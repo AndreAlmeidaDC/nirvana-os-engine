@@ -31,6 +31,7 @@ export function preflightReindex(): boolean {
     // stdout ignored so routing scripts keep machine-parseable output clean;
     // indexer failures still surface on stderr.
     stdio: ["ignore", "ignore", "inherit"],
+    windowsHide: true,
     env: { ...process.env, NRV_IN_PREFLIGHT: "1" },
     timeout: 120_000,
   });

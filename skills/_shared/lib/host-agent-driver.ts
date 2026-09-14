@@ -243,7 +243,7 @@ export function firstExecutablePath(stdout: string): string | null {
 
 export function whichSync(cli: string): string | null {
   const probe = whichProbe(cli);
-  const r = spawnSync(probe.command, probe.args, { encoding: "utf8", env: process.env });
+  const r = spawnSync(probe.command, probe.args, { encoding: "utf8", env: process.env, windowsHide: true });
   // bash builtin `command` is shell-only; fallback to PATH scan
   if (r.status === 0) {
     const found = firstExecutablePath(r.stdout);
@@ -786,6 +786,7 @@ export function callHostAgent(persona: string, userMessage: string, opts: CallOp
       timeout: opts.timeoutMs ?? DEFAULT_INACTIVITY_BUDGET_MS,
       maxBuffer: 8 * 1024 * 1024,
       env: childEnv(),
+      windowsHide: true,
       ...(exec.shell ? { shell: true } : {}),
       ...(call.input !== undefined ? { input: call.input } : {}),
     });
@@ -954,6 +955,7 @@ export function callHostAgentAsync(persona: string, userMessage: string, opts: C
     const exec = resolveExecutable(host.cli);
     const child = spawn(exec.command, exec.args(call.args), {
       env: childEnv(),
+      windowsHide: true,
       ...(exec.shell ? { shell: true } : {}),
       stdio: [call.input !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -1390,9 +1392,14 @@ function driverSpawnSync(cmd: string, args: string[], options: SpawnSyncOptions 
   // childEnv(): the live process.env minus Orca's pane identity, so a child the
   // engine spawns inside an Orca terminal is not reported to Orca as that
   // pane's agent (see _shared/lib/orca.js). Outside Orca it is process.env.
+  // windowsHide belongs in the base: a headless parent without a console (the
+  // detached sweep, the heartbeat sidecar) hands its child a NEW, visible
+  // console window on Windows unless the flag is set — stdio: "ignore" does
+  // not prevent it. Every runtime adapter reaches the OS through here.
   const baseEnv = childEnv();
   options = {
     env: spawnAsRuntime ? { ...baseEnv, NIRVANA_HOST_RUNTIME: spawnAsRuntime } : baseEnv,
+    windowsHide: true,
     ...(exec.shell ? { shell: true } : {}),
     ...options,
   };
@@ -1450,7 +1457,7 @@ function runWithLedgerHeartbeat(opts: RunHeadlessOpts, runner: (o: RunHeadlessOp
   try {
     // Live env (not Bun's original-env snapshot) so audit/state paths set at
     // runtime reach the sidecar.
-    const sc = spawn(process.execPath, sidecarArgs, { detached: true, stdio: "ignore", env: { ...process.env } });
+    const sc = spawn(process.execPath, sidecarArgs, { detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env } });
     sc.unref();
     sidecarPid = sc.pid ?? null;
   } catch (e) {
@@ -2403,7 +2410,7 @@ export function runtimeAvailable(runtime: Runtime): boolean {
   // invocation runs with (callHostAgent spawns with `env: {...process.env}`),
   // so a runtime added to PATH mid-process reads as unavailable while being
   // perfectly invocable. Same reason in whichSync below.
-  const r = spawnSync(probe, [bin], { encoding: "utf8", env: process.env });
+  const r = spawnSync(probe, [bin], { encoding: "utf8", env: process.env, windowsHide: true });
   return r.status === 0;
 }
 

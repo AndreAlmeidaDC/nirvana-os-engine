@@ -60,6 +60,7 @@ function runIndexer(label: string, scriptRelPath: string) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     env: process.env,
+    windowsHide: true,
   });
   const ms = Date.now() - start;
   return {

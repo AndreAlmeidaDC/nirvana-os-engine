@@ -211,6 +211,7 @@ export function runGateOnce(files: string[], gate: string | GateRunOpts): { pass
     }
     const g = spawnSync("bun", argv, {
       encoding: "utf8",
+      windowsHide: true,
       env: { ...process.env, ...(opts.env ?? {}) },
     });
     if (g.status !== 0) {
@@ -409,6 +410,7 @@ export function runDelivery(args: DeliveryArgs): DeliveryResult {
     const v = spawnSync("bun", [verifyScript, args.pid, args.slug, "--outputs-root", args.outputsRoot], {
       encoding: "utf8",
       cwd: args.workingDir ?? process.cwd(),
+      windowsHide: true,
       env: { ...process.env, ...gateEnv },
     });
     if (v.status === 0) {

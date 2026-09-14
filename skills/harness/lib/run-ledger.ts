@@ -511,7 +511,7 @@ function processStartedAtWindows(pid: number, timeoutMs = WINDOWS_PS_TIMEOUT_MS)
     const r = spawnSync("powershell", [
       "-NoProfile", "-NonInteractive", "-Command",
       `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).StartTime.Ticks`,
-    ], { encoding: "utf8", timeout: timeoutMs });
+    ], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
     if (r.status !== 0) return null;
     const line = (r.stdout || "").trim();
     return line || null;
@@ -528,7 +528,7 @@ function findChildPidWindows(parentPid: number, excludePid?: number, timeoutMs =
     const r = spawnSync("powershell", [
       "-NoProfile", "-NonInteractive", "-Command",
       `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${parentPid}" -ErrorAction SilentlyContinue).ProcessId`,
-    ], { encoding: "utf8", timeout: timeoutMs });
+    ], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
     if (r.status !== 0) return null;
     for (const line of (r.stdout || "").trim().split(/\r?\n/)) {
       const pid = parseInt(line.trim(), 10);

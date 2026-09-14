@@ -52,7 +52,7 @@ const defaults: BusinessPostGateDependencies = {
   size: pathname => fs.statSync(pathname).size,
   homeDir: os.homedir,
   resolve: path.resolve,
-  spawn: (command, args, options) => spawnSync(command, args, options as Parameters<typeof spawnSync>[2]) as SpawnResult,
+  spawn: (command, args, options) => spawnSync(command, args, { windowsHide: true, ...options } as Parameters<typeof spawnSync>[2]) as SpawnResult,
   runPublisher: runHeadless,
 };
 

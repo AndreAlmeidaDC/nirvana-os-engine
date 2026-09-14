@@ -425,6 +425,7 @@ function defaultResume(h: LedgerHandle, row: RunRow): RecoveryResult {
     cwd: reviseCwdFor(info.meta),
     encoding: "utf8",
     timeout: RESUME_TIMEOUT_MS,
+    windowsHide: true,
     // NRV_IN_SWEEP is the recursion guard AND revise.ts's signal that nobody is
     // watching: it drops its revision budget to 0 and hands the verdict back.
     env: { ...process.env, NRV_IN_SWEEP: "1" },
@@ -989,6 +990,7 @@ export function maybeSweep(): boolean {
     const child = spawn(process.execPath, [SUPERVISOR_PATH, "sweep", "--quiet", ...(scope.allProjects ? ["--all-projects"] : [])], {
       detached: true,
       stdio: "ignore",
+      windowsHide: true,
       env: { ...process.env, NRV_IN_SWEEP: "1" },
     });
     child.unref();
