@@ -1,10 +1,13 @@
 ---
 name: squads
-description: "Squad lifecycle skill. Use when asked to create, validate, inspect, list, or migrate squads — portable AI agent teams with workflows. Triggers on: create squad, list squads, inspect squad, validate squad, migrate squad, adapters. For EXECUTION of production briefs ('use the squad X', 'orquestre via squad', 'rode via squad'), invoke the `harness` skill instead — it carries the maestro intelligence and dispatches the right squad capability."
+description: "Squad lifecycle skill. Use when asked to create, validate, inspect, list, or migrate squads — portable AI agent teams with workflows. Triggers on: create squad, list squads, inspect squad, validate squad, migrate squad, adapters. For EXECUTION of production briefs ('use the squad X', 'orquestre via squad', 'rode via squad'), hand it to the harness (read `~/.nirvana/skills/harness/SKILL.md` and follow it) instead — it carries the maestro intelligence and dispatches the right squad capability."
 compatibility: "Requires the Nirvana-OS engine: the `nrv` CLI and Bun on PATH. Install: npx @nirvana-os/cli. Runtime-agnostic — no dependency on any specific agent CLI. Squad activation may install large dependencies and needs an interactive consent primitive."
 tools: [Read, Write, Edit, Glob, Grep, Bash]
 maxTurns: 50
 metadata:
+  # Hidden from skills.sh discovery: this skill is not standalone (it needs the
+  # engine at ~/.nirvana). The `nirvana` skill is the one to install there.
+  internal: true
   openclaw:
     emoji: "🛠️"
     requires:
@@ -14,20 +17,22 @@ metadata:
 
 # Squad Protocol Engine v6.0.0
 
+> Requires the Nirvana-OS engine (`nrv` on PATH). If it is absent, use the `nirvana` skill, which installs it. This skill is not standalone.
+
 You orchestrate multi-agent squads following the **Squad Protocol v6.0**. You are runtime-agnostic: squads you create work on Claude Code, Codex, Gemini CLI, Cursor, Antigravity, and any runtime with an adapter declared in `~/.nirvana/skills/_shared/adapters/`.
 
 ---
 
 ## Scope of this skill
 
-This skill is for **squad lifecycle operations**: create / validate / inspect / list / migrate squads. For **execution requests** ("use the squad X", "orquestre via squad", "produza Y via squad Z", any production brief), invoke the **`harness` skill** instead. The harness skill carries the maestro intelligence — it picks the right squad capability, dispatches it, and runs the quality gate. This skill is not the entry point for orchestration.
+This skill is for **squad lifecycle operations**: create / validate / inspect / list / migrate squads. For **execution requests** ("use the squad X", "orquestre via squad", "produza Y via squad Z", any production brief), hand it to the **harness** (read `~/.nirvana/skills/harness/SKILL.md` and follow it) instead. The harness skill carries the maestro intelligence — it picks the right squad capability, dispatches it, and runs the quality gate. This skill is not the entry point for orchestration.
 
 ### When this skill IS the right entry point
 
 - "Create a new squad called X" → here (lifecycle)
 - "Validate squad X" / "Inspect squad X" / "List my squads" → here
 - "Migrate squad to v6" → here
-- "Run squad X to produce Y" → **NOT here** — invoke the `harness` skill.
+- "Run squad X to produce Y" → **NOT here** — hand it to the harness (read `~/.nirvana/skills/harness/SKILL.md` and follow it).
 
 ### Verifying real dispatch (when execution does happen via harness)
 
@@ -277,7 +282,7 @@ When creating a NEW squad, ALWAYS:
 5. Declare `capabilities[]` in the v5 shape: `id` (dotted, ≥3 segments), `description`, `domains[]` from `CAPABILITY_CATALOG_V1.yaml`, `invoke{type,ref}`, `examples[]`. Without capabilities the squad is invisible to harness discovery.
 6. Use portable semantic tool names in agent `tools:` (`read`, `write`, `grep`, `bash`, `web_search`).
 7. Tasks have NO owner — workflows bind agent→task.
-8. Task acceptance criteria MUST be binary and verifiable.
+8. A task states its `## Outcome` (what must be true when it is done) and binary, verifiable `## Acceptance Criteria`. `## Steps` is optional and is the author's reference method, never an order (v6 §36).
 9. Include `<protocol-context>` block in prompts for long-running subagents.
 10. A workflow is a DAG of phases that consume each other's output, so a phase starts only once the phase it depends on has REPORTED — and a phase reports through the `<task-notification>` carrying its `<result>`, never through the spawn's tool result (that is a launch receipt). Dispatching the next phase on a receipt leaves it reading a file that may still be half-written. Phases with no dependency between them go in ONE message as several calls, which is what makes them concurrent; phases that feed each other go one at a time, each dispatched once the previous one's notification landed.
 11. Declare output schemas in `contracts:` for chained tasks.
