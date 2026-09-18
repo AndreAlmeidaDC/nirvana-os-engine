@@ -6,6 +6,89 @@ Todas as mudanças relevantes do engine Nirvana-OS. As versões correspondem às
 releases no GitHub (`nirvana-os-engine`); cada release publica o tarball completo
 do engine que o `npx @nirvana-os/cli` e as instalações de pack consomem.
 
+## Unreleased
+
+### O `nrv mine-briefs` atende pelo nome que ele mesmo documenta
+
+O script foi publicado na 0.13.16 e o comando não: o `mine-real-briefs.ts` estava no tarball, o cabeçalho dele mandava rodar `nrv mine-briefs`, e o `nrv mine-briefs` respondia "unknown subcommand". Um comando mora em três lugares — a tabela, o roteador em TypeScript e o lançador em bash — e ele não estava em nenhum, o que também explica o silêncio da checagem de paridade do CLI: aquele portão compara os três entre si, então um script ausente dos três é invisível para ele. Registrado nos três agora, e o portão conta 66 comandos em sincronia.
+
+## 0.13.16 — 2026-09-18
+
+### A API servia a instrumentação da execução como se fosse a entrega
+
+Relatado de uma VPS de cliente: `GET /v1/jobs/<trace>/artifacts/relatorio-final.html` devolvia 81 KB que não continham uma linha do trabalho entregue e continham todas as linhas da instrumentação da execução — o prompt de sistema inteiro do employee, a biblioteca de mind-clones, o manifesto da empresa e a memória permanente da firma. É a propriedade intelectual de um pack vendido por US$ 1.290, baixável por qualquer um com uma chave de sessão.
+
+Dois defeitos de caminho puseram isso lá e um agravante manteve. O `nrv serve` gravava as entregas de uma execução no caminho legado `.nirvana/outputs/<run>` enquanto todas as outras camadas calculam o canônico `outputs/<run>` que o `outputsDir()` devolve, então uma execução só ficava partida em dois diretórios; o gerador do relatório, apontado para o caminho canônico exatamente como o protocolo documenta, encontrava só o prompt do employee e renderizava aquilo como relatório do cliente. O piloto automático piorava passando o diretório do PROJETO em vez do da execução, então a renderização ainda indexava os arquivos de contrato do projeto. E três consumidores mantinham cada um sua cópia privada da lista de exclusão — a do verificador tinha doze itens e estava certa, a da API tinha três, a do gerador tinha um — então as duas que davam de cara com o cliente eram as curtas.
+
+Agora: um `runOutputsRoot()` para o escritor e os dois leitores, canônico, com o caminho legado ainda legível para um servidor atualizado no meio do caminho achar as execuções de ontem. Um `run-plumbing.ts` nomeando o que o engine grava ao lado do trabalho e que nunca é entrega, lido pela API, pelo gerador e pelo verificador igualmente, cobrindo o prompt, o brief, o handoff, o ledger, os campos do envelope e os próprios `AGENTS.md`, `CLAUDE.md` e `GEMINI.md` do projeto. Um cliente que pede `/v1/jobs/<trace>/result` passa a receber o trabalho, porque o sumário deixou de contar como artefato.
+
+### O zip entregue ao cliente também levava o prompt do employee
+
+O `--zip` é a mais perigosa das três superfícies que dão de cara com o cliente, porque é um pacote que ele guarda, e ele tinha uma quarta cópia privada da lista de exclusão: `audit.jsonl`, `HANDOFF.json` e dois arquivos ocultos. O `agent-prompt.md` passava direto, e com ele a persona, a biblioteca de mind-clones e a memória permanente da firma. Pior, o `--deliverables-only` caía para arquivar o PROJETO INTEIRO sempre que não conseguia isolar exatamente uma pasta `deliverables/` — e uma execução servida pela API não tem essa pasta, porque os artefatos ficam soltos na raiz da execução, então o caso normal caía no atalho e levava o andaime junto. Agora o arquivo lê o mesmo `run-plumbing.ts` que a API, o gerador e o verificador, tanto no caminho do zip quanto no do tgz, e o atalho empacota a raiz da execução sem o andaime em vez do projeto. O `--include-audit` continua devolvendo a trilha de auditoria, e continua nunca devolvendo o prompt.
+
+### O relatório HTML é pedido, nunca presumido
+
+Ele rodava em toda entrega que não fosse em modo `fast`. Uma entrega que ninguém pediu é uma entrega que ninguém confere, e foi assim que o vazamento acima passou despercebido. Passa a ser `--html` no despachante e "sob pedido" no protocolo, e quando é pedido renderiza o diretório da execução e não o do projeto.
+
+### Duas regras de como o trabalho é despachado
+
+**Nunca despachar no modo `fast`.** Ele é o roteador BM25: offline, reprodutível, grátis, e medido em 0,224 de top-1 contra briefs reais de primeiro toque, perdendo o destino certo por completo em dois terços deles. É diagnóstico e prévia, não jeito de escolher quem faz o trabalho.
+
+**Nunca fixar teto de gasto que o usuário não pediu.** O `--max-budget` é rígido, não consultivo: cruzá-lo para a execução, então um teto escolhido pelo orquestrador é um palpite sobre o dinheiro dos outros que pode encerrar uma execução no meio com tudo gasto e nada entregue. Passe um quando o usuário nomeou um número, ou quando um manifesto de empresa declara `run_budget_usd` — aí é o dono falando pelo manifesto.
+
+### Um teto pertence à execução, e só o dono define um
+
+O `--max-budget` era passado a cada filho com o valor cheio, então uma cadeia de seis employees recebia seis tetos: uma execução que um cliente havia limitado em US$ 2 gastou US$ 4,90, e o pior caso é um teto por assento. O teto que o dono nomeia é da execução, então virou um saldo que diminui — cada filho recebe o que sobrou, e um assento que não pode ser pago não é iniciado, porque execução interrompida depois do estouro já pagou por ele. A contabilidade fica ao lado da execução, então o `nrv team step`, que roda um assento por processo, acumula igual à cadeia em processo único. Custo que o runtime não soube informar não é contado como zero, o que deixaria um runtime não mensurável rodar para sempre sob um teto.
+
+E o engine deixa de nomear teto por conta própria. O `glance.maestro_max_budget_usd` tinha padrão 5, o único lugar em que o engine punha número no dinheiro dos outros; agora é 0, como todo outro teto daqui. Um teto vem do `--max-budget`, do `run_budget_usd` de um manifesto de empresa, ou de uma chave do serve que o dono criou com um, e de nenhum outro lugar.
+
+### Dá para parar uma execução
+
+Não havia como encerrar uma execução a não ser ela mesma: uma cara só parava abrindo SSH e matando na mão, o que um cliente de API HTTP não pode fazer. O `DELETE /v1/jobs/<trace>` manda SIGTERM — não SIGKILL, para o runtime fechar os filhos dele e gravar o que produziu — e a execução entra em `cancelled`, estado terminal próprio e não `failed`, porque execução que o dono parou não é execução que quebrou. Cancelar uma execução já terminada é no-op que relata no que ela deu. O sinal vai pelo handle vivo do filho e não pelo pid gravado: pid que responde não prova ser o nosso, e o supervisor carrega o mesmo aviso. Uma execução iniciada por um servidor anterior é marcada como cancelada com `signalled: false`, então quem chamou é informado de que o processo não foi alcançado em vez de presumir que foi.
+
+### O envelope conta quando o runtime morreu
+
+Quando um runtime dá erro depois de produzir arquivos, o engine não descarta o trabalho: o verificador roda, o portão julga, e só um resultado aprovado é entregue. Isso está certo. Mas o envelope perdia o fato, então um cliente da API lia `delivered` com código 0 enquanto o ledger, a auditoria e o CLI todos sabiam que o runtime havia falhado. O envelope passa a carregar `runtime_errored` ao lado do estado, do mesmo jeito que já carrega `fail-accepted` quando o portão passou com reservas.
+
+## 0.13.15 — 2026-09-18
+
+### O modo de roteamento fast voltou a ser offline, e reprodutível
+
+O `route()` amplificava por padrão, e o amplificador é chamada de LLM nos seus dois gatilhos: o estágio -1.5 num brief fraco e a ponte de cobertura do estágio 2.7. Ele não tem braço determinístico, porque `builtin` e `maestro` nomeiam a persona e não um caminho offline. Então o modo que alguém escolhe para ter resposta barata e reprodutível não era nem uma coisa nem outra: gastava tokens em todo brief fraco e devolvia vereditos diferentes para a mesma entrada. Medido no corpus vivo: dez briefs reais roteados duas vezes dentro de um processo, mesmas registries, e um deles virou de HIGH para AMBIGUOUS entre passadas consecutivas; com o amplificador desligado as duas passadas foram idênticas. O `routing.mode: fast` agora implica sem amplificação, a razão do salto nomeia o modo, e um `amplify` explícito continua vencendo nos dois sentidos. O `agentic` e qualquer outro modo mantêm o amplificador.
+
+### Uma decisão de rota expõe os destinos que encontrou, e recupera fundo o bastante para tê-los
+
+O estágio 2 recuperava 10 vagas pontuadas e o estágio 3 expunha 3 delas. Vagas são por capacidade, então uma squad ocupava várias: nos 35 briefs reais colhidos do log de auditoria, 4,34 vagas colapsavam para 2,06 destinos, o que fazia de um "top 3" uma escolha entre dois. Nenhum dos dois números é parâmetro de pontuação, porque toda atribuição de `alternatives` fica dentro de um return cujo sinal já foi escolhido, então a profundidade nunca mudou veredito, só o que quem chama podia ver. A recuperação passa a 30 vagas, medida como o pico (acima disso, mais vagas amontoam mais destinos na janela e empurram o certo para fora), e a decisão expõe uma entrada por destino até 15. Nesses briefs o top-1 decidido fica igual em 0,400, o destino certo aparece em algum lugar da lista exposta em 0,543 dos casos em vez de 0,457, e quem chama vê 6,29 destinos em vez de 2,66. O eixo fraco é o que mais ganha na recuperação: a cobertura de empresa dentro da janela vai de 0,474 para 0,632.
+
+### Um diretor que narra o plano é perguntado uma vez pelo plano em si
+
+O diretor da empresa decide a cadeia e responde com um objeto JSON. Ele também roda com ferramentas, confiança total e o projeto concedido, o que é deliberado e tem um custo: um agente com ferramentas trata a mensagem final como relatório do trabalho feito e não como a carga útil. Medido numa empresa de 16 assentos: o diretor decidiu bem e depois descreveu a decisão em prosa, duas vezes, no modo padrão e sob `--team`. A própria segunda resposta afirmava ter devolvido a cadeia como um único objeto JSON enquanto devolvia prosa nomeando os assentos que havia escolhido. O plano existia e só faltava o envelope, e a execução desabou para um assento único por causa disso, então um brief de C-suite foi carregado por um empregado só. Quando nenhum objeto JSON é encontrado na resposta, o diretor passa a ser perguntado uma vez mais para transcrever a decisão que já tomou, com a resposta anterior e os nomes válidos de assento num prompt curto que não concede ferramenta nem diretório. A re-pergunta nunca pede para decidir de novo, registra `x_director_reask`, e um diretor que responde certo na primeira vez nunca é perguntado duas vezes.
+
+### Um roteador que narra a decisão é perguntado uma vez pela decisão em si
+
+O roteador agêntico roda com Read, Glob, Grep e Bash, porque uma decisão sobre um catálogo grande deve poder consultar as coisas. Essa concessão custa o mesmo que o assento de diretor da empresa paga: um agente com ferramentas trata a mensagem final como relatório do trabalho que fez e não como a carga útil. Observado num brief real sobre uma holding familiar: o roteador respondeu "Routing decision: aurum-contabil + nirvana-societario-sucessao / I read the client brief ... and surveyed", gastou 117 segundos e não foi parseado. Ele havia decidido certo, nomeando uma empresa e um squad que existem, e o brief caiu no `agent-x` com a mensagem de que não recebeu especialista nenhum. O retry da cascata não resolve isso, porque repete o prompt idêntico, o que responde a transporte instável e não a envelope ausente. Quando nenhum JSON é encontrado, o roteador passa a ser perguntado uma vez mais para transcrever a decisão que já tomou, levando a resposta anterior num prompt curto que não concede ferramenta. Registra `x_router_reask`, e um roteador que responde certo na primeira vez nunca é perguntado duas vezes.
+
+### Agentes despachando agentes passa a ter limite, em três lugares
+
+Relatado de uma execução real: o dono despachou dois agentes e quinze rodaram. Os dois que ele começou abriram os próprios subagentes, esses abriram mais, e um deles produziu um fork que entrou em laço contra a regra de orquestração do contrato do próprio projeto. Nada no engine limitava isso, e os únicos guardas de recursão que existiam eram a marca de varredura do supervisor e a checagem de identidade de processo do ledger, nenhum dos dois sobre despacho.
+
+Três coisas independentes tornavam isso possível, e cada uma tem agora resposta. **O contrato decide o papel pelo ambiente**: a seção 0.5 do `AGENTS.md` abria dizendo a quem a lesse que era o orquestrador e nunca deveria produzir o artefato, o que um filho despachado lia e obedecia. Ela agora abre checando `NIRVANA_DISPATCH_DEPTH`, e um filho que carrega essa marca é informado de que é o executor: produza o artefato, não delegue, não abra subagentes. **Um trabalhador despachado deixa de receber a ferramenta de subagente do próprio runtime**, que é a perna que o engine não consegue ver, porque essa multiplicação acontece dentro de um filho e nunca passa pelo driver; o `claude --disallowedTools Task Agent` a nega por cima das flags de confiança, e quem realmente orquestra opta de volta com `allowSubagents: true`. **E o engine recusa despacho acima de um teto finito**: `execution.max_dispatch_depth`, padrão 4, que cobre as duas topologias que o engine realmente percorre: do terminal a empresa fica em 1, um assento dela em 2 e um squad que esse assento usa em 3, enquanto no chat do Glance o maestro é ele mesmo um filho e a mesma cadeia termina em 4. Com 0 significando ilimitado. A profundidade viaja em `NIRVANA_DISPATCH_DEPTH`, que a lista de ambiente do filho mantém por prefixo, então um spawn filtrado não consegue perder o contador. Uma recusa nomeia os dois números e a chave, registra `x_dispatch_depth_refused` e não inicia processo nenhum.
+<<<<<<< HEAD
+
+### Só funcionários usam squads, e um squad nunca despacha
+
+Um teto de profundidade limita a cadeia mas não diz nada sobre quem está nela, e um squad despachado direto pelo maestro fica na profundidade 1 com espaço embaixo. A regra é, portanto, sobre papéis: uma **empresa** abre o próprio quadro e os squads que seus assentos carregam; um **funcionário** pode usar squads para construir a entrega dele, quantos o trabalho pedir, e mais nada, porque um assento que convoca outra empresa é a fuga; um **squad** executa e nunca despacha, e o mesmo vale para o `agent-x` e para todo passo de decisão (o diretor da empresa, um juiz, um roteador), que rodam com ferramentas e confiança total e por isso precisam de regra, não de esperança. Todo ponto real de despacho passa a declarar o que está criando, o driver carimba isso em `NIRVANA_DISPATCH_ROLE`, e um spawn que a regra proíbe é recusado antes de qualquer processo começar, com `x_dispatch_role_refused` na auditoria e uma mensagem que nomeia a regra em vez de uma chave para aumentar. Um carimbo desconhecido é lido como o operador, em vez de travar toda execução. O contrato diz a mesma regra em palavras, ao lado da cascata que ela qualifica.
+=======
+>>>>>>> bb46e5c (fix(dispatch): the ceiling clears the Glance topology, and an employee may use several squads)
+
+### `nrv exec` — o runtime como ele mesmo, e honesto sobre quanto isso vale
+
+Tudo o que o engine faz com um runtime embrulha o brief: uma persona, a diretiva autônoma, uma raiz de saída, o ledger, o pipeline de entrega, o portão de qualidade. Esse embrulho é o produto, e é também por isso que não havia como fazer uma pergunta simples a um runtime. O `--agent-x` é o despacho mais fino e ainda carrega tudo isso, então uma tarefa ao redor do trabalho — conferir um fato, perguntar a um segundo runtime quando aquele em que você está bateu num limite próprio, ler algo de volta numa língua que você não escreve — não tinha lugar. O `nrv exec [--runtime=<rt>] "<prompt>"` é esse lugar, e ele não promete nada: sem persona, sem diretório de saída, sem execução no ledger, sem portão. Escolhe o runtime pela mesma regra de um despacho, então o runtime da sessão é o padrão e um runtime nomeado que não está instalado é parada, nunca troca silenciosa de fornecedor. O `--json` devolve `{ok, runtime, result, cost_usd, duration_ms, gate: null}`, e esse `gate: null` é o ponto: o valor deste engine é que uma entrega tem `gate_passed` atrás dela, então um comando que devolve texto cru diz no stderr, toda vez, que não passou por portão nenhum e não produziu artefato. É ferramenta do operador, e a regra de papéis é o que torna isso verdadeiro em vez de documentado: `exec` carrega permissão vazia, então um squad, um assento, um diretor ou outro exec são recusados — um agente despachado que saísse por ele seria um agente sem supervisão com outro nome. Toda tarefa registra `x_exec_passthrough` com runtime, custo e duração, e nunca com o prompt.
+
+### Uma variável `USE_` alheia deixa de parecer regra quebrada
+
+`USE_<runtime>` e `NOT_USE_<runtime>` são como um projeto direciona um despacho para um runtime, e uma não reconhecida imprimia `[runtime-rules] unknown runtime … rule ignored` para que um erro de digitação não ficasse calado. Só que o prefixo não é só nosso: uma máquina de CI com Bazel exporta `USE_BAZEL_FALLBACK_VERSION`, e toda chamada de `nrv` naquela máquina avisava sobre ela — alarmante, inútil e medido no CI deste próprio repositório. O aviso passa a valer só para variável vinda de um arquivo `.env`, que existe para guardar essas regras e mais nada, então um erro de digitação de verdade continua sendo relatado enquanto o ambiente da máquina é lido em silêncio.
+
 ## 0.13.14 — 2026-09-17
 
 ### Um agente despachado vê uma lista do ambiente, não uma cópia dele

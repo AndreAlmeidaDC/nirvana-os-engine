@@ -6,6 +6,89 @@ All notable changes to the Nirvana-OS engine. Versions map to GitHub releases
 (`nirvana-os-engine`); each release ships the full engine tarball that
 `npx @nirvana-os/cli` and pack installs consume.
 
+## Unreleased
+
+### `nrv mine-briefs` is reachable by the name it documents
+
+The script shipped in 0.13.16 and the command did not: `mine-real-briefs.ts` was in the tarball, its own header told the reader to run `nrv mine-briefs`, and `nrv mine-briefs` answered "unknown subcommand". A command lives in three places — the table, the TypeScript router and the bash launcher — and it was in none of them, which is also why the CLI parity check stayed quiet: that gate compares the three against each other, so a script absent from all three is invisible to it. Registered in all three now, and the gate counts 66 commands in sync.
+
+## 0.13.16 — 2026-09-18
+
+### The API served the run's instrumentation as if it were the deliverable
+
+Reported from a customer VPS: `GET /v1/jobs/<trace>/artifacts/relatorio-final.html` returned 81 KB that contained no line of the delivered work and every line of the run's own instrumentation — the employee's full system prompt, the mind-clone library, the business manifest and the firm's permanent memory. That is the intellectual property of a pack sold for US$ 1,290, downloadable by anyone holding a session key.
+
+Two path bugs put it there and one aggravator kept it. `nrv serve` wrote a run's deliverables to the legacy `.nirvana/outputs/<run>` while every other layer computes the canonical `outputs/<run>` that `outputsDir()` returns, so a single run was split across two directories; the report renderer, pointed at the canonical path exactly as the protocol documents, found only the employee prompt and rendered that as the client's report. The scripted autopilot made it worse by passing the PROJECT directory rather than the run, so the render also indexed the project's own contract files. And three consumers each kept a private copy of the exclusion list — the verifier's had twelve entries and was right, the API's had three, the renderer's had one — so the two that faced the client were the short ones.
+
+Now: one `runOutputsRoot()` for the writer and both readers, canonical, with the legacy root still readable so a server upgraded mid-flight finds the runs it wrote yesterday. One `run-plumbing.ts` naming what the engine writes beside the work and what is never a deliverable, read by the API, the renderer and the verifier alike, and it covers the prompt, the brief, the handoff, the ledger, the envelope fields and the project's own `AGENTS.md`, `CLAUDE.md` and `GEMINI.md`. A client asking `/v1/jobs/<trace>/result` now gets the work, because the summary stopped counting as an artifact.
+
+### The zip handed to the client carried the employee prompt too
+
+`--zip` is the most dangerous of the three surfaces that face a client, because it is a bundle they keep, and it held a fourth private copy of the exclusion list: `audit.jsonl`, `HANDOFF.json` and two dotfiles. `agent-prompt.md` went straight through it, and with it the persona, the mind-clone library and the firm's permanent memory. Worse, `--deliverables-only` fell back to archiving the WHOLE PROJECT whenever it could not isolate exactly one `deliverables/` folder — and a run served over the API has no such folder, since its artifacts sit flat in the run root, so the normal case took the fallback and shipped the scaffold. Now the archive reads the same `run-plumbing.ts` as the API, the renderer and the verifier, in both the zip and the tgz path, and the fallback packs the run root without the scaffold instead of the project. `--include-audit` still returns the audit trail, and still never the prompt.
+
+### The HTML report is asked for, never assumed
+
+It ran on every delivery that was not in `fast` mode. A deliverable nobody asked for is a deliverable nobody checks, which is how the leak above went unnoticed. It is now `--html` on the dispatcher and "on request" in the protocol, and when it is asked for it renders the run directory rather than the project.
+
+### Two rules for how work is dispatched
+
+**Never dispatch in `fast` mode.** It is the BM25 router: offline, reproducible, free, and measured at 0.224 top-1 against real first-touch briefs, losing the right destination entirely in two thirds of them. It is a diagnostic and a preview, not a way to pick who does the work.
+
+**Never set a spend ceiling the user did not ask for.** `--max-budget` is hard, not advisory: crossing it stops the run, so a ceiling chosen by the orchestrator is a guess about someone else's money that can end a run halfway with everything spent and nothing delivered. Pass one when the user named a number, or when a business manifest declares `run_budget_usd` — that is the owner speaking through the manifest.
+
+### A ceiling belongs to the run, and only the owner sets one
+
+`--max-budget` was passed to every child at its full value, so a chain of six employees received six ceilings: a run a customer had capped at US$ 2 spent US$ 4,90, and the worst case is one ceiling per seat. The cap the owner names is for the run, so it is now a balance that decreases — each child is offered what is left, and a seat that cannot be paid for is not started, because a run stopped after the overage has already paid it. The accounting lives beside the run, so `nrv team step`, which runs one seat per process, accumulates the same way the in-process chain does. A cost the runtime could not report is not counted as zero, which would let an unmeasurable runtime run forever under a ceiling.
+
+And the engine no longer names a ceiling by itself. `glance.maestro_max_budget_usd` defaulted to 5, the only place the engine put a number on someone else's money; it defaults to 0 now, like every other cap here. A ceiling comes from `--max-budget`, from a business manifest's `run_budget_usd`, or from a serve key the owner minted with one, and from nowhere else.
+
+### A run can be stopped
+
+There was no way to end a run but its own: an expensive one could only be stopped by opening an SSH session and killing it by hand, which a client of an HTTP API cannot do. `DELETE /v1/jobs/<trace>` sends SIGTERM — not SIGKILL, so the runtime closes its children and flushes what it wrote — and the run enters `cancelled`, its own terminal state rather than `failed`, because a run the owner stopped is not a run that broke. Cancelling a finished run is a no-op that reports what it became. The signal goes through the live child handle rather than the recorded pid: a pid that answers is not proof it is ours, and the supervisor carries the same warning. A run started by a previous server process is marked cancelled with `signalled: false`, so the caller is told the process was not reached rather than left to assume it was.
+
+### The envelope says when the runtime died
+
+When a runtime errors after producing files, the engine does not discard the work: the verifier runs, the gate judges, and only an approved result is delivered. That is right. But the envelope dropped the fact, so an API client read `delivered` with exit 0 while the ledger, the audit and the CLI all knew the runtime had failed. The envelope now carries `runtime_errored` beside the state, the way it already carries `fail-accepted` when the gate passed with reservations.
+
+## 0.13.15 — 2026-09-18
+
+### The fast routing mode is offline again, and reproducible
+
+`route()` amplified by default, and the amplifier is an LLM call at both of its trigger points: Stage -1.5 on a WEAK brief, and the Stage 2.7 coverage bridge. It has no deterministic arm, since `builtin` and `maestro` name the persona rather than an offline path. So the mode a caller picks to get a cheap reproducible answer was neither: it spent tokens on every WEAK brief and returned different verdicts for the same input. Measured on the live corpus: ten real briefs routed twice inside one process, same registries, and one flipped HIGH to AMBIGUOUS between consecutive passes; with the amplifier off the two passes were identical. `routing.mode: fast` now implies no amplification, the skip reason names the mode, and an explicit `amplify` still wins in both directions. `agentic` and any other mode keep the amplifier.
+
+### A routing decision exposes the destinations it found, and retrieves deep enough to have them
+
+Stage 2 retrieved 10 scored slots and Stage 3 exposed 3 of them. Slots are per capability, so one squad occupied several: on 35 real briefs harvested from the audit log, 4.34 slots collapsed to 2.06 destinations, which made a "top 3" a choice between two. Neither number is a scoring parameter, since every `alternatives` assignment sits inside a return whose signal is already chosen, so the depth never changed a verdict, only what the caller could see. Retrieval is now 30 slots, measured as the peak (past it, more slots crowd more destinations into the window and push the right one out), and the decision exposes one entry per destination up to 15. On those briefs the decided top-1 is unchanged at 0.400, the right destination appears somewhere in the exposed list in 0.543 of cases instead of 0.457, and the caller sees 6.29 destinations instead of 2.66. The weak axis gains most in retrieval: business recall in the window goes from 0.474 to 0.632.
+
+### A director that narrates its plan is asked once for the plan itself
+
+The business director decides the chain and answers with a JSON object. It also runs with tools, full trust and the project granted, which is deliberate and has a cost: an agent with tools treats its final message as a report of work done rather than as the payload. Measured on a 16-seat business: the director decided well and then described the decision in prose, twice, in the default mode and under `--team`. Its own second answer claimed it had returned the chain as a single JSON object while returning prose naming the seats it had chosen. The plan existed and only the envelope was missing, and the run collapsed to a single seat because of it, so a C-suite brief was carried by one employee. When no JSON object can be found in the answer, the director is now asked once more to transcribe the decision it already made, with its previous answer and the valid seat names in a short prompt that grants no tools and no directories. The re-ask never asks it to decide again, records `x_director_reask`, and a director that answers correctly the first time is never asked twice.
+
+### A router that narrates its decision is asked once for the decision itself
+
+The agentic router runs with Read, Glob, Grep and Bash, because a decision over a large catalogue should be allowed to look things up. That grant costs the same thing the business director's seat pays: an agent with tools treats its final message as a report of the work it did rather than as the payload. Observed on a real brief about a family holding: the router answered "Routing decision: aurum-contabil + nirvana-societario-sucessao / I read the client brief ... and surveyed", spent 117 seconds, and failed to parse. It had decided correctly, naming a business and a squad that both exist, and the brief still fell through to `agent-x` under the message "this brief got NO specialist". The cascade's own retry cannot help there, since it replays the identical prompt, which answers flaky transport rather than a missing envelope. When no JSON can be found, the router is now asked once more to transcribe the decision it already made, carrying its previous answer in a short prompt that grants no tools. It records `x_router_reask`, and a router that answers correctly the first time is never asked twice.
+
+### Agents dispatching agents is bounded, in three places
+
+Reported from a live run: the owner dispatched two agents and fifteen ran. The two he started opened their own subagents, those opened more, and one produced a fork that looped against the orchestration rule of the project's own contract. Nothing in the engine bounded any of it, and the only recursion guards that existed were the supervisor's sweep flag and the ledger's process-identity check, neither of which is about dispatch.
+
+Three independent things made it possible, and each is now answered. **The contract decides the role from the environment**: section 0.5 of `AGENTS.md` used to open by telling whoever read it that they were the orchestrator and must never produce the artifact, which a dispatched child read and obeyed. It now opens by checking `NIRVANA_DISPATCH_DEPTH`, and a child carrying that stamp is told it is the executor: produce the artifact, do not delegate, do not open subagents. **A dispatched worker no longer gets its runtime's own subagent tool**, which is the leg the engine cannot see, since that multiplication happens inside one child and never passes through the driver; `claude --disallowedTools Task Agent` denies it on top of the trust flags, and a caller that genuinely orchestrates opts back in with `allowSubagents: true`. **And the engine refuses a dispatch past a finite ceiling**: `execution.max_dispatch_depth`, default 4, which clears both topologies the engine actually walks: from a terminal a business sits at 1, one of its seats at 2 and a squad that seat uses at 3, while in the Glance chat the maestro is itself a spawned child, so the same chain ends at 4. With 0 meaning unlimited. The depth travels in `NIRVANA_DISPATCH_DEPTH`, which the child-env allowlist keeps by prefix, so a filtered spawn cannot lose the counter. A refusal names both numbers and the setting, records `x_dispatch_depth_refused`, and starts no process.
+<<<<<<< HEAD
+
+### Only employees use squads, and a squad never dispatches
+
+A depth ceiling bounds a chain but says nothing about who is in it, and a squad dispatched straight from the maestro sits at depth 1 with room underneath. The rule is therefore about roles: a **business** opens its own org chart and the squads its seats carry; an **employee** may use squads to build its deliverable, as many as the work needs, and nothing else, because a seat that convenes another company is the runaway; a **squad** executes and never dispatches, and so do `agent-x` and every decision step (the business director, a judge, a router), which run with tools and full trust and so need a rule rather than a hope. Every real dispatch site now declares what it is spawning, the driver stamps it in `NIRVANA_DISPATCH_ROLE`, and a spawn the rule forbids is refused before any process starts, with `x_dispatch_role_refused` in the audit and a message that names the rule instead of a setting to raise. An unknown stamp reads as the operator rather than blocking every run. The contract states the same rule in words, beside the cascade it qualifies.
+=======
+>>>>>>> bb46e5c (fix(dispatch): the ceiling clears the Glance topology, and an employee may use several squads)
+
+### `nrv exec` — the runtime as itself, and honest about what that is worth
+
+Everything the engine does with a runtime wraps the brief: a persona, the autonomous directive, an outputs root, the ledger, the delivery pipeline, the quality gate. That wrapping is the product, and it is also why there was no way to ask a runtime a plain question. `--agent-x` is the thinnest dispatch and still carries all of it, so an errand around the work — check a fact, ask a second runtime when the one you are sitting in has hit a limit of its own, read something back in a language you do not write — had no home. `nrv exec [--runtime=<rt>] "<prompt>"` is that home, and it promises nothing: no persona, no outputs directory, no run in the ledger, no gate. It picks the runtime by the same rule a dispatch does, so the session's own runtime is the default and a named one that is not installed is a stop rather than a silent substitution to another vendor. `--json` returns `{ok, runtime, result, cost_usd, duration_ms, gate: null}`, and that `gate: null` is the point: the value of this engine is that a deliverable has `gate_passed` behind it, so a command that returns raw text says on stderr, every time, that it passed no gate and produced no artifact. It is an operator tool and the role rule is what makes that true rather than documented: `exec` carries an empty allowance, so a squad, a seat, a director or another exec is refused — a dispatched agent shelling out to it would be an unsupervised agent with a different name. Every errand records `x_exec_passthrough` with its runtime, cost and duration, and never with the prompt.
+
+### A stray `USE_` variable no longer looks like a broken rule
+
+`USE_<runtime>` and `NOT_USE_<runtime>` are how a project steers a dispatch to a runtime, and an unrecognized one printed `[runtime-rules] unknown runtime … rule ignored` so a typo would not sit silent. The prefix is not ours alone, though: a CI runner with Bazel exports `USE_BAZEL_FALLBACK_VERSION`, and every `nrv` call on that machine warned about it — alarming, useless, and measured on this repository's own CI. The warning is now limited to a variable that came from a `.env` file, which exists to hold these rules and nothing else, so a real typo is still reported while the machine's own environment is read in silence.
+
 ## 0.13.14 — 2026-09-17
 
 ### A dispatched agent sees an allowlist of the environment, not a copy of it

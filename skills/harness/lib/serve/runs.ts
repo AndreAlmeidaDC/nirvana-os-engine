@@ -20,6 +20,17 @@ import { defaultDotenvFiles, knownSecrets, redactText } from "../../../_shared/l
 
 /** The secrets a response from this server must never carry: credential-like
  *  variables of the server and the dotenv files of the session and the home. */
+/** Did the runtime error after producing files? The dispatcher records it in
+ *  the run own audit; absence of the file simply means no. */
+function runtimeErrored(outputsRoot: string): boolean {
+  for (const f of [path.join(outputsRoot, "audit.jsonl"), path.join(outputsRoot, "..", "audit.jsonl")]) {
+    try {
+      if (fs.readFileSync(f, "utf8").includes("x_runtime_errored_with_artifacts")) return true;
+    } catch { /* no audit here */ }
+  }
+  return false;
+}
+
 export function serveKnownSecrets(sessionDir: string): Array<[string, string]> {
   return knownSecrets({ env: process.env, dotenvFiles: defaultDotenvFiles({ cwd: sessionDir, projectRoot: sessionDir }) });
 }
@@ -30,7 +41,19 @@ export function redactForClient(text: string | null, sessionDir: string): { text
   return redactText(text, serveKnownSecrets(sessionDir));
 }
 
-export type RunEnvelopeState = "queued" | "running" | "delivered" | "withheld" | "indeterminate" | "failed";
+/**
+ * Where a run's artifacts live, for `nrv serve`.
+ *
+ * One function so the writer and both readers cannot drift apart again. It is
+ * the same shape `outputsDir()` returns for a project — `<root>/outputs/<run>`
+ * — which is what OUTPUTS_CONTRACT calls canonical and what every other layer
+ * of the engine computes on its own. An empty `traceId` returns the base.
+ */
+export function runOutputsRoot(sessionDir: string, traceId: string): string {
+  return traceId ? path.join(sessionDir, "outputs", traceId) : path.join(sessionDir, "outputs");
+}
+
+export type RunEnvelopeState = "queued" | "running" | "delivered" | "withheld" | "indeterminate" | "failed" | "cancelled";
 
 export interface RunEnvelope {
   trace_id: string;
@@ -47,6 +70,17 @@ export interface RunEnvelope {
   summary: string | null;
   /** Contents of _QA-RESERVATIONS.md — honesty as a field, not a footnote. */
   reservations: string | null;
+  /**
+   * True when the runtime reported an error and the work was judged anyway.
+   *
+   * Not a failure state: the artifacts existed, the verifier ran and the gate
+   * approved them, which is the engine doing the right thing rather than
+   * throwing away finished work. But a client reading `delivered` with exit 0
+   * had no way to know the runtime had died, while the ledger, the audit and
+   * the CLI all did. A fact the engine holds and the answer omits is the kind
+   * of silence this envelope exists to prevent.
+   */
+  runtime_errored: boolean;
   error: string | null;
 }
 
@@ -93,7 +127,12 @@ function rehydrate(traceId: string, sessionsRoot: string): RunMemo | null {
   let sessions: string[];
   try { sessions = fs.readdirSync(sessionsRoot); } catch { return null; }
   for (const sid of sessions) {
-    const f = path.join(sessionsRoot, sid, ".nirvana", "outputs", traceId, ".run.json");
+    // Canonical first, then the legacy root: a server upgraded mid-flight
+    // must still find the runs it wrote yesterday.
+    const f = [runOutputsRoot(path.join(sessionsRoot, sid), traceId),
+           path.join(sessionsRoot, sid, ".nirvana", "outputs", traceId)]
+      .map((d) => path.join(d, ".run.json")).find((p) => fs.existsSync(p))
+      ?? path.join(runOutputsRoot(path.join(sessionsRoot, sid), traceId), ".run.json");
     try {
       const raw = JSON.parse(fs.readFileSync(f, "utf8")) as RunMemo;
       // A run that was mid-flight when the server died is not "running" any
@@ -146,6 +185,47 @@ export function all(): RunMemo[] {
  * with quotes, newlines or a shell metacharacter must not depend on
  * escaping (and argv has a length ceiling).
  */
+/**
+ * Live children of THIS server process, by trace.
+ *
+ * Cancelling by pid is not safe: a pid that answers is not proof it is ours.
+ * The process that used to live there can have exited, and the OS is free to
+ * hand the same number to anything spawned since — the supervisor carries the
+ * same warning and the same guard. Holding the handle removes the question.
+ */
+const live = new Map<string, { kill(signal?: NodeJS.Signals): boolean }>();
+
+/**
+ * Stops a run that is still going.
+ *
+ * A run had no way to end but its own: an expensive one could only be stopped
+ * by opening an SSH session and killing it by hand, which is not something a
+ * client of an HTTP API can do and not something an owner should have to.
+ *
+ * SIGTERM, not SIGKILL, so the runtime closes its own children and flushes what
+ * it wrote — the artifacts already on disk are not the enemy. The state is
+ * `cancelled`, its own terminal state rather than `failed`: a run the owner
+ * stopped is not a run that broke, and telling those apart is the whole reason
+ * an envelope carries a state.
+ *
+ * A run started by a PREVIOUS server process has no handle here. It is marked
+ * cancelled and `signalled` comes back false, so the caller is told plainly
+ * that the process was not reached rather than being left to assume it was.
+ */
+export function cancel(memo: RunMemo, reason = "cancelled by the owner"): { memo: RunMemo; signalled: boolean } {
+  if (memo.state !== "queued" && memo.state !== "running") return { memo, signalled: false };
+  let signalled = false;
+  const child = live.get(memo.trace_id);
+  if (child) {
+    try { signalled = child.kill("SIGTERM"); } catch { signalled = false; }
+  }
+  memo.state = "cancelled";
+  memo.error = signalled ? reason : `${reason} (the run process was not reachable from this server)`;
+  memo.finished_at = new Date().toISOString();
+  persist(memo);
+  return { memo, signalled };
+}
+
 export function start(memo: RunMemo, opts: { budgetUsd?: number } = {}): Promise<RunMemo> {
   const { bin, script } = dispatchCmd();
   fs.mkdirSync(memo.outputs_root, { recursive: true });
@@ -185,10 +265,13 @@ export function start(memo: RunMemo, opts: { budgetUsd?: number } = {}): Promise
       stdio: ["ignore", "pipe", "pipe"],
     });
     memo.child_pid = child.pid ?? null;
+    live.set(memo.trace_id, child);
     let stderr = "";
     child.stderr?.on("data", (b) => { stderr = (stderr + b.toString()).slice(-4000); });
     child.stdout?.resume();
     child.on("error", (e) => {
+      live.delete(memo.trace_id);
+      if (memo.state === "cancelled") { resolve(memo); return; }
       memo.state = "failed";
       memo.error = e.message;
       memo.finished_at = new Date().toISOString();
@@ -196,6 +279,10 @@ export function start(memo: RunMemo, opts: { budgetUsd?: number } = {}): Promise
       resolve(memo);
     });
     child.on("close", (code) => {
+      live.delete(memo.trace_id);
+      // A cancelled run keeps its state: the close that follows a SIGTERM is
+      // the consequence, not a new verdict.
+      if (memo.state === "cancelled") { resolve(memo); return; }
       memo.exit_code = code ?? 1;
       memo.finished_at = new Date().toISOString();
       memo.state = stateFromExit(memo.exit_code);
@@ -222,6 +309,7 @@ function gateFromState(state: RunEnvelopeState, outputsRoot: string): RunEnvelop
   }
   if (state === "withheld") return "fail";
   if (state === "indeterminate") return "indeterminate";
+  if (state === "cancelled") return null;
   return null;
 }
 
@@ -240,6 +328,13 @@ export function envelope(memo: RunMemo): RunEnvelope {
     created_at: memo.created_at,
     finished_at: memo.finished_at,
     exit_code: memo.exit_code,
+    // The runtime died and the work was judged anyway. The engine knew:
+    // the ledger marks the run failed, the audit records
+    // x_runtime_errored_with_artifacts and the CLI prints a warning. The
+    // envelope dropped it, so an API client saw `delivered` with exit 0 and
+    // no way to tell. The state is right — the gate did pass — and the
+    // caveat travels beside it, the way `fail-accepted` already does.
+    runtime_errored: runtimeErrored(memo.outputs_root),
     artifacts,
     summary: redactForClient(readIf(path.join(memo.outputs_root, "_SUMMARY.md"))
       ?? readIf(path.join(memo.outputs_root, "outputs", "_SUMMARY.md")), memo.session.dir).text,
