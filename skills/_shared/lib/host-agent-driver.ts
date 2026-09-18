@@ -53,11 +53,18 @@ import { EFFORT_LEVELS, isEffortLevel, resolvePinnedEffort, resolveSystemModel }
 import { resolveSetting } from "./settings.ts";
 import { childEnv } from "./orca.ts";
 import { childEnvFor, type ChildEnvMode } from "./child-env.ts";
+import { childDepth, currentDepth, currentRole, DEFAULT_MAX_DEPTH, DEPTH_ENV, mayDispatch, refusalMessage, roleMayDispatch, roleRefusalMessage, ROLE_ENV, type DispatchRole } from "./dispatch-depth.ts";
 import { runOrcaWorker } from "./orca-worker.ts";
 
 /** `execution.child_env`. The variable NIRVANA_CHILD_ENV wins over any file
  *  (settings precedence), which is how a child that was itself filtered — it
  *  carries the stamp — filters its own children the same way. */
+/** `execution.max_dispatch_depth`; 0 or less means unlimited. */
+function maxDispatchDepth(): number {
+  try { const v = Number(resolveSetting("execution.max_dispatch_depth").value); return Number.isFinite(v) ? v : DEFAULT_MAX_DEPTH; }
+  catch { return DEFAULT_MAX_DEPTH; }
+}
+
 function childEnvModeSetting(): ChildEnvMode {
   try { return String(resolveSetting("execution.child_env").value) === "declared" ? "declared" : "inherit"; }
   catch { return "inherit"; }
@@ -1147,6 +1154,14 @@ export interface RunHeadlessOpts {
    * (`nrv dispatch --safe`). NIRVANA_HEADLESS_SKIP_PERMISSIONS=0 forces
    * `false` for every run (see headlessSkipPermissions). */
   yolo?: boolean;
+  /** Let this child open its own subagents (the runtime own Task/Agent tool).
+   *  Off by default: a dispatched worker produces the artifact, and the engine
+   *  is the only orchestrator. See the deny in the claude-code arg builder. */
+  allowSubagents?: boolean;
+  /** WHAT is being dispatched, so the role rule can be enforced: a business
+   *  employee may dispatch a squad, a squad may dispatch nothing. Absent means
+   *  the target is unknown, and then only the empty-allowance roles refuse. */
+  dispatchRole?: DispatchRole;
   /** Optional model override. Passed as `--model <id>` (or equivalent) to the
    * underlying CLI. Honors model hints from LLM_CASCADE entries. If unset,
    * each CLI uses its own configured default. */
@@ -1381,6 +1396,10 @@ let managedCtx: ManagedSpawnCtx | null = null;
  * dispatched child answers with itself, on every OS and for the runtimes whose
  * markers we could not measure. */
 let spawnAsRuntime: string | null = null;
+/** The role stamped on the next child. Same idiom and same safety as
+ *  spawnAsRuntime above: set by runHeadless immediately around a SYNCHRONOUS
+ *  spawn, saved and restored, so it cannot leak across calls. */
+let spawnAsRole: string | null = null;
 
 /** All runners spawn their child through this. Pass-through to spawnSync when
  * unledgered (zero behavior change); with an active ledger context, stdout/
@@ -1405,6 +1424,12 @@ function driverSpawnSync(cmd: string, args: string[], options: SpawnSyncOptions 
   // and the variables the installed squads declare — never the operator's
   // whole environment.
   const baseEnv = childEnvFor(childEnv(), { mode: childEnvModeSetting(), runtime: spawnAsRuntime ?? null });
+  // The child knows how deep it is, so ITS own dispatches count from here. The
+  // NIRVANA_ prefix survives the declared-mode allowlist, so the counter cannot
+  // be dropped by a filtered spawn.
+  baseEnv[DEPTH_ENV] = String(childDepth());
+  // And WHAT it is, so its own dispatches answer to the role rule.
+  if (spawnAsRole) baseEnv[ROLE_ENV] = spawnAsRole;
   options = {
     env: spawnAsRuntime ? { ...baseEnv, NIRVANA_HOST_RUNTIME: spawnAsRuntime } : baseEnv,
     ...(exec.shell ? { shell: true } : {}),
@@ -1554,6 +1579,24 @@ function runClaudeCode(opts: RunHeadlessOpts): RunHeadlessResult {
   } else {
     args.push("--dangerously-skip-permissions");
   }
+
+  // A dispatched worker does not open its own agents. This is the leg of the
+  // recursion the engine cannot otherwise see: a depth counter only counts
+  // ENGINE dispatches, while the runtime's own subagent tool multiplies inside
+  // one child and never passes through here. Reported from a live run — two
+  // dispatches became fifteen agents, "each opening its own subagents, and
+  // those opened more".
+  //
+  // Denying is the right shape rather than narrowing --allowedTools: a worker
+  // legitimately needs the broad tool set to produce an artifact, and
+  // enumerating it would go stale on the next CLI release. `claude --help`
+  // (audited 2026-09-18) documents `--disallowedTools`, which applies as a deny
+  // list on top of the trust flags. Both spellings are passed because the tool
+  // was renamed across versions; a name the CLI does not know is inert.
+  //
+  // A caller that genuinely orchestrates — not a worker — opts back in with
+  // `allowSubagents: true`.
+  if (!opts.allowSubagents) args.push("--disallowedTools", "Task", "Agent");
 
   if (typeof opts.maxBudgetUsd === "number") args.push("--max-budget-usd", String(opts.maxBudgetUsd));
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
@@ -2308,6 +2351,31 @@ const BUDGET_CAPABLE: ReadonlySet<Runtime> = new Set<Runtime>(["claude-code"]);
 const _warnedUncappable = new Set<string>();
 
 export function runHeadless(opts: RunHeadlessOpts): RunHeadlessResult {
+  // WHO may dispatch WHAT. The owner's rule: a business employee may use a
+  // squad to build its deliverable; a squad executes and never dispatches.
+  // Checked before the depth ceiling because it is the sharper of the two — a
+  // squad dispatched straight from the maestro sits at depth 1 with room
+  // underneath, and depth alone would let it open another squad.
+  if (!roleMayDispatch(opts.dispatchRole ?? null)) {
+    const error = roleRefusalMessage(opts.dispatchRole ?? null);
+    console.error(`[driver] ${error}`);
+    try { loadAudit()?.emit?.("x_dispatch_role_refused", { role: currentRole(), target: opts.dispatchRole ?? null, runtime: opts.runtime }); }
+    catch { /* audit is never the reason a refusal fails to happen */ }
+    return { ok: false, runtime: opts.runtime, sessionId: null, result: "", costUsd: null, exitCode: null, stderr: error, durationMs: 0, error };
+  }
+  // Agents dispatching agents, bounded. The ceiling is read here because this
+  // is the one funnel every dispatch of every runtime passes through, and a
+  // refusal has to look like a failed run so callers already handle it.
+  const maxDepth = maxDispatchDepth();
+  if (!mayDispatch(maxDepth)) {
+    const error = refusalMessage(maxDepth);
+    console.error(`[driver] ${error}`);
+    // Fire and forget through the driver own lazy accessor: a refusal must
+    // happen whether or not the sibling skill can be loaded.
+    try { loadAudit()?.emit?.("x_dispatch_depth_refused", { depth: currentDepth(), max_depth: maxDepth, runtime: opts.runtime }); }
+    catch { /* audit is never the reason a refusal fails to happen */ }
+    return { ok: false, runtime: opts.runtime, sessionId: null, result: "", costUsd: null, exitCode: null, stderr: error, durationMs: 0, error };
+  }
   // The operator's switch outranks the caller: with the bypass disabled every
   // runner takes its restricted path, the same one `--safe` selects.
   if (!headlessSkipPermissions() && opts.yolo !== false) opts = { ...opts, yolo: false };
@@ -2339,11 +2407,14 @@ function dispatchToRunner(opts: RunHeadlessOpts): RunHeadlessResult {
   // runtime must not look as though it was obeyed.
   warnEffortUnsupported(opts, opts.runtime);
   const previousSpawnAs = spawnAsRuntime;
+  const previousSpawnRole = spawnAsRole;
   spawnAsRuntime = opts.runtime;
+  spawnAsRole = opts.dispatchRole ?? null;
   try {
     return dispatchToRunnerInner(opts);
   } finally {
     spawnAsRuntime = previousSpawnAs;
+    spawnAsRole = previousSpawnRole;
   }
 }
 
