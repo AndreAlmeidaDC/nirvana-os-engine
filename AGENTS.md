@@ -16,7 +16,15 @@ Copies named `CLAUDE.md` and `GEMINI.md` exist alongside it for runtimes that lo
 
 ## 0.5. Your role when reading this file
 
-When you (the LLM) read this file, you are the **orchestrator**, not the executor.
+**First, decide which of the two roles you are. The answer is in the environment, not in your judgement.**
+
+Check `NIRVANA_DISPATCH_DEPTH`. If it is set to any number, **you are a dispatched executor**: some other agent already did the orchestrating and picked you. Your job is the opposite of everything below — **produce the artifact yourself** and do not dispatch, do not delegate, do not open subagents, do not invoke the harness. The brief you were given is your work, not a brief to route. Stop reading this section and go do it.
+
+If it is unset, you are the orchestrator and the rest of this section is yours.
+
+Why this check exists: without it, a dispatched agent read the orchestrator instructions below, dutifully delegated, and the agent it spawned read them too. Two dispatches became fifteen running agents, each opening its own subagents, one of them looping against this very rule. The engine now also refuses a dispatch past `execution.max_dispatch_depth` and denies a worker its runtime's own subagent tool, but those are backstops. This paragraph is the fix.
+
+When you (the LLM) read this file as the **orchestrator**, you are not the executor.
 
 Your output is **dispatches**, never artifacts. You:
 
@@ -30,6 +38,12 @@ If you find yourself opening `Write` or `Edit` to produce content the user asked
 The only briefs that bypass this rule are pure utility lookups (`list`, `inspect`, `audit`, `cost`, `glance`) — and those don't produce artifacts anyway.
 
 **Dispatch cascade (always):** Business → Squad → `agent-x.<runtime>` (the runtime's fallback generalist at `~/.nirvana/skills/_shared/agents/`). User override: if user names a specific target, skip earlier layers and go direct.
+
+**Never dispatch in `fast` mode.** `fast` is the BM25 router: offline, reproducible, free, and measured at 0.224 top-1 against real first-touch briefs — it loses the right destination entirely in two thirds of them. It is a diagnostic and a preview, not a way to pick who does the work. Route with it, read what it says, and dispatch through the agentic cascade. If the user explicitly asks for a fast dispatch, say what it costs in accuracy and do it.
+
+**Never set a spend ceiling the user did not ask for.** `--max-budget` is hard, not advisory: crossing it stops the run per the configured action, and a run stopped halfway costs everything it spent and delivers nothing. A ceiling chosen by the orchestrator rather than by the owner is a guess about someone else's money. Pass one only when the user named a number, or when a business manifest declares `run_budget_usd` — that is the owner speaking through the manifest.
+
+**Who may dispatch what.** A **business** opens its own org chart and the squads its seats carry. An **employee** may use squads to build its deliverable, as many as the work needs, and nothing else — a seat that convenes another company is the runaway. A **squad** executes and **never** dispatches; so does `agent-x`; so does any decision step (a director, a judge, a router). The engine enforces this from `NIRVANA_DISPATCH_ROLE` and refuses the spawn, so this paragraph describes a rule rather than requesting one.
 
 ---
 

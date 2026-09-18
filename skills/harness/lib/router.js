@@ -907,7 +907,7 @@ function stage2Match(intent, registries, opts) {
 
   const idx = bm25.buildIndex(docs);
   const queryStr = brief + ' ' + ((intent && intent.domains) || []).join(' ') + ' ' + ((intent && intent.verbs) || []).join(' ');
-  const raw = bm25.query(idx, queryStr, { topK: (opts && opts.topK) || 10 });
+  const raw = bm25.query(idx, queryStr, { topK: (opts && opts.topK) || STAGE2_TOPK });
 
   const adjusted = applyAdjustments(raw, intent && intent.intent, brief);
   return adjusted.map((r) => ({
@@ -936,7 +936,7 @@ async function stage2MatchHybrid(intent, registries, opts) {
   // amplified tokens — the Stage 3 coverage gate would go blind. The census
   // measurement base (real ≥3 matched, out-of-domain ≤2) is the raw brief.
   const coverageBrief = (opts && opts.coverageBrief) || brief;
-  const topK = (opts && opts.topK) || 10;
+  const topK = (opts && opts.topK) || STAGE2_TOPK;
   const prepared = opts && opts.preparedMatchIndex;
   const docs = prepared ? prepared.docs : buildMatchDocs(registries.squads, registries.businesses);
   if (docs.length === 0) return [];
@@ -1030,6 +1030,82 @@ async function stage2MatchHybrid(intent, registries, opts) {
  * stage3Decide and the Stage 3.5 dense-fallback dedupe: two candidates with
  * one destination are one suggestion, not an ambiguity.
  */
+/**
+ * How many candidates a Stage 3 decision EXPOSES. Not a scoring parameter: the
+ * signal is decided before this list is built, so widening it cannot turn a
+ * NO_MATCH into a HIGH.
+ *
+ * It was 3, and 3 was measured to be the dominant loss of the whole router.
+ * On the 35 real briefs harvested from the audit log (2026-09-17, installed
+ * 0.13.13): the right destination is the exposed top-1 in 0.171 of them, sits
+ * in the first 3 distinct destinations in 0.371, and in the first 15 in 0.686.
+ * The retriever finds the answer four times more often than the decision let
+ * anyone see it. Nothing downstream reads this list as membership — the
+ * self-retrieval gate compares `rank <= maxRank`, the business verifier asks
+ * for `hit === 0`, and eval-routing measures position 1 and the first 3 — so
+ * the depth is free to the gates and only makes their diagnostics honest
+ * (a miss past rank 3 used to report rank "unknown").
+ */
+const EXPOSED_ALTERNATIVES_MAX = 15;
+
+/**
+ * How many scored slots Stage 2 retrieves. Slots are per capability, so this is
+ * not a count of destinations: 30 slots yielded 17.6 distinct destinations on
+ * the real briefs, which is what fills a 15-destination exposure.
+ *
+ * It was 10, and 10 starved the exposure the moment the cap came off. Swept
+ * offline on the 35 real briefs harvested from the audit log (amplifier off, so
+ * the numbers reproduce), measuring whether the right destination lands inside
+ * the exposed window:
+ *
+ *   topK    distinct    in window    business    squad    ms/35 briefs
+ *     10         6.3        0.571       0.474    0.688          11055
+ *     20        12.0        0.657       0.632    0.688          12330
+ *     30        17.6        0.714       0.632    0.813          12333
+ *     40        23.1        0.686       0.632    0.750          12707
+ *     60        33.8        0.686       0.632    0.750          12656
+ *    120        62.4        0.686       0.632    0.750          13170
+ *
+ * 30 is the peak, and past it recall FALLS: more slots crowd more destinations
+ * into the first 15 and push the right one out of the window. The weak axis
+ * gains most (business 0.474 -> 0.632). Cost is about 37ms per brief, all of it
+ * BM25 sort, with no network.
+ *
+ * Deeper retrieval cannot move the winner: topK keeps the highest scorers, so
+ * everything it adds scores below what was already there, which also leaves the
+ * Stage 3 ambiguity cluster (a window around the top) untouched.
+ */
+const STAGE2_TOPK = 30;
+
+/**
+ * The exposed list for a decision that asks the caller to CHOOSE: one entry per
+ * destination, in score order, up to EXPOSED_ALTERNATIVES_MAX of them.
+ *
+ * Deduping by destination is the point here and not elsewhere. A brief that
+ * cannot be decided needs variety of destinations to pick from, and slots are
+ * per capability, so the same squad used to occupy several of the three
+ * (measured on the real briefs: 4.34 slots collapsed to 2.06 destinations, so
+ * a "top 3" was a choice between two). Inside a single-destination HIGH
+ * cluster the opposite is true — sibling capabilities of one squad are
+ * legitimately distinct candidates — which is why those paths stay positional.
+ * Candidates with no resolvable destination are kept, never deduped.
+ */
+function exposeAlternatives(matches, opts) {
+  const limit = (opts && typeof opts.limit === 'number') ? opts.limit : EXPOSED_ALTERNATIVES_MAX;
+  const out = [];
+  const seen = new Set();
+  for (const m of (Array.isArray(matches) ? matches : [])) {
+    const destination = resolveDestination(m);
+    if (destination) {
+      if (seen.has(destination)) continue;
+      seen.add(destination);
+    }
+    out.push(m);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 function resolveDestination(m) {
   const meta = (m && (m.meta || (m.doc && m.doc.meta))) || {};
   if (meta.type === 'business_route') return String(meta.route_to || '').split('::')[0] || null;
@@ -1132,14 +1208,14 @@ function stage3Decide(matches, opts) {
       return {
         signal: 'NO_MATCH',
         reason: `coverage: vencedor casa ${cov.matched} de ${cov.total} tokens de conteúdo do brief`,
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         thresholds: thr,
       };
     }
     if (cov.matched === 2 && cov.total >= 4 && frac <= 0.5) {
       return {
         signal: 'AMBIGUOUS',
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         reason: `coverage: vencedor casa só 2 de ${cov.total} tokens de conteúdo — confirmação necessária`,
         thresholds: thr,
       };
@@ -1155,7 +1231,7 @@ function stage3Decide(matches, opts) {
     if (cov.matched <= 1 && cov.total === 2) {
       return {
         signal: 'AMBIGUOUS',
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         reason: `coverage: vencedor casa ${cov.matched} de 2 tokens de conteúdo — confirmação necessária`,
         thresholds: thr,
       };
@@ -1168,7 +1244,7 @@ function stage3Decide(matches, opts) {
     return {
       signal: 'HIGH',
       target: top,
-      alternatives: matches.slice(1, 3),
+      alternatives: matches.slice(1, EXPOSED_ALTERNATIVES_MAX),
       reason: `top=${top.normalized.toFixed(3)} ge ${thr.match_high_threshold} & lead=${lead.toFixed(3)} ge ${thr.match_high_lead}`,
       thresholds: thr,
     };
@@ -1197,7 +1273,7 @@ function stage3Decide(matches, opts) {
       return {
         signal: 'HIGH',
         target: top,
-        alternatives: cluster.slice(1, 3),
+        alternatives: cluster.slice(1, EXPOSED_ALTERNATIVES_MAX),
         reason: `${cluster.length} candidatos, destino único ${[...destinos][0]}`,
         thresholds: thr,
       };
@@ -1217,7 +1293,7 @@ function stage3Decide(matches, opts) {
     // Single match between ambiguous and high. Prefer to surface as AMBIGUOUS so user confirms.
     return {
       signal: 'AMBIGUOUS',
-      alternatives: [top, ...matches.slice(1, 3)],
+      alternatives: [top, ...matches.slice(1, EXPOSED_ALTERNATIVES_MAX)],
       reason: `top ${top.normalized.toFixed(3)} below high threshold ${thr.match_high_threshold} — confirm`,
       thresholds: thr,
     };
@@ -1226,7 +1302,7 @@ function stage3Decide(matches, opts) {
   return {
     signal: 'NO_MATCH',
     reason: `top score ${top.normalized.toFixed(3)} below ambiguous threshold ${thr.match_ambiguous_threshold}`,
-    alternatives: matches.slice(0, 3),
+    alternatives: exposeAlternatives(matches),
     thresholds: thr,
   };
 }
@@ -1280,6 +1356,22 @@ const DENSE_FALLBACK_MIN_COSINE = 0.55;
  *  context.denseMode is the test hook; the routing.dense setting otherwise.
  * @returns {Promise<'off'|'fallback'>}
  */
+/**
+ * The system routing mode, read through its single source of truth
+ * (_shared/lib/routing-mode.ts: --mode > routing.mode > env > project > global
+ * > agentic). Dynamic import for the same reason denseFallbackMode gives below;
+ * failure resolves to agentic, which changes nothing.
+ */
+async function routingMode(context) {
+  if (context && typeof context.mode === 'string' && context.mode) return context.mode;
+  try {
+    const m = await import(path.join(__dirname, '..', '..', '_shared', 'lib', 'routing-mode.ts'));
+    return m.resolveRoutingMode();
+  } catch {
+    return 'agentic';
+  }
+}
+
 async function denseFallbackMode(context) {
   if (context && (context.denseMode === 'off' || context.denseMode === 'fallback')) {
     return context.denseMode;
@@ -2040,10 +2132,30 @@ async function route(brief, ctx) {
   // Stage -2 — Brief strength classifier (zero LLM)
   const strengthReport = classifyBriefStrength(brief);
 
+  // The amplifier is an LLM call at both of its trigger points (Stage -1.5 on a
+  // WEAK brief, and the Stage 2.7 coverage bridge). There is no deterministic
+  // arm: builtin and maestro name the PERSONA, not an offline path. So the mode
+  // decides whether it may run at all.
+  //
+  // The fast mode is the one a caller picks to get a reproducible answer for
+  // free, and it was neither. Measured 2026-09-18 on the live corpus: ten real
+  // briefs routed twice inside one process, same registries, returned different
+  // signals (one brief flipped HIGH to AMBIGUOUS between consecutive passes);
+  // with the amplifier off the two passes were identical. It also spent tokens
+  // on every WEAK brief, which is why verify/kinds/business.ts and the bridge
+  // tests already disable it by hand.
+  //
+  // An explicit context.amplify still wins in both directions. The mode is the
+  // default, never an override.
+  const routingModeName = await routingMode(context);
+  const amplifyAllowed = typeof context.amplify === 'boolean'
+    ? context.amplify
+    : routingModeName !== 'fast';
+
   // Stage -1.5 — Optional amplification when WEAK (or --force-amplify)
-  // Disabled by --no-amplify (context.amplify === false).
+  // Disabled by --no-amplify (context.amplify === false) and by the fast mode.
   const shouldAmplify =
-    context.amplify !== false &&
+    amplifyAllowed &&
     (context.forceAmplify === true || strengthReport.strength === 'WEAK');
   if (shouldAmplify) {
     const amp = await amplifierFn(brief, {
@@ -2071,7 +2183,9 @@ async function route(brief, ctx) {
       amplifier_used: 'skipped',
       reason: context.amplify === false
         ? 'amplify_disabled'
-        : `strength=${strengthReport.strength}_above_threshold`,
+        : !amplifyAllowed
+          ? `amplify_disabled_by_mode_${routingModeName}`
+          : `strength=${strengthReport.strength}_above_threshold`,
       original_brief: originalBrief,
       strength: strengthReport,
     };
@@ -2184,7 +2298,7 @@ async function route(brief, ctx) {
 
   // Stage 2 — Capability matching (BM25 + denso opcional + business_route, RRF)
   let matches = await stage2MatchHybrid(intent, registries, {
-    brief, topK: 10, businessRouteRanked, coverageBrief: originalBrief,
+    brief, topK: STAGE2_TOPK, businessRouteRanked, coverageBrief: originalBrief,
     preparedMatchIndex: context.preparedMatchIndex,
   });
 
@@ -2237,7 +2351,7 @@ async function route(brief, ctx) {
     // ('skipped' = strength gate did not fire; 'failed' means a run was already
     // attempted and re-trying would double the failure, so it is excluded).
     if (!bridge.alias_adopted &&
-        context.amplify !== false &&
+        amplifyAllowed &&
         amplification && amplification.amplifier_used === 'skipped') {
       const amp = await amplifierFn(originalBrief, {
         preferAmplifier: context.preferAmplifier,
@@ -2265,7 +2379,7 @@ async function route(brief, ctx) {
           ? []
           : businessRouteCoverageRanked(brief, registries.businesses, { threshold: context.stage0Threshold });
         matches = await stage2MatchHybrid(intent, registries, {
-          brief, topK: 10, businessRouteRanked: rerankedRoutes, coverageBrief: originalBrief,
+          brief, topK: STAGE2_TOPK, businessRouteRanked: rerankedRoutes, coverageBrief: originalBrief,
           preparedMatchIndex: context.preparedMatchIndex,
         });
         // Post-amplify guard (a) — drift-to-zero (routing-360 Phase 4).
@@ -2373,6 +2487,9 @@ module.exports = {
   buildAliasMap,
   loadKeywordAliases,
   resolveDestination,
+  exposeAlternatives,
+  STAGE2_TOPK,
+  EXPOSED_ALTERNATIVES_MAX,
   DEFAULT_THRESHOLDS,
   DENSE_FALLBACK_MIN_COSINE,
   STAGE0_KEYWORD_THRESHOLD,
