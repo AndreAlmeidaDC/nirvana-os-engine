@@ -128,7 +128,7 @@ if (format === "tgz") {
   const relOutRaw = path.relative(parent, outputPath);
   const relOut = (relOutRaw === "" || relOutRaw.includes(":") ? outputPath : relOutRaw).split(path.sep).join("/");
   const tarArgs = ["-czf", relOut, ...excludes, basename];
-  r = spawnSync("tar", tarArgs, { encoding: "utf8", cwd: parent });
+  r = spawnSync("tar", tarArgs, { windowsHide: true, encoding: "utf8", cwd: parent });
 } else {
   // zip — use python3 zipfile to avoid `zip` dep on minimal systems
   const py = `
@@ -148,7 +148,7 @@ with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
             arc = os.path.relpath(p, os.path.dirname(src))
             z.write(p, arcname=arc)
 `;
-  r = spawnSync("python3", ["-c", py, archiveSource, outputPath, includeAudit ? "true" : "false"], { encoding: "utf8" });
+  r = spawnSync("python3", ["-c", py, archiveSource, outputPath, includeAudit ? "true" : "false"], { windowsHide: true, encoding: "utf8" });
 }
 
 if (r.status !== 0) {
