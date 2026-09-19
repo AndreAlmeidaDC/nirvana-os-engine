@@ -120,7 +120,7 @@ Escaneia + gera `${SQUADS_REGISTRY_PATH}` (incluindo `_v4_inferred_capabilities`
 | `tools_required[]` | (opcional) Tools que o agent precisa |
 | `not_for[]` | (opcional) Frases que penalizam match (ex: "B2C, consumer-grade") |
 | `score_boost` | `1.0` | Multiplicador de score no harness BM25. **Premium squads (awwwards, nirvana, etc.) recebem 1.2 quando inferred via v4-capability-inferrer.** |
-| `model_hint` | (opcional) `haiku | sonnet | opus` |
+| `model_hint` | (opcional) `haiku | sonnet | opus | fable | inherit` — padrão `inherit`, que significa o modelo do runtime do usuário |
 
 ### `components` (obrigatório)
 
@@ -133,9 +133,15 @@ Escaneia + gera `${SQUADS_REGISTRY_PATH}` (incluindo `_v4_inferred_capabilities`
 
 ### `runtime_requirements` (obrigatório)
 
+`policy: declared` é o padrão retrocompatível e exige `minimum[]`. `policy: active`
+usa o runtime que hospeda a sessão e pode omitir `minimum`; adapters registrados
+continuam preferenciais, features obrigatórias continuam fail-closed e
+`incompatible[]` continua sendo uma negação explícita. O engine nunca instala,
+inicia ou troca de runtime.
+
 | Campo | Função |
 |---|---|
-| `minimum[]` | Lista de `{runtime: <id>, version?: <v>}`. Runtimes aceitos: `claude-code, codex, gemini-cli, cursor, antigravity, openclaw, opencode` |
+| `minimum[]` | Lista de `{runtime: <id>, version?: <v>}`. Runtimes aceitos: `claude-code, codex, antigravity-cli, antigravity, gemini-cli, pi, kimi-cli, grok-cli, qwen-code, opencode, cursor, openclaw` |
 | `compatible[]` | Runtimes que também funcionam (sem garantia) |
 | `incompatible[]` | Runtimes que NÃO funcionam |
 

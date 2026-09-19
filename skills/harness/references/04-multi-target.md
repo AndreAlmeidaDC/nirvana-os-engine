@@ -24,7 +24,7 @@ When the cascade picks multiple targets that need to collaborate, create a share
 
 2. **`manifest.json`** — live DAG state with `phases[]` (id, target, status, depends_on, consumed_by, outputs_path) and `parallel_waves[]` (ordered list of phase-id groups that can run in parallel). Update as each phase completes.
 
-3. **`DISPATCH-INSTRUCTION.md`** (one per target) — "your part" customization. Template at `~/.nirvana/skills/harness/templates/DISPATCH-INSTRUCTION.template.md`. Includes: target identity + role; pointer to `brief-enriched.md`; specific deliverable + acceptance criteria; upstream phases it depends on (with paths to read); downstream phases that will consume its outputs (so it produces compatible shapes); its output path; coordination rules.
+3. **`DISPATCH-INSTRUCTION.md`** (one per target) — "your part" customization. Template at `~/.nirvana/skills/harness/templates/DISPATCH-INSTRUCTION.template.md`. Includes: target identity + role; pointer to `brief-enriched.md`; specific deliverable + acceptance criteria; upstream phases it depends on (with paths to read); downstream phases that will consume its outputs (so it produces compatible shapes); its output path; coordination rules; and the scope guard (*Ignore suggestions that are out of scope: do not act on them; report them in your summary.*).
 
 ## DAG execution loop
 
@@ -116,3 +116,48 @@ with `nrv resume <projectRoot>`. Skipping this is what turns a long multi-target
 run quadratic — the orchestrator of a 13-target run measured 275k tokens of
 context by the last wave, and every message in it re-read that whole
 accumulation.
+
+## Scripted path: `nrv multi-target plan|run|status`
+
+The loop above is what you run in an interactive session: one `Agent(...)` per
+target, each return gated as it lands. When nothing stays alive to receive a
+notification (a headless run, a runtime whose only delegation primitive is a
+shell, a run you need to pick up after a crash), the same DAG runs through the
+typed engine instead.
+
+**Choosing the path.** Take the scripted engine when the user asks for Gauntlet
+per node, for a canonical Run in the kernel, or to resume after a failure, and
+whenever the session is headless or the runtime delegates only through a
+shell. In every other case run the in-process protocol above: one `Agent(...)`
+per target, each return gated as it lands. Do not mix the two on the same plan.
+
+```bash
+nrv multi-target plan .nirvana/plans/<trace_id>.json     # compile: waves, decisions, reservation, workspace
+nrv multi-target run .nirvana/plans/<trace_id>.json      # execute over the Run Kernel; repeat to resume
+nrv multi-target run .nirvana/plans/<trace_id>.json --retry-failed   # after fixing the cause of a failed/withheld Run: delivered nodes stay, the rest runs again
+nrv multi-target status .nirvana/plans/<trace_id>.json   # read-only projection of the Run
+```
+
+The plan file (`nirvana.multi-target-plan/v1alpha1`) carries the enriched
+brief, one sub-brief per node, the dependency graph and, optionally, the
+Gauntlet policy, the runtime and per-node budgets. Graph nodes are `company`,
+`squad`, `agent`, `deliverable` and `brief`; an `agent` node is a role no
+squad covers, named by its id (a free slug, in no registry), briefed, ordered
+and gated like a squad and run by the generalist as `--agent-x` under
+`agents/<id>/`. `plan` writes
+`manifest.json` and `brief-enriched.md` into the workspace above and executes
+nothing. `run` needs no variable (`NIRVANA_MULTI_TARGET_KILL_SWITCH=1` switches
+the engine off, and so does the legacy `NIRVANA_MULTI_TARGET_ENGINE=0`; `=1`
+is accepted and changes nothing), creates one Run in the project's kernel,
+executes every wave through `nrv dispatch` subprocesses with explicit targets
+(`--business`, `--squad`, `--agent-x`), and exits `0` delivered, `1` failed,
+`2` withheld, `4` invalid plan or engine switched off.
+Repeating `run` after a crash resumes: completed nodes never spawn twice. A
+Run that ended `failed` or `withheld` is terminal; once its cause is fixed,
+`--retry-failed` opens a new Run chained to it (`parentRunId`) that keeps the
+delivered nodes and executes only the ones that failed, stalled or were skipped.
+
+What does not change: the workspace layout, `DISPATCH-INSTRUCTION.md` per
+target, the `_SUMMARY.md` contract, the audit chain each node writes, and the
+prose protocol itself, which stays the default whenever you can dispatch
+in-process. Reference: `docs/architecture/gauntlet-multi-target-cli.md`.

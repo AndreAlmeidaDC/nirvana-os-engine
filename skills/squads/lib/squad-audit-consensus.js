@@ -29,6 +29,8 @@
 
 'use strict';
 
+const { extractJsonObject } = require('../../_shared/lib/model-json.js');
+
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -83,8 +85,8 @@ function buildMechanicalConsensus(scoreReport) {
       case 'dependencies_synth':
         patches.push({ kind: 'dependencies_synth', criterion: c.id });
         break;
-      case 'humanize_default_true':
-        patches.push({ kind: 'humanize_default_true', criterion: c.id });
+      case 'outputs_shape_repair':
+        patches.push({ kind: 'outputs_shape_repair', criterion: c.id });
         break;
       case 'caps_inference_required':
         // Defer to v4-capability-inferrer.js — needs caps to be inferred from
@@ -149,17 +151,16 @@ function buildMechanicalConsensus(scoreReport) {
 // Agentic mode — host-runtime-agnostic via host-agent-driver
 // ─────────────────────────────────────────────────────────────────────
 
-// host-agent-driver is a TS module; load lazily via dynamic require if Bun
-// resolved it at startup. CommonJS fallback path supports node --experimental-strip-types.
+// host-agent-driver.js already delegates to the canonical .ts under Bun and
+// falls back to its own inline legacy implementation otherwise (see that
+// file's header) — requiring the .ts directly from here duplicated that
+// fallback AND was itself a `.js` requiring a `.ts`, which can throw
+// `TypeError: require() async module` under Bun on Windows.
 let _hostDriver = null;
 function loadHostDriver() {
   if (_hostDriver) return _hostDriver;
-  try {
-    _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.ts'));
-  } catch {
-    try { _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.js')); }
-    catch { _hostDriver = null; }
-  }
+  try { _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.js')); }
+  catch { _hostDriver = null; }
   return _hostDriver;
 }
 
@@ -172,13 +173,16 @@ async function callAgent(_client, role, userMessage) {
   const driver = loadHostDriver();
   if (!driver) return { role, text: '', error: 'host-agent-driver not loadable' };
   const persona = readPersona(role) || `You are the ${role} agent in a squad audit consensus loop.`;
-  // Async path with stall watchdog: 90s heartbeat + 1 retry on stall. Avoids
-  // 600s freezes when the agent reads heavy + writes heavy in one call.
+  // Async path with a 240s budget of SILENCE + 1 retry on it. Still guards the
+  // 600s freeze when the agent reads heavy and writes heavy in one call, but
+  // without the 90s heartbeat that used to fire first: the runtimes this calls
+  // print one JSON object at the END, so "no bytes for 90s" was a model
+  // thinking, and killing it produced the freeze it was meant to prevent.
   let retry = null;
   try {
     retry = require(path.join(SKILLS_ROOT, '_shared', 'lib', 'host-agent-retry.js'));
   } catch {}
-  const callOpts = { heartbeatMs: 90_000, timeoutMs: 240_000, maxRetries: 1 };
+  const callOpts = { timeoutMs: 240_000, maxRetries: 1 };
   const r = retry && retry.callWithRetryOnStall
     ? await retry.callWithRetryOnStall(persona, userMessage, callOpts)
     : await driver.callHostAgentAsync(persona, userMessage, callOpts);
@@ -249,7 +253,7 @@ async function runAgenticConsensus({ scoreReport, squadDir, mechanicalPatches, s
   // Parse critic verdict
   let criticVerdict = 'approve_all';
   try {
-    const j = JSON.parse(r1.text.match(/\{[\s\S]*\}/)?.[0] || '{}');
+    const j = (extractJsonObject(r1.text) || {});
     criticVerdict = j.verdict || 'approve_all';
   } catch { /* keep default */ }
 
@@ -275,7 +279,7 @@ async function runAgenticConsensus({ scoreReport, squadDir, mechanicalPatches, s
     transcript.push(r3);
 
     let meta;
-    try { meta = JSON.parse(r3.text.match(/\{[\s\S]*\}/)?.[0] || '{}'); } catch { meta = { consensus_reached: false }; }
+    try { meta = (extractJsonObject(r3.text) || {}); } catch { meta = { consensus_reached: false }; }
 
     if (!meta.consensus_reached) {
       // Round 4 — empiricus tiebreak
@@ -288,7 +292,7 @@ async function runAgenticConsensus({ scoreReport, squadDir, mechanicalPatches, s
       transcript.push(r4);
       // If empiricus rejects or escalates, fall back to mechanical-only.
       try {
-        const j = JSON.parse(r4.text.match(/\{[\s\S]*\}/)?.[0] || '{}');
+        const j = (extractJsonObject(r4.text) || {});
         if (j.verdict !== 'accept_proposal') {
           return { mode: 'mechanical-after-tiebreak', transcript, status: 'human-review-needed', skipped };
         }
@@ -299,7 +303,7 @@ async function runAgenticConsensus({ scoreReport, squadDir, mechanicalPatches, s
   // Parse final proposal
   let semanticPatches = [];
   try {
-    const j = JSON.parse(finalProposal.match(/\{[\s\S]*\}/)?.[0] || '{}');
+    const j = (extractJsonObject(finalProposal) || {});
     semanticPatches = j.patches || [];
   } catch { /* leave empty */ }
 

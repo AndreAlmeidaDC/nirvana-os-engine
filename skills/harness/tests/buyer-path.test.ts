@@ -24,6 +24,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { fakeHomeEnv } from "./helpers/fake-home.ts";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const SLUG = "buyer-path-fixture";
@@ -75,16 +77,15 @@ beforeAll(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "nrv-buyer-"));
   home = path.join(root, "home");
   fs.mkdirSync(home, { recursive: true });
-  env = {
-    ...process.env,
-    HOME: home,
-    USERPROFILE: home,
+  // fakeHomeEnv carries NIRVANA_SKIP_PATH_PERSIST=1: on Windows the installer
+  // would otherwise persist this HOME's .local\bin to the real user PATH (#87).
+  env = fakeHomeEnv(home, {
     NIRVANA_SKIP_ENGINE_UPDATE: "1",
     // Registries must resolve to the fake HOME, not to whatever project the
     // test runner happens to sit in. Without this the overlay indexes into the
     // repo's own .nirvana/ and the assertions read the developer's library.
     NIRVANA_SCOPE: "global",
-  };
+  });
   delete env.NIRVANA_PROVENANCE;
 
   // 1. The engine, installed the way the buyer's `npx @nirvana-os/cli` does.
@@ -164,7 +165,7 @@ describe("what the buyer has after running setup.ts", () => {
     expect(reg.length).toBeGreaterThan(0);
     expect(fs.existsSync(reg)).toBe(true);
     expect(fs.readFileSync(reg, "utf8")).toContain("fixture-squad");
-  });
+  }, spawnBudgetMs(2));
 
   test("the pack manifest records the version", () => {
     const p = path.join(home, ".nirvana", "packs", `${SLUG}.json`);

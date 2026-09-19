@@ -21,7 +21,32 @@ function glance() {
     LIST_KINDS: ['squads', 'businesses', 'projects', 'mind-clones'],
     kindEntered: false,   // true = Level 2 (list) for a LIST_KIND
     kindMenuOpen: false,  // quick type-switch popover in the Level 2 header
+    // A count is `null` when the API could not determine it, and the view renders
+    // `—`. It is a number only when something was actually measured. The rule and
+    // the helpers live in absence.js, exposed by the index.html module adapter.
     counts: {},
+    get absence() {
+      return window.NirvanaAbsence || {
+        UNKNOWN_LABEL: '—',
+        isUnknown: (v) => v === null || v === undefined,
+        countLabel: (v) => (v === null || v === undefined ? '—' : String(v)),
+        listLength: (v) => (v === null || v === undefined ? null : v.length),
+        listItems: (v) => (v === null || v === undefined ? [] : v),
+      };
+    },
+    /** The text a count cell shows: the number, or `—` when it was never measured. */
+    countText(value) { return this.absence.countLabel(value); },
+    // The engine subsystem strip. `null` until /api/subsystems answers.
+    subsystems: null,
+    get subsystemRow() {
+      const row = window.NirvanaSubsystemRow;
+      if (!row || !this.subsystems) return { cells: [], up: 0, down: 0, unknown: 0 };
+      return row.buildSubsystemRow({ subsystems: this.subsystems });
+    },
+    get subsystemSummary() {
+      const row = window.NirvanaSubsystemRow;
+      return row ? row.rowSummary(this.subsystemRow) : '';
+    },
     // Per-list loading/error state — distinguishes "carregando" from "vazio"
     // from "falhou" (the catch used to be silent and everything became empty-state).
     listLoading: { squads: false, businesses: false, projects: false, 'mind-clones': false },
@@ -42,6 +67,16 @@ function glance() {
     runsFilter: 'recent',          // recent | running | delivered | failed
     runsAutoRefresh: null,         // setInterval handle
     selectedRun: null,             // full run detail (events timeline)
+    // Runs rail: searchable, collapsible 280px ⇄ 56px (page-layout-redesign.md
+    // §1.3). Named runsListQuery (not runsFilter, above) to keep the two apart —
+    // runsFilter is an existing recent|running|delivered|failed status enum,
+    // this is free-text search against brief/business/squad.
+    runsRailCollapsed: (typeof localStorage !== 'undefined' && localStorage.getItem('glance.runsRailCollapsed') === '1'),
+    runsListQuery: '',
+    // "Atividade relacionada" strip inside run-detail — one collapsible flag
+    // shared by whichever run is open, same pattern as the Trajectory Card's
+    // own judgement-strip toggle.
+    relatedActivityOpen: true,
     mindClones: [],
     // Memory layer (state.db) — populated lazily when kind === 'memory'
     memorySubTab: 'decisions',  // decisions | gates | audit
@@ -55,7 +90,8 @@ function glance() {
     memoryAddDraft: { decision_id: '', text: '', source: 'manual', rationale: '' },
     // Graph view
     graph: null,
-    graphFilter: 'all',        // all | capabilities | created | squads | businesses | mind-clones | red-yellow
+    graphScope: 'topology',    // topology (global capability map, ignores the All/Project toggle) | activity (per-project artifact/decision trail)
+    graphFilter: 'capabilities', // all | capabilities | created | squads | businesses | mind-clones | red-yellow — default matches graphScope: 'topology'
     graphTimeline: null,       // { range: [iso,iso], minMs, maxMs }
     graphTimeMs: null,         // current slider value (epoch ms)
     graphTimeISO: null,
@@ -90,17 +126,35 @@ function glance() {
     // Cost dashboard
     cost: null,
     costPeriod: '7d',          // 7d | 30d | all
-    // Activity feed (right sidebar)
-    activityOpen: true,
+    // Activity feed — on-demand overlay (bell in topnav), not a permanent
+    // rail (page-layout-redesign.md §1.3). activityUnseenCount resets to 0
+    // whenever the overlay opens.
+    activityOverlayOpen: false,
+    activityUnseenCount: 0,
     activityEvents: [],
     activityStream: null,
     // Layout chrome — collapsible sidebars + agents fullscreen
     sidebarOpen: (typeof localStorage !== 'undefined' && localStorage.getItem('glance.sidebarOpen') !== '0'),
     rightPaneOpen: (typeof localStorage !== 'undefined' && localStorage.getItem('glance.rightPaneOpen') !== '0'),
+    // Sidebar auto-collapses to a 64px icon rail whenever a run is open in
+    // detail, unless pinned full (page-layout-redesign.md §1.3). The hint
+    // toast is intentionally session-only (not persisted) — it fires once
+    // per page load, the first time the auto-collapse actually happens.
+    sidebarPinnedFull: (typeof localStorage !== 'undefined' && localStorage.getItem('glance.sidebarPinnedFull') === '1'),
+    sidebarHintShown: false,
+    showSidebarHint: false,
+    sidebarLiveMessage: '',
     agentsFullscreen: false,
     // Scope filter: 'all' = entire machine, 'project' = only events whose cwd
     // starts with scope.projectRoot. Disabled when no projectRoot is detected.
     projectFilter: (typeof localStorage !== 'undefined' && localStorage.getItem('glance.projectFilter')) || '',  // '' = not decided yet; fetchScope picks project-first
+    // ── Project switcher (topnav) — rebinds this Glance instance to a DIFFERENT
+    // project (distinct from projectFilter above, which only filters WITHIN the
+    // one bound project). Requires --allow-actions: it's a mutating action.
+    // Dropdown open/close and the free-text path live in the control's own
+    // local x-data (index.html), same convention as the existing actions menu.
+    knownProjects: [],
+    projectSwitching: false,
     // Setup mode (project scaffolding via Glance)
     // Setup mode (project scaffolding via Glance)
     setupMode: false,
@@ -115,12 +169,23 @@ function glance() {
     // Settings modal state (env editor)
     settingsOpen: false,
     settingsData: null,
-    settingsActiveGroup: 'scope',
-    settingsScopePicker: 'project',  // 'project' | 'global'
+    // 'engine:<section>' for the engine settings (nrv config), a .env group id, or '__rules__'.
+    // Empty until the modal opens: the first engine group becomes the default then.
+    settingsActiveGroup: '',
+    settingsScopePicker: 'project',  // 'project' | 'global' (the .env section)
     settingsDraft: {},
     settingsDeletes: {},
     settingsSaving: false,
     settingsRestartRequired: false,
+    // ── Engine settings (nrv config) over /api/v1/settings; logic in settings-panel.js ──
+    engineSettings: null,      // the GET payload
+    engineGroups: [],          // buildSettingsPanel(payload).groups
+    engineDraft: {},           // key → control input (a boolean for a switch, text otherwise)
+    engineScope: {},           // key → 'project' | 'global'
+    engineErrors: {},          // key → refusal shown inline
+    engineNotice: {},          // key → what the last write did
+    engineSaving: {},          // key → true while a write is in flight
+    engineError: null,         // the whole section failed to load (a config file the resolver refuses)
     selected: null,
     detail: null,
     mindCloneContent: null,
@@ -128,8 +193,15 @@ function glance() {
     mindCloneActiveFile: null,     // path string of file currently shown
     tab: 'overview',
     orgView: 'tree',
+    // Org-chart card editor (Glance actions — gated by health.allow_actions)
+    orgEditOpen: false,
+    orgEditMode: 'edit',       // 'edit' | 'add'
+    orgEditTargetSlug: null,   // edit: the employee being edited. add: the parent it reports to.
+    orgEditDraft: { role: '', description: '', reportsTo: '', assignedMindClones: '', squadsAuthorized: '' },
+    orgEditSaving: false,
+    orgEditError: null,
     squadTabs: ['overview', 'manifest', 'capabilities', 'state', 'files'],
-    businessTabs: ['overview', 'manifest', 'org-chart', 'routing', 'memory'],
+    businessTabs: ['org-chart', 'overview', 'manifest', 'routing', 'memory'],
     filterQuery: '',
     filterSource: '',
     searchQuery: '',
@@ -150,6 +222,11 @@ function glance() {
     jobStreams: {},
     // Per-kind audit scores: { squads: { slug: {tier, score} }, businesses: ..., 'mind-clones': ... }
     auditScores: { squads: {}, businesses: {}, 'mind-clones': {} },
+    // Admission gate (nrv validate) — one report at a time, keyed "<kind>:<slug>"
+    // so a stale verdict never shows under a different entity.
+    verifyKey: null,
+    verifyReport: null,
+    verifyBusy: false,
 
     // ─── Computed ───
     get currentList() {
@@ -201,7 +278,7 @@ function glance() {
         }
       } catch {}
       // Chat history + hash router (deep-link).
-      this.loadChatHistory();
+      await this.loadChatHistory();
       this.applyHash();
       window.addEventListener('hashchange', () => this.applyHash());
       // Awwwards hero only on awwwards theme
@@ -306,12 +383,87 @@ function glance() {
       if (!tab) tab = this.tab;
       this.$nextTick(() => {
         if (this.kind === 'businesses' && tab === 'org-chart' && this.detail?.org_chart_raw && window.renderOrgChart) {
-          window.renderOrgChart('#org-chart-canvas', this.detail.org_chart_raw);
+          window.renderOrgChart('#org-chart-canvas', this.detail, {
+            allowActions: !!this.health.allow_actions,
+            onEdit: (slug) => this.openEmployeeEdit(slug),
+            onAddBelow: (parentSlug) => this.openAddEmployeeBelow(parentSlug),
+          });
         }
         if (this.kind === 'projects' && tab === 'dag' && this.detail?.dag && window.renderDag) {
           window.renderDag('#dag-canvas', this.detail.dag);
         }
       });
+    },
+
+    // ─── Org-chart card editor ───
+    openEmployeeEdit(slug) {
+      const raw = this.detail?.employees_md?.[slug] || '';
+      const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(raw);
+      let fm = {};
+      try { fm = (m && window.jsyaml?.load(m[1])) || {}; } catch { fm = {}; }
+      this.orgEditMode = 'edit';
+      this.orgEditTargetSlug = slug;
+      this.orgEditDraft = {
+        role: fm.role || '',
+        description: fm.description || '',
+        reportsTo: fm.reports_to || '',
+        assignedMindClones: (fm.assigned_mind_clones || []).join(', '),
+        squadsAuthorized: (fm.squads_authorized || []).join(', '),
+      };
+      this.orgEditError = null;
+      this.orgEditOpen = true;
+    },
+    openAddEmployeeBelow(parentSlug) {
+      this.orgEditMode = 'add';
+      this.orgEditTargetSlug = parentSlug;
+      this.orgEditDraft = { role: '', description: '', reportsTo: '', assignedMindClones: '', squadsAuthorized: '' };
+      this.orgEditError = null;
+      this.orgEditOpen = true;
+    },
+    closeOrgEdit() {
+      this.orgEditOpen = false;
+      this.orgEditError = null;
+    },
+    async saveOrgEdit() {
+      const bizSlug = this.selected?.slug;
+      if (!bizSlug) return;
+      const toList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+      this.orgEditSaving = true;
+      this.orgEditError = null;
+      try {
+        const url = this.orgEditMode === 'add'
+          ? `/api/businesses/${encodeURIComponent(bizSlug)}/employees`
+          : `/api/businesses/${encodeURIComponent(bizSlug)}/employees/${encodeURIComponent(this.orgEditTargetSlug)}`;
+        const body = this.orgEditMode === 'add'
+          ? {
+              role: this.orgEditDraft.role.trim(),
+              description: this.orgEditDraft.description.trim() || undefined,
+              reportsTo: this.orgEditTargetSlug,
+            }
+          : {
+              role: this.orgEditDraft.role.trim(),
+              description: this.orgEditDraft.description.trim(),
+              reportsTo: this.orgEditDraft.reportsTo.trim() || undefined,
+              assignedMindClones: toList(this.orgEditDraft.assignedMindClones),
+              squadsAuthorized: toList(this.orgEditDraft.squadsAuthorized),
+            };
+        if (this.orgEditMode === 'add' && !body.role) { this.orgEditError = 'título é obrigatório'; return; }
+        const res = await fetch(url, {
+          method: this.orgEditMode === 'add' ? 'POST' : 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) { this.orgEditError = data.error || `erro ${res.status}`; return; }
+        this.orgEditOpen = false;
+        this.detail = await api(`/api/businesses/${encodeURIComponent(bizSlug)}`);
+        this.renderActiveChart('org-chart');
+        this.flash('✓ organograma atualizado', 2000);
+      } catch (e) {
+        this.orgEditError = e.message || String(e);
+      } finally {
+        this.orgEditSaving = false;
+      }
     },
 
     async refreshAll() {
@@ -326,6 +478,8 @@ function glance() {
         this.fetchAuditScores(),
         this.fetchSetupSources(),
         this.fetchSetupStatus(),
+        this.fetchSubsystems(),
+        this.fetchKnownProjects(),
       ]);
       this.flash(`refreshed · ${this.squads.length} squads, ${this.businesses.length} bus`);
     },
@@ -397,14 +551,31 @@ function glance() {
       } catch(e) {}
     },
     async fetchHealth()   { try { const h = await api('/api/health'); this.health = { ...h, ok: h.ok, uptime: humanizeMs(h.uptime_ms) }; } catch(e) {} },
+    // ─── Engine subsystems (what is standing) ───
+    // A failed read does NOT become a row of red: the payload stays empty and the
+    // strip says nothing, rather than claiming eight subsystems fell because one
+    // fetch did.
+    async fetchSubsystems() {
+      try { this.subsystems = (await api('/api/subsystems')).subsystems; }
+      catch (e) { this.subsystems = null; }
+    },
+    // ─── Project switcher (topnav) — OTHER Nirvana projects on this machine,
+    // distinct from projectFilter above (which only filters within the ONE
+    // project this instance is bound to). Read-only; always available.
+    async fetchKnownProjects() {
+      try { this.knownProjects = (await api('/api/known-projects')).projects || []; }
+      catch (e) { this.knownProjects = []; }
+    },
     async fetchSquads()   { this.listLoading.squads = true; this.listError.squads = null; try { const r = await api('/api/squads'); this.squads = r.squads; this.counts.squads = r.squads.length; } catch(e) { this.listError.squads = e.message || 'failed'; this.flash(`✗ squads: ${e.message || 'load failed'}`, 3000); } finally { this.listLoading.squads = false; } },
     async fetchBusinesses(){ this.listLoading.businesses = true; this.listError.businesses = null; try { const r = await api('/api/businesses'); this.businesses = r.businesses; this.counts.businesses = r.businesses.length; } catch(e) { this.listError.businesses = e.message || 'failed'; this.flash(`✗ businesses: ${e.message || 'load failed'}`, 3000); } finally { this.listLoading.businesses = false; } },
-    async fetchProjects() { this.listLoading.projects = true; this.listError.projects = null; try { const r = await api(`/api/projects${this.projectQuery('?')}`); this.projects = r.projects; this.counts.projects = r.projects.length; } catch(e) { this.listError.projects = e.message || 'failed'; this.flash(`✗ projects: ${e.message || 'load failed'}`, 3000); } finally { this.listLoading.projects = false; } },
+    async fetchProjects() { this.listLoading.projects = true; this.listError.projects = null; try { const r = await api(`/api/projects${this.projectQuery('?')}`); this.projects = this.absence.listItems(r.projects); this.counts.projects = this.absence.listLength(r.projects); } catch(e) { this.listError.projects = e.message || 'failed'; this.flash(`✗ projects: ${e.message || 'load failed'}`, 3000); } finally { this.listLoading.projects = false; } },
     async fetchRuns(opts = {}) {
       try {
         const r = await api(`/api/runs?days=7&limit=200${this.projectQuery()}`);
-        this.runs = r.runs || [];
-        this.counts.runs = r.total || this.runs.length;
+        this.runs = this.absence.listItems(r.runs);
+        // `r.total` may be null (the logs root does not exist): the count stays
+        // undetermined instead of borrowing the length of an empty list.
+        this.counts.runs = this.absence.isUnknown(r.total) ? this.absence.listLength(r.runs) : r.total;
         // If a run is selected, refresh its detail
         if (this.selectedRun?.trace_id && opts.refreshDetail !== false) {
           const updated = this.runs.find(x => x.trace_id === this.selectedRun.trace_id);
@@ -413,22 +584,51 @@ function glance() {
       } catch (e) {}
     },
     selectRun(run) {
+      const wasCollapsed = this.sidebarCollapsed;
       this.selectedRun = run;
+      // Nielsen H1 (visibility of system status): the sidebar auto-collapsing
+      // needs to announce itself the first time it happens, not just silently
+      // change width (ux-qa finding, page-layout-redesign.md §3.1).
+      if (!wasCollapsed && this.sidebarCollapsed && !this.sidebarHintShown) {
+        this.sidebarHintShown = true;
+        this.showSidebarHint = true;
+        this.sidebarLiveMessage = 'Sidebar recolhida para ícones — uma run está aberta em detalhe. Use o botão fixar para mantê-la cheia.';
+        setTimeout(() => { this.showSidebarHint = false; }, 4000);
+      }
+    },
+    // Sidebar auto-collapse to the 64px icon rail (page-layout-redesign.md
+    // §1.3) — driven by whether a run is open in detail, never by `kind`.
+    get sidebarCollapsed() {
+      const pl = window.NirvanaPanelLayout;
+      return pl
+        ? pl.shouldCollapseSidebar({ pinnedFull: this.sidebarPinnedFull, hasSelectedRun: !!this.selectedRun })
+        : (!this.sidebarPinnedFull && !!this.selectedRun);
+    },
+    toggleSidebarPin() {
+      this.showSidebarHint = false;
+      this.sidebarPinnedFull = !this.sidebarPinnedFull;
+      try { localStorage.setItem('glance.sidebarPinnedFull', this.sidebarPinnedFull ? '1' : '0'); } catch {}
+    },
+    // Runs rail: search filter + collapse toggle (page-layout-redesign.md §1.3).
+    get filteredRunsList() {
+      const pl = window.NirvanaPanelLayout;
+      return pl ? pl.filterRunsByQuery(this.visibleRuns, this.runsListQuery) : this.visibleRuns;
+    },
+    toggleRunsRail() {
+      this.runsRailCollapsed = !this.runsRailCollapsed;
+      try { localStorage.setItem('glance.runsRailCollapsed', this.runsRailCollapsed ? '1' : '0'); } catch {}
+    },
+    // "Atividade relacionada" — activity events scoped to this run's
+    // business/project, excluding events already on its own trace.
+    relatedActivity(run) {
+      const pl = window.NirvanaPanelLayout;
+      return pl ? pl.filterRelatedActivity(this.activityEvents, run) : [];
     },
     runStatusColor(status) {
       if (status === 'delivered') return 'meta-ok';
-      if (status === 'gate_failed' || status === 'no_match') return 'meta-bad';
+      if (status === 'gate_failed') return 'meta-bad';
       if (status === 'running') return 'meta-pending';
       return '';
-    },
-    runEventColor(event) {
-      if (event === 'brief_received' || event === 'brief_amplified') return '#3b82f6';
-      if (event === 'delivered' || event === 'gate_passed') return '#10b981';
-      if (event === 'gate_failed' || event.startsWith('validation_')) return '#ef4444';
-      if (event === 'tool_invoked' || event === 'artifact_touched' || event === 'bash_completed') return '#8b5cf6';
-      if (event.startsWith('dispatch_')) return '#a855f7';
-      if (event === 'cost_emission') return '#9ca3af';
-      return '#64748b';
     },
     runRelTime(iso) {
       if (!iso) return '';
@@ -549,8 +749,13 @@ function glance() {
     },
 
     // ─── Graph view (knowledge graph) ───
+    // 'topology' is global engine data (businesses/squads/capabilities/mind-clones) —
+    // it deliberately ignores the top-nav All/Project toggle, since that data has no
+    // notion of "which project". 'activity' is the per-project artifact/decision
+    // trail, so it respects the toggle exactly like Runs/Cost/Memory do.
     async fetchGraph() {
-      try { this.graph = await api(`/api/graph${this.projectQuery('?')}`); }
+      const q = this.graphScope === 'activity' ? this.projectQuery('?') : '';
+      try { this.graph = await api(`/api/graph${q}`); }
       catch (e) { this.graph = { nodes: [], edges: [] }; }
       // Compute temporal range from nodes with created_at
       const stamps = (this.graph?.nodes || [])
@@ -597,6 +802,13 @@ function glance() {
       this.graphFilter = filter;
       this.clearGraphSelection();
       this.renderGraphNow({ autoFit: true });
+    },
+    setGraphScope(scope) {
+      if (this.graphScope === scope) return;
+      this.graphScope = scope;
+      this.graphFilter = scope === 'activity' ? 'created' : 'capabilities';
+      this.clearGraphSelection();
+      this.fetchGraph(); // different data per scope (project-filtered or not) — refetch, not just re-render
     },
     graphFitView() {
       this.graphCtrl?.fitToExtent?.(80);
@@ -736,7 +948,9 @@ function glance() {
     startAgentsStream() {
       if (this.agentsES) { try { this.agentsES.close(); } catch {} }
       this.agentsES = new EventSource('/api/agents/live' + this.projectQuery('?'));
-      this.agentsES.addEventListener('snapshot', (e) => {
+      // `snapshot` is the opening state, `pulse` the periodic aggregate; both
+      // carry the same payload, so one handler serves the two names.
+      const applyAgentAggregate = (e) => {
         try {
           const d = JSON.parse(e.data);
           this.agents = d.agents || [];
@@ -748,11 +962,13 @@ function glance() {
             window.__agentWorkspace.syncAgents(this.agents);
           }
         } catch {}
-      });
+      };
+      this.agentsES.addEventListener('snapshot', applyAgentAggregate);
+      this.agentsES.addEventListener('pulse', applyAgentAggregate);
       this.agentsES.addEventListener('status_change', (e) => {
         try {
           const d = JSON.parse(e.data);
-          // optional: brief flash animation; for now just rely on snapshot to redraw
+          // optional: brief flash animation; for now just rely on the pulse to redraw
           console.debug('[agents] status change:', d.trace_id, d.from, '→', d.to);
         } catch {}
       });
@@ -778,6 +994,18 @@ function glance() {
       try { localStorage.setItem('glance.rightPaneOpen', this.rightPaneOpen ? '1' : '0'); } catch {}
       this.$nextTick(() => { try { window.lucide?.createIcons(); } catch {} });
     },
+    // Activity: on-demand overlay (page-layout-redesign.md §1.3). Opening
+    // moves focus into the panel; closing returns it to the bell that opened
+    // it, so focus is never dropped on <body> (WCAG 2.4.3).
+    openActivity() {
+      this.activityOverlayOpen = true;
+      this.activityUnseenCount = 0;
+      this.$nextTick(() => { this.$refs.activityCloseBtn?.focus(); try { window.lucide?.createIcons(); } catch {} });
+    },
+    closeActivity() {
+      this.activityOverlayOpen = false;
+      this.$nextTick(() => { this.$refs.activityTrigger?.focus(); });
+    },
     // ── Project scope filter ──
     canFilterByProject() {
       return !!(this.scope && this.scope.projectRoot);
@@ -789,6 +1017,20 @@ function glance() {
       if (this.projectFilter !== 'project' || !this.canFilterByProject()) return '';
       return `${prefix}project=${encodeURIComponent(this.scope.projectRoot)}`;
     },
+    // Refetch every backend-aggregated view so Cost / Runs / Memory match what's
+    // shown for Agents / Activity. Squads/businesses/mind-clones intentionally
+    // NOT refetched — those stay global. Shared by setProjectFilter (All↔Project
+    // MODE change, within one bound project) and switchProject (rebinding to a
+    // DIFFERENT project) — same list either way, so it lives in one place.
+    refetchProjectScopedViews() {
+      try { this.fetchRuns && this.fetchRuns(); } catch {}
+      try { this.fetchCost && this.fetchCost(); } catch {}
+      try { this.fetchMemory && this.fetchMemory(); } catch {}
+      try { this.fetchProjects && this.fetchProjects(); } catch {}
+      try { this.fetchGraph && this.fetchGraph(); } catch {}
+      try { this.restartAgentsStream && this.restartAgentsStream(); } catch {}
+      try { this.restartActivityStream && this.restartActivityStream(); } catch {}
+    },
     setProjectFilter(mode, persist = true) {
       // 'all' | 'project' — silently ignore 'project' if no root detected
       if (mode === 'project' && !this.canFilterByProject()) return;
@@ -797,19 +1039,35 @@ function glance() {
       // persist=false for the AUTOMATIC (project-first) choice: it doesn't become
       // a stored preference, so it re-evaluates by projectRoot on every session.
       if (persist) { try { localStorage.setItem('glance.projectFilter', mode); } catch {} }
-      if (changed) {
-        // Refetch every backend-aggregated view so Cost / Runs / Memory match
-        // what's shown for Agents / Activity. Squads/businesses/mind-clones
-        // intentionally NOT refetched — those stay global.
-        try { this.fetchRuns && this.fetchRuns(); } catch {}
-        try { this.fetchCost && this.fetchCost(); } catch {}
-        try { this.fetchMemory && this.fetchMemory(); } catch {}
-        try { this.fetchProjects && this.fetchProjects(); } catch {}
-        try { this.fetchGraph && this.fetchGraph(); } catch {}
-        try { this.restartAgentsStream && this.restartAgentsStream(); } catch {}
-        try { this.restartActivityStream && this.restartActivityStream(); } catch {}
-      }
+      if (changed) this.refetchProjectScopedViews();
       this.$nextTick(() => this.renderAllSwimlanes && this.renderAllSwimlanes());
+    },
+    // ── Project switcher: rebinds this Glance INSTANCE to a different project
+    // (POST /api/actions/switch-project), unlike setProjectFilter above which only
+    // filters within the one project already bound. Requires --allow-actions.
+    async switchProject(targetPath) {
+      const path = (targetPath || '').trim();
+      if (!path || this.projectSwitching) return;
+      this.projectSwitching = true;
+      try {
+        const r = await fetch('/api/actions/switch-project', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ project_root: path }),
+        });
+        const data = await r.json();
+        if (!r.ok) { this.flash(`✗ switch project: ${data.error || r.status}`, 4000); return; }
+        this.scope = data.scope;
+        this.flash(`▶ switched to ${(data.to || '').split('/').slice(-1)[0] || data.to}`, 2000);
+        this.refetchProjectScopedViews();
+        try { this.fetchSubsystems && this.fetchSubsystems(); } catch {}
+        try { this.fetchSetupStatus && this.fetchSetupStatus(); } catch {}
+        try { this.fetchKnownProjects && this.fetchKnownProjects(); } catch {}
+      } catch (e) {
+        this.flash(`✗ ${e.message}`, 4000);
+      } finally {
+        this.projectSwitching = false;
+      }
     },
     matchesCurrentProject(item) {
       if (this.projectFilter !== 'project' || !this.canFilterByProject()) return true;
@@ -820,8 +1078,8 @@ function glance() {
       if (item.cwd && (item.cwd === root || item.cwd.startsWith(root + '/'))) return true;
 
       // 2. Fallback for project_id. Claude Code stores transcripts under
-      //    ~/.claude/projects/-Users-guto-foo-bar/, and our importer turns that
-      //    back into "Users/guto/foo/bar" — every "-" becomes "/" indiscriminately,
+      //    ~/.claude/projects/-Users-alice-foo-bar/, and our importer turns that
+      //    back into "Users/alice/foo/bar" — every "-" becomes "/" indiscriminately,
       //    so a real "nirvana-os" path is encoded as "nirvana/os". We can't reverse
       //    that perfectly, but for matching we normalise BOTH sides by treating
       //    "/" and "-" as the same separator and lowercasing.
@@ -831,6 +1089,23 @@ function glance() {
         const pidN = norm(item.project_id);
         if (pidN === rootN || pidN.startsWith(rootN + '/')) return true;
       }
+
+      // 3. Business/squad dispatches (via brief-business.ts / brief-squad.ts)
+      //    have no notion of "cwd" at all — their project_id IS the trace_id
+      //    ("glance-visual-impl-2026...", not a filesystem path), so both
+      //    checks above always miss them, and every dispatch this project
+      //    ever ran disappeared from its own Runs tab. outputs_dir/outputs_root
+      //    would be the real filesystem signal, but in practice brief-business.ts
+      //    doesn't stamp it on every event — so fall back to trusting the
+      //    backend: projectQuery() above already sent ?project=<root> on this
+      //    fetch, and the server's own eventMatchesProject (server.ts) already
+      //    scopes business/squad dispatches by project before this item ever
+      //    reaches the client. A run carrying business_slug/squad_name only
+      //    got here because the server already decided it belongs.
+      const out = item.outputs_dir || item.outputs_root;
+      if (out && (out === root || out.startsWith(root + '/'))) return true;
+      if (item.business_slug || item.squad_name || item.target) return true;
+
       return false;
     },
     get visibleAgents() {
@@ -857,7 +1132,7 @@ function glance() {
     get visibleAgentsSummary() {
       if (this.projectFilter !== 'project' || !this.canFilterByProject()) return this.agentsSummary;
       const list = this.visibleAgents;
-      const out = { tool_in_flight: 0, running: 0, idle: 0, waiting: 0, stale: 0, completed: 0, failed: 0, no_match: 0, total: 0 };
+      const out = { tool_in_flight: 0, running: 0, idle: 0, waiting: 0, stale: 0, completed: 0, failed: 0, total: 0 };
       for (const s of list) { out[s.status] = (out[s.status] || 0) + 1; out.total++; }
       return out;
     },
@@ -902,7 +1177,6 @@ function glance() {
         stale: '#f59e0b',            // amber-500
         completed: '#10b981',        // emerald-500
         failed: '#ef4444',           // red-500
-        no_match: '#a3a3a3',         // neutral-400
       };
       return colors[status] || '#64748b';
     },
@@ -916,7 +1190,6 @@ function glance() {
         stale: 'warn',
         completed: 'success',
         failed: 'danger',
-        no_match: 'neutral',
       })[status] || 'neutral';
     },
     runStatusVariant(status) {
@@ -924,7 +1197,6 @@ function glance() {
         running: 'warn',
         delivered: 'success',
         gate_failed: 'danger',
-        no_match: 'danger',
         stale: 'neutral',
         unknown: 'neutral',
       })[status] || 'neutral';
@@ -941,7 +1213,6 @@ function glance() {
         stale: 'Stale',
         completed: 'Completed',
         failed: 'Failed',
-        no_match: 'No match',
       };
       return labels[status] || status;
     },
@@ -1037,11 +1308,12 @@ function glance() {
       this.activityStream.addEventListener('snapshot', (e) => {
         try { const d = JSON.parse(e.data); this.activityEvents = d.events || []; } catch {}
       });
-      this.activityStream.addEventListener('event', (e) => {
+      this.activityStream.addEventListener('timeline', (e) => {
         try {
           const ev = JSON.parse(e.data);
           this.activityEvents.unshift(ev);
           if (this.activityEvents.length > 50) this.activityEvents.length = 50;
+          if (!this.activityOverlayOpen) this.activityUnseenCount++;
         } catch {}
       });
     },
@@ -1050,7 +1322,6 @@ function glance() {
         stall_detected: '⚠', stall_retry: '↻', loop_detected: '∞',
         approval_granted: '✓', approval_rejected: '✗', approval_checkpoint: '◇',
         gate_failed: '✗', validation_failed: '✗', context_budget_warning: '⚡',
-        humanization_applied: '✨', invocation_start: '▶', invocation_end: '■',
         handoff: '↪', resume: '↶',
       };
       return icons[event] || '·';
@@ -1210,9 +1481,29 @@ function glance() {
     chatMode: 'run',           // 'run' (new dispatch) | 'revise' | 'resume'
     chatHistory: [],           // [{id, title, mode, updatedAt}] persisted in localStorage
     chatHistoryOpen: false,    // history drawer inside the panel
+    // Chat panel width — 460..920px, resizable via drag handle or
+    // ArrowLeft/ArrowRight (page-layout-redesign.md §2.2), persisted like the
+    // other Glance layout preferences. chat-history above is unrelated and
+    // unchanged — it stays the on-demand drawer it already was in production.
+    chatWidth: (() => {
+      let saved = null;
+      try { saved = parseInt(localStorage.getItem('glance.chatWidth'), 10); } catch {}
+      return (Number.isFinite(saved) && saved >= 460 && saved <= 920) ? saved : 460;
+    })(),
+    canonicalProjectId: null,
 
-    // Chat history (localStorage — the full transcript comes from /api/runs).
-    loadChatHistory() {
+    // The control plane is canonical when this workspace has been adopted.
+    // localStorage remains a compatibility fallback for legacy workspaces.
+    async loadChatHistory() {
+      try {
+        const result = await api('/api/v1/projects');
+        this.canonicalProjectId = result.projects?.[0]?.project_id || null;
+        if (this.canonicalProjectId) {
+          const history = await api(`/api/v1/projects/${encodeURIComponent(this.canonicalProjectId)}/conversations`);
+          this.chatHistory = (history.conversations || []).map(c => ({ id: c.conversation_id, title: c.title, mode: 'run', updatedAt: Date.parse(c.updated_at) }));
+          return;
+        }
+      } catch {}
       try { this.chatHistory = JSON.parse(localStorage.getItem('glance.chatHistory') || '[]'); } catch { this.chatHistory = []; }
     },
     saveChatToHistory() {
@@ -1222,13 +1513,32 @@ function glance() {
       const entry = { id: this.chatId, title, mode: this.chatMode, updatedAt: Date.now() };
       if (existing >= 0) this.chatHistory[existing] = entry; else this.chatHistory.unshift(entry);
       this.chatHistory = this.chatHistory.slice(0, 30);
-      try { localStorage.setItem('glance.chatHistory', JSON.stringify(this.chatHistory)); } catch {}
+      if (!this.canonicalProjectId) {
+        try { localStorage.setItem('glance.chatHistory', JSON.stringify(this.chatHistory)); } catch {}
+      }
     },
     async openChatFromHistory(entry) {
+      // The conversation whose turn is streaming right now: just show it, never rebuild the bubbles.
+      if (entry.id === this.chatId && this.chatBusy) { this.chatHistoryOpen = false; this.chatOpen = true; return; }
       this.chatId = entry.id;
       this.chatMode = entry.mode || 'run';
       this.chatHistoryOpen = false;
       this.chatOpen = true;
+      if (this.canonicalProjectId && entry.id.startsWith('cnv_')) {
+        try {
+          const conversation = await api(`/api/v1/conversations/${encodeURIComponent(entry.id)}`);
+          this.chatMessages = (conversation.messages || []).map(m => ({ role: m.role, text: m.content }));
+          this.chatSession = null; this.chatSessionRuntime = null; this.chatResumeCommand = null;
+          this.applySession(conversation.session, null);
+          if (conversation.active_turn) {
+            // A turn still running (or queued) for this conversation: follow it again after a reload.
+            this.chatMessages.push({ role: 'assistant', text: '', events: [], streaming: true });
+            this.chatBusy = true;
+            this.subscribeTurn(conversation.active_turn, this.chatMessages[this.chatMessages.length - 1]);
+          }
+          return;
+        } catch {}
+      }
       const isRun = this.chatMode === 'revise' || this.chatMode === 'resume';
       if (isRun) {
         // Production run: rehydrate the timeline from the trace's audit trail.
@@ -1246,7 +1556,9 @@ function glance() {
     },
     deleteChatFromHistory(id) {
       this.chatHistory = this.chatHistory.filter(c => c.id !== id);
-      try { localStorage.setItem('glance.chatHistory', JSON.stringify(this.chatHistory)); } catch {}
+      if (!this.canonicalProjectId) {
+        try { localStorage.setItem('glance.chatHistory', JSON.stringify(this.chatHistory)); } catch {}
+      }
     },
 
     // Open the chat pointed at an existing run, to continue the session.
@@ -1264,10 +1576,85 @@ function glance() {
     rulesData: null,           // { project:[{key,value}], global:[], runtimes:[] }
     rulesDraft: [],            // [{ envKey, mode:'use'|'not', runtime, text }]
     rulesLoading: false,
+    runtimeOptions: [],        // installed runtimes, for the chat override picker
+    /** The runtimes this machine can actually run, fetched once. The picker
+     *  used to carry four names written into the page; a user sitting in pi,
+     *  kimi, grok, qwen or opencode could not name their own CLI, and the list
+     *  said nothing about which of them were installed. Empty is a safe state:
+     *  the select still offers "auto", which follows the session anyway. */
+    async ensureRuntimeOptions() {
+      if (this.runtimeOptions.length) return;
+      if (this.rulesData?.runtimes_installed) { this.runtimeOptions = this.rulesData.runtimes_installed; return; }
+      try {
+        const d = await api('/api/config/rules');
+        this.runtimeOptions = d?.runtimes_installed || [];
+      } catch (e) { this.runtimeOptions = []; }
+    },
     async openSettings() {
       this.settingsOpen = true;
       this.settingsRestartRequired = false;
+      this.engineDraft = {}; this.engineErrors = {}; this.engineNotice = {}; this.engineSaving = {};
+      // The engine section first: its first group is the default tab when none was chosen yet.
+      await this.fetchEngineSettings();
       await Promise.all([this.fetchSettings(), this.fetchRules()]);
+    },
+    settingsIsEngineTab() { return String(this.settingsActiveGroup || '').startsWith('engine:'); },
+    engineActiveGroup() { return this.engineGroups.find(g => 'engine:' + g.id === this.settingsActiveGroup) || null; },
+    async fetchEngineSettings() {
+      const panel = window.NirvanaSettingsPanel;
+      if (!panel) { this.engineError = 'settings-panel.js não carregou'; return; }
+      try {
+        const query = this.canonicalProjectId ? `?project_id=${encodeURIComponent(this.canonicalProjectId)}` : '';
+        const r = await fetch(`/api/v1/settings${query}`);
+        const body = await r.json().catch(() => null);
+        if (!r.ok) { this.engineError = panel.problemMessage(body, r.status); this.engineGroups = []; return; }
+        this.engineSettings = body;
+        this.engineError = null;
+        const built = panel.buildSettingsPanel(body);
+        this.engineGroups = built.groups;
+        for (const g of built.groups) for (const f of g.fields) if (!(f.key in this.engineScope)) this.engineScope[f.key] = panel.defaultScope(f);
+        if (!this.settingsActiveGroup && built.groups.length) this.settingsActiveGroup = 'engine:' + built.groups[0].id;
+      } catch (e) {
+        this.engineError = String(e.message || e);
+        this.engineGroups = [];
+      }
+    },
+    // The control's current input: the draft when the user touched it, else the effective value.
+    engineDraftValue(f) {
+      return f.key in this.engineDraft ? this.engineDraft[f.key] : window.NirvanaSettingsPanel.controlState(f);
+    },
+    engineDisplay(f, value) { return window.NirvanaSettingsPanel.displayValue(f, value); },
+    async saveEngineSetting(f) {
+      const panel = window.NirvanaSettingsPanel;
+      await this.engineWrite(f, panel.writeRequest(f, this.engineScope[f.key], this.engineDraftValue(f)));
+    },
+    async unsetEngineSetting(f) {
+      const panel = window.NirvanaSettingsPanel;
+      await this.engineWrite(f, panel.unsetRequest(f, this.engineScope[f.key]));
+    },
+    // One write per key: a fresh Idempotency-Key, the refusal inline (the schema's own message),
+    // the notice from the API's answer, then the section re-reads the effective values.
+    async engineWrite(f, request) {
+      const panel = window.NirvanaSettingsPanel;
+      this.engineSaving[f.key] = true;
+      this.engineErrors[f.key] = '';
+      this.engineNotice[f.key] = '';
+      try {
+        const r = await fetch(request.path, {
+          method: request.method,
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+          body: request.body ? JSON.stringify(request.body) : undefined,
+        });
+        const body = await r.json().catch(() => null);
+        if (!r.ok) { this.engineErrors[f.key] = panel.problemMessage(body, r.status); return; }
+        this.engineNotice[f.key] = panel.changeNotice(body);
+        delete this.engineDraft[f.key];
+        await this.fetchEngineSettings();
+      } catch (e) {
+        this.engineErrors[f.key] = String(e.message || e);
+      } finally {
+        this.engineSaving[f.key] = false;
+      }
     },
     async fetchRules() {
       this.rulesLoading = true;
@@ -1277,27 +1664,60 @@ function glance() {
       } catch (e) { this.rulesData = null; }
       finally { this.rulesLoading = false; }
     },
+    /**
+     * Env-key suffix ⇄ runtime. DERIVED from the roster the server reports
+     * (/api/config/rules), plus the short names a person may have typed.
+     *
+     * Two hand-written maps used to live here and both knew seven of the nine
+     * runtimes, and the gap was not cosmetic. An unrecognised suffix was shown
+     * as a claude-code rule AND saved as one, while the original key went into
+     * `deletes` — so merely opening the settings panel and pressing save turned
+     * a `USE_QWEN` rule into `USE_CLAUDE_CODE` and destroyed the user's.
+     */
+    ruleSuffixes() {
+      const ALIASES = {
+        CLAUDE: 'claude-code', GEMINI: 'gemini-cli',
+        ANTIGRAVITY: 'antigravity-cli', AGY: 'antigravity-cli',
+        KIMI: 'kimi-cli', KIMI_CODE: 'kimi-cli', GROK: 'grok-cli',
+        PI_CLI: 'pi', PI_DEV: 'pi', PI_CODING_AGENT: 'pi',
+        QWEN: 'qwen-code', OPEN_CODE: 'opencode',
+      };
+      const toKey = (rt) => String(rt).toUpperCase().replace(/-/g, '_');
+      const byKey = {};
+      for (const rt of (this.rulesData?.runtimes || [])) byKey[toKey(rt)] = rt;
+      return { byKey: { ...ALIASES, ...byKey }, toKey };
+    },
     // Convert the active scope's rules into editable rows {mode,runtime,text}.
     loadRulesDraft() {
-      const RT = { CLAUDE_CODE: 'claude-code', CLAUDE: 'claude-code', CODEX: 'codex', GEMINI: 'gemini-cli', GEMINI_CLI: 'gemini-cli', ANTIGRAVITY: 'antigravity-cli', ANTIGRAVITY_CLI: 'antigravity-cli', AGY: 'antigravity-cli', KIMI: 'kimi-cli', KIMI_CLI: 'kimi-cli', GROK: 'grok-cli', GROK_CLI: 'grok-cli', PI: 'pi', PI_CLI: 'pi', PI_DEV: 'pi', PI_CODING_AGENT: 'pi', HERMES: 'hermes' };
+      const { byKey } = this.ruleSuffixes();
       const src = (this.rulesData?.[this.settingsScopePicker] || []);
       this.rulesDraft = src.map(r => {
         const m = r.key.match(/^(NOT_USE|USE)_([A-Z0-9_]+)$/);
         const mode = m && m[1] === 'NOT_USE' ? 'not' : 'use';
-        const runtime = m ? (RT[m[2]] || 'claude-code') : 'claude-code';
-        return { mode, runtime, text: r.value };
+        // No fallback runtime: a key this build does not recognise keeps its
+        // own name and travels back to the .env untouched.
+        const runtime = (m && byKey[m[2]]) || '';
+        return { mode, runtime, text: r.value, rawKey: r.key, rawRuntime: runtime };
       });
     },
-    addRule() { this.rulesDraft.push({ mode: 'use', runtime: 'codex', text: '' }); },
+    addRule() {
+      const first = (this.rulesData?.runtimes || []).find(rt => rt !== 'hermes') || '';
+      this.rulesDraft.push({ mode: 'use', runtime: first, text: '' });
+    },
     removeRule(i) { this.rulesDraft.splice(i, 1); },
     // Serialize the rows back into USE_<RT>/NOT_USE_<RT> keys.
     rulesToEnv() {
-      const SUFFIX = { 'claude-code': 'CLAUDE_CODE', 'codex': 'CODEX', 'gemini-cli': 'GEMINI', 'antigravity-cli': 'ANTIGRAVITY', 'kimi-cli': 'KIMI', 'grok-cli': 'GROK', 'pi': 'PI', 'hermes': 'HERMES' };
+      const { toKey } = this.ruleSuffixes();
       const out = {};
       for (const r of this.rulesDraft) {
         if (!r.text.trim()) continue;
-        const key = (r.mode === 'not' ? 'NOT_USE_' : 'USE_') + (SUFFIX[r.runtime] || 'CODEX');
-        out[key] = r.text.trim();
+        // A row nobody edited keeps the exact key it was read from, so an
+        // existing `USE_GEMINI` is not churned into `USE_GEMINI_CLI` for free.
+        const sameRuntime = r.rawKey && r.runtime === r.rawRuntime;
+        const sameMode = r.rawKey && (r.mode === 'not') === r.rawKey.startsWith('NOT_USE_');
+        if (sameRuntime && sameMode) { out[r.rawKey] = r.text.trim(); continue; }
+        if (!r.runtime) { if (r.rawKey) out[r.rawKey] = r.text.trim(); continue; }
+        out[(r.mode === 'not' ? 'NOT_USE_' : 'USE_') + toKey(r.runtime)] = r.text.trim();
       }
       return out;
     },
@@ -1323,6 +1743,9 @@ function glance() {
       this.settingsOpen = false;
       this.settingsDraft = {};
       this.settingsDeletes = {};
+      this.engineDraft = {};
+      this.engineErrors = {};
+      this.engineNotice = {};
     },
     async fetchSettings() {
       try {
@@ -1419,19 +1842,56 @@ function glance() {
       }
     },
     // ─── Chat: methods (Phase 3) ───
-    openChat() {
+    async openChat() {
       // Free chat: conversational concierge. Generates a fresh chatId.
-      this.chatId = 'chat-' + Date.now().toString(36);
+      if (this.canonicalProjectId) {
+        try {
+          const response = await fetch(`/api/v1/projects/${encodeURIComponent(this.canonicalProjectId)}/conversations`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ title: 'Nova conversa' }),
+          });
+          const conversation = await response.json();
+          this.chatId = conversation.conversation_id;
+        } catch { this.chatId = 'chat-' + Date.now().toString(36); }
+      } else this.chatId = 'chat-' + Date.now().toString(36);
       this.chatMode = 'run';        // 'run' here = concierge (chat-agent)
       this.chatMessages = [];
       this.chatRunEvents = [];
       this.chatResumeSession = null;
+      this.chatSession = null; this.chatSessionRuntime = null; this.chatResumeCommand = null; this.chatTurnId = null;
+      if (this.chatTurnES) { this.chatTurnES.close(); this.chatTurnES = null; }
       this.chatHistoryOpen = false;
       this.chatOpen = true;
     },
     closeChat() {
       this.chatOpen = false;
       if (this.chatRunES) { this.chatRunES.close(); this.chatRunES = null; }
+    },
+    // Chat panel resize — drag handle AND ArrowLeft/ArrowRight keyboard,
+    // clamped to 460..920px (page-layout-redesign.md §2.2), persisted.
+    startChatResize(e) {
+      e.preventDefault();
+      // preventDefault() on mousedown also suppresses the browser's default
+      // click-to-focus behavior — restore it explicitly so the separator
+      // stays keyboard-operable (ArrowLeft/ArrowRight) right after a drag.
+      e.currentTarget.focus();
+      const startX = e.clientX;
+      const startW = this.chatWidth;
+      const pl = window.NirvanaPanelLayout;
+      const clamp = (w) => (pl ? pl.clampChatWidth(w) : Math.min(920, Math.max(460, w)));
+      const onMove = (ev) => { this.chatWidth = clamp(startW - (ev.clientX - startX)); };
+      const onUp = () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        try { localStorage.setItem('glance.chatWidth', String(this.chatWidth)); } catch {}
+      };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    },
+    stepChatWidth(delta) { this.setChatWidthPreset(this.chatWidth + delta); },
+    setChatWidthPreset(w) {
+      const pl = window.NirvanaPanelLayout;
+      this.chatWidth = pl ? pl.clampChatWidth(w) : Math.min(920, Math.max(460, w));
+      try { localStorage.setItem('glance.chatWidth', String(this.chatWidth)); } catch {}
     },
     // Subscribe to a trace's audit event stream (live timeline).
     subscribeRun(traceId) {
@@ -1440,73 +1900,95 @@ function glance() {
       const es = new EventSource(`/api/runs/${encodeURIComponent(traceId)}/stream`);
       const paint = () => this.$nextTick(() => { try { window.lucide?.createIcons(); } catch {} this.scrollChatBottom(); });
       es.addEventListener('snapshot', (e) => { try { this.chatRunEvents = JSON.parse(e.data).events || []; paint(); } catch {} });
-      es.addEventListener('event', (e) => { try { this.chatRunEvents.push(JSON.parse(e.data)); paint(); } catch {} });
+      es.addEventListener('timeline', (e) => { try { this.chatRunEvents.push(JSON.parse(e.data)); paint(); } catch {} });
       es.addEventListener('done', () => { es.close(); });
       es.onerror = () => { /* keep — reopens on the next turn */ };
       this.chatRunES = es;
     },
-    // Human label for an audit event (the golden 5 + the rest).
+    // Human label for an audit event. Single source: run-event-labels.js,
+    // exposed by the index.html module adapter as window.NirvanaRunEventLabels.
     chatEventLabel(ev) {
-      const map = {
-        agentic_route_decision: 'Roteou', dispatch_business: 'Despachou empresa', dispatch_squad: 'Despachou squad',
-        mind_clone_injected: 'Injetou mind-clone', agent_executed: 'Executou', gate_passed: 'Passou no gate',
-        gate_failed: 'Falhou no gate', delivered: 'Entregou', routing_rule_applied: 'Regra de runtime',
-        team_chain_selected: 'Montou o time', research_completed: 'Pesquisou', brief_received: 'Recebeu o brief',
-      };
-      return map[ev.event] || ev.event;
+      return window.NirvanaRunEventLabels?.chatEventLabel(ev) || ev.event || ev.type || 'evento';
     },
-    // AG-UI orchestration surface: maps each audit event into a semantic block
-    // {icon, title, sub, tone} — who (business/squad/agent), what,
-    // with cost/step. Foundation of the run mode's live timeline.
+    // AG-UI orchestration surface: maps each event (canonical `ev.type` or
+    // legacy `ev.event`) into a semantic block {icon, title, sub, tone}.
+    // Foundation of the run mode's live timeline.
     runEventView(ev) {
-      const biz = ev.business_slug, sq = ev.squad_slug || ev.squad_name;
-      const cost = ev.cost_usd != null ? `$${Number(ev.cost_usd).toFixed(2)}` : '';
-      const dur = ev.duration_ms != null ? `${(ev.duration_ms / 1000).toFixed(0)}s` : '';
-      const rt = ev.runtime ? String(ev.runtime).replace('claude-code', 'claude') : '';
-      const step = (ev.step && ev.total) ? `passo ${ev.step}/${ev.total}` : '';
-      const sub = (...xs) => xs.filter(Boolean).join(' · ');
-      const M = {
-        brief_received:       { icon: 'inbox', title: 'Brief recebido', tone: '' },
-        brief_amplified:      { icon: 'sparkles', title: 'Brief enriquecido', tone: '' },
-        agentic_route_decision:{ icon: 'compass', title: `Roteou → ${biz || ev.primary_business || '?'}`, sub: ev.rationale || ev.method || '', tone: 'active' },
-        auto_route_selected:  { icon: 'compass', title: `Roteou → ${biz || '?'}`, sub: ev.method || '', tone: 'active' },
-        routing_rule_applied: { icon: 'settings-2', title: `Regra de runtime → ${ev.runtime || ''}`, tone: '' },
-        dispatch_business:    { icon: 'building-2', title: `${biz || 'empresa'} assumiu`, tone: 'active' },
-        dispatch_squad:       { icon: 'users', title: `squad ${sq || ''}`, tone: 'active' },
-        mind_clone_injected:  { icon: 'brain', title: `Mind-clone: ${ev.clone || ev.dna || ev.slug || ev.file || 'persona'}`, tone: '' },
-        team_chain_selected:  { icon: 'link', title: 'Time montado', sub: sub(biz), tone: '' },
-        agent_executed:       { icon: 'bot', title: ev.employee || 'agente', sub: sub(step, rt, cost, dur), tone: 'ok' },
-        agent_exec_failed:    { icon: 'alert-triangle', title: `${ev.employee || 'agente'} falhou`, tone: 'fail' },
-        tool_invoked:         { icon: 'wrench', title: ev.tool || 'ferramenta', tone: '' },
-        bash_completed:       { icon: 'terminal-square', title: 'comando', tone: '' },
-        ask_invoked:          { icon: 'message-circle-question', title: `consultou ${ev.clone || 'mind-clone'}`, tone: '' },
-        verify_passed:        { icon: 'check-circle-2', title: 'Verificação passou', tone: 'ok' },
-        verify_failed:        { icon: 'x-circle', title: 'Verificação falhou', tone: 'fail' },
-        gate_passed:          { icon: 'shield-check', title: 'Gate passou', sub: (ev.rubrics || []).join(', '), tone: 'ok' },
-        report_html_generated:{ icon: 'file-text', title: 'HTML gerado', tone: '' },
-        report_pdf_generated: { icon: 'file-text', title: 'PDF gerado', tone: '' },
-        delivered:            { icon: 'party-popper', title: 'Entregue', tone: 'ok' },
-        runtime_handoff:      { icon: 'refresh-cw', title: `Trocou runtime → ${ev.to || ev.runtime || ''}`, tone: '' },
-        runtime_quota_exhausted: { icon: 'ban', title: 'Cota esgotada', tone: 'fail' },
-        cascade_exhausted:    { icon: 'ban', title: 'Cascata esgotada', tone: 'fail' },
-      };
-      return M[ev.event] || { icon: 'circle', title: this.chatEventLabel(ev), sub: '', tone: '' };
+      const labels = window.NirvanaRunEventLabels;
+      return labels ? labels.runEventView(ev) : { icon: 'circle', title: ev.type || ev.event || 'evento', sub: '', tone: '' };
     },
-    // Live header derived from the stream: current business/squad/agent + total cost.
+    // Timeline rows, shared by the Chat panel and the Runs tab. Infrastructure
+    // events (coordinator snapshots, lease renewals) stay in the stream but
+    // are hidden until the user toggles them; `hidden` feeds the toggle label.
+    infraEventsVisible: false,
+    runTimeline(events) {
+      const labels = window.NirvanaRunEventLabels;
+      return labels ? labels.runTimeline(events, this.infraEventsVisible) : { visible: events || [], hidden: 0 };
+    },
+    // Trajectory Card: the single grouping used by BOTH the Chat panel
+    // (mode 'live') and the Runs tab (mode 'historical') — see trajectory-card.js.
+    // `expandedTrajectoryRows` keys by the row's stable `_seq`, so an expanded
+    // judgement/delivery row survives the infra toggle and re-renders.
+    expandedTrajectoryRows: {},
+    trajectoryRows(events) {
+      const tc = window.NirvanaTrajectoryCard;
+      return tc ? tc.buildTrajectoryRows(events, { showInfra: this.infraEventsVisible }) : { rows: [], hidden: 0 };
+    },
+    isTrajectoryRowExpanded(seq) { return !!this.expandedTrajectoryRows[seq]; },
+    toggleTrajectoryRow(seq) { this.expandedTrajectoryRows[seq] = !this.expandedTrajectoryRows[seq]; },
+    // Live header derived from the stream: business/squad/agent, canonical
+    // state, Gauntlet decision and cost (see summarizeRunEvents).
     get runSummary() {
-      const evs = this.chatRunEvents || [];
-      let business = null, squad = null, lastAgent = null, agents = 0, cost = 0;
-      for (const ev of evs) {
-        if (ev.business_slug || ev.business) business = ev.business_slug || ev.business;
-        if (ev.squad_slug || ev.squad_name || ev.squad) squad = ev.squad_slug || ev.squad_name || ev.squad;
-        if (ev.event === 'agent_executed') { agents++; lastAgent = ev.employee || lastAgent; }
-        if (ev.cost_usd != null) cost += Number(ev.cost_usd) || 0;
-      }
-      return { business, squad, lastAgent, agents, cost, count: evs.length };
+      const labels = window.NirvanaRunEventLabels;
+      return labels ? labels.summarizeRunEvents(this.chatRunEvents) : { cost: 0, count: (this.chatRunEvents || []).length };
+    },
+    // How the Run's target was decided (`run.route`): named in the Message, chosen by the router, or agent-x by fallback.
+    routeLabel(route) {
+      const labels = window.NirvanaRunEventLabels;
+      return labels && route ? labels.routeSourceLabel(route) : '';
+    },
+    routeVia(route) { return route ? ` (${this.routeLabel(route)}${route.rationale ? ': ' + route.rationale : ''})` : ''; },
+    // What a prepared Run is doing, from its target and `run.route`: a Run without a route is
+    // still being routed by the queue (`x_run_route_resolved` brings the target).
+    canonicalRunStep(target, route) {
+      if (!route) return 'Roteando a Message (empresa, squad ou agent-x)…';
+      const kind = target?.kind;
+      return (!kind || kind === 'agent-x') ? `Executando agent-x no Gauntlet light${this.routeVia(route)}…` : `Executando ${kind} ${target.slug || ''}${this.routeVia(route)}…`;
+    },
+    // The answer the queue wrote to the conversation for a Message the router could not place.
+    async canonicalRunAnswer(runId) {
+      try {
+        const conversation = await api(`/api/v1/conversations/${encodeURIComponent(this.chatId)}`);
+        const reply = (conversation.messages || []).filter(m => m.role === 'assistant' && m.run_id === runId).pop();
+        return reply ? reply.content : '';
+      } catch { return ''; }
+    },
+    runStateVariant(state) {
+      return ({ completed: 'success', delivered_with_reservations: 'success', running: 'warn', verifying: 'warn', revising: 'warn',
+        waiting: 'info', prepared: 'info', failed: 'danger', withheld: 'danger', cancelled: 'danger', rolled_back: 'danger', abandoned: 'danger' })[state] || 'neutral';
+    },
+    // Multi-target coordinator projection of the streaming canonical Run
+    // (GET /api/v1/runs/:run/multi-target). Null until the Run saves a snapshot.
+    chatMultiTarget: null,
+    async refreshMultiTarget(projectId, runId) {
+      try {
+        const result = await api(`/api/v1/runs/${encodeURIComponent(runId)}/multi-target?project_id=${encodeURIComponent(projectId)}`);
+        this.chatMultiTarget = result.projection || null;
+      } catch {}
+    },
+    runMultiTarget(m) { return m.streaming ? this.chatMultiTarget : (m.multiTarget || null); },
+    multiTargetWaveCount(projection) { return (projection?.nodes || []).reduce((max, node) => Math.max(max, node.waveIndex + 1), 0); },
+    multiTargetStateVariant(state) {
+      return ({ delivered: 'success', running: 'warn', ready: 'info', pending: 'neutral', withheld: 'warn', skipped: 'neutral', failed: 'danger', stalled: 'danger' })[state] || 'neutral';
     },
     chatRuntime: '',           // '' = auto (session host); or claude-code/codex/…
     chatFast: false,           // fast/cheap mode (opt-in); default = agentic
     chatResumeSession: null,   // runtime session_id to continue the conversation
+    chatSession: null,         // native runtime session of the canonical conversation (maestro turn)
+    chatSessionRuntime: null,
+    chatResumeCommand: null,   // how to continue the same session from a terminal in the project root
+    chatTurnId: null,          // the maestro turn running for the open conversation (cancel target)
+    chatTurnES: null,          // EventSource of that turn
     // Send a turn. Default = conversational concierge (chat-agent). The
     // revise/resume mode is only used on "Continuar session" of an existing run.
     async sendChat() {
@@ -1522,6 +2004,21 @@ function glance() {
       this.chatInput = '';
       this.chatMessages.push({ role: 'user', text: msg });
       this.chatMessages.push({ role: 'assistant', text: '', events: [], streaming: true });
+      let canonicalReceipt = null;
+      if (this.canonicalProjectId && this.chatId.startsWith('cnv_')) {
+        try {
+          const response = await fetch(`/api/v1/conversations/${encodeURIComponent(this.chatId)}/messages`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+            body: JSON.stringify({ project_id: this.canonicalProjectId, role: 'user', content: msg, mode: 'turn' }),
+          });
+          canonicalReceipt = await response.json();
+          if (!response.ok) throw new Error(canonicalReceipt.detail || canonicalReceipt.title || 'falha ao iniciar o turno');
+        } catch (error) {
+          const asst = this.chatMessages[this.chatMessages.length - 1];
+          asst.text = `⚠ ${error.message || error}`; asst.streaming = false; this.chatBusy = false;
+          return;
+        }
+      }
       // Grab the REACTIVE reference (array proxy) — mutating the raw object would
       // not trigger Alpine's re-render, and the bubble would stay at "orquestrando…".
       const asst = this.chatMessages[this.chatMessages.length - 1];
@@ -1530,6 +2027,29 @@ function glance() {
       this.saveChatToHistory();
       try { location.hash = `#/chat/${this.chatId}`; } catch {}
       this.$nextTick(() => this.scrollChatBottom());
+
+      if (canonicalReceipt?.turn) {
+        // A maestro turn: the project's runtime session answers; the events arrive by SSE.
+        const turn = canonicalReceipt.turn;
+        if (turn.state === 'unavailable') {
+          asst.text = `⚠ Turnos do maestro indisponíveis (${turn.detail || turn.reason}).`;
+          asst.streaming = false; this.chatBusy = false;
+          return;
+        }
+        this.applySession(canonicalReceipt.session, turn);
+        this.subscribeTurn(turn, asst);
+        return;
+      }
+      if (canonicalReceipt?.run) {
+        // The receipt is immediate: an explicit prefix already carries target and `run.route`; a
+        // routed Message shows them once the stream brings `x_run_route_resolved`.
+        asst.text = canonicalReceipt.queued
+          ? `Run canônico preparado. ${this.canonicalRunStep(canonicalReceipt.run.target, canonicalReceipt.run.route)}`
+          : `Run não executado: ${canonicalReceipt.run.state}${this.routeVia(canonicalReceipt.run.route)}.`;
+        if (canonicalReceipt.queued) this.subscribeCanonicalRun(this.canonicalProjectId, canonicalReceipt.run.runId, canonicalReceipt.run.lastSequence || 0, asst);
+        else { asst.streaming = false; this.chatBusy = false; }
+        return;
+      }
 
       // revise/resume = continue a specific production RUN (nrv revise/resume).
       // Otherwise, the conversational concierge.
@@ -1550,21 +2070,104 @@ function glance() {
         asst.text = `⚠ ${e.message}`; asst.streaming = false; this.chatBusy = false;
       }
     },
-    // `!<cmd>` — runs an arbitrary shell command (free-form; localhost + gate).
-    async runShell(cmd) {
-      if (!cmd) return;
-      if (!this.chatId) this.chatId = 'chat-' + Date.now().toString(36);
-      this.chatMessages.push({ role: 'user', text: '$ ' + cmd });
-      this.chatMessages.push({ role: 'assistant', text: '', events: [], streaming: true });
-      const asst = this.chatMessages[this.chatMessages.length - 1];
-      this.chatBusy = true;
-      this.saveChatToHistory();
-      this.$nextTick(() => this.scrollChatBottom());
+    subscribeCanonicalRun(projectId, runId, after, asst) {
+      if (this.chatRunES) this.chatRunES.close();
+      this.chatRunEvents = [];
+      this.chatMultiTarget = null;
+      const es = new EventSource(`/api/v1/projects/${encodeURIComponent(projectId)}/stream?after=${Number(after) || 0}`);
+      this.chatRunES = es;
+      es.addEventListener('timeline', async (event) => {
+        try {
+          const item = JSON.parse(event.data);
+          if (item.runId !== runId) return;
+          this.chatRunEvents.push(item);
+          // Only snapshots, node events and the terminal event change the projection.
+          if (item.type === 'multi_target.snapshot_saved' || item.type === 'multi_target.plan_terminal' || item.payload?.node) this.refreshMultiTarget(projectId, runId);
+          if (item.type === 'x_run_route_resolved') asst.text = `Run canônico preparado. ${this.canonicalRunStep(item.payload?.target, item.payload?.route)}`;
+          if (item.type === 'run.transitioned' && ['completed', 'withheld', 'delivered_with_reservations', 'cancelled', 'failed', 'rolled_back'].includes(item.payload?.to)) {
+            es.close();
+            if (this.chatMultiTarget) await this.refreshMultiTarget(projectId, runId);
+            // Keep the timeline and the projection with the message once the stream ends.
+            asst.events = [...this.chatRunEvents];
+            asst.multiTarget = this.chatMultiTarget;
+            asst.text = `Run ${item.payload.to}.`;
+            // A Message the router could not place ends with the answer the queue wrote to the conversation.
+            if (item.payload.reason === 'no_dispatchable_target') asst.text = (await this.canonicalRunAnswer(runId)) || asst.text;
+            asst.streaming = false; this.chatBusy = false;
+            this.$nextTick(() => this.scrollChatBottom());
+          }
+        } catch {}
+      });
+      es.onerror = () => { /* EventSource resumes from the cursor query and SSE id. */ };
+    },
+    // The native session of the conversation's runtime (kept by the runtime, per working
+    // directory): shown short in the header, with the terminal command that continues it.
+    applySession(session, turn) {
+      const id = (session && session.session_id) || (turn && turn.session_id) || null;
+      if (!id) return;
+      this.chatSession = id;
+      this.chatSessionRuntime = (session && session.session_runtime) || (turn && turn.runtime) || this.chatSessionRuntime;
+      this.chatResumeCommand = (session && session.resume_command) || (this.chatSessionRuntime === 'claude-code' ? `claude --resume ${id}` : null);
+    },
+    // Follow one maestro turn by SSE: tok → live text, tool → chip, run → link to the Run the
+    // maestro opened, done → the reply. The server persists the assistant message; nothing to POST.
+    subscribeTurn(turn, asst) {
+      if (this.chatTurnES) { this.chatTurnES.close(); this.chatTurnES = null; }
+      this.chatTurnId = turn.turn_id;
+      asst.turnId = turn.turn_id; asst.tools = []; asst.runs = [];
+      const es = new EventSource(turn.events_url);
+      this.chatTurnES = es;
+      let graceTimer = null;
+      const clearGrace = () => { if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; } };
+      const finish = (errText) => {
+        clearGrace(); es.close();
+        if (this.chatTurnES === es) this.chatTurnES = null;
+        this.chatTurnId = null;
+        asst.streaming = false; this.chatBusy = false;
+        if (errText && !asst.text) asst.text = errText;
+        this.saveChatToHistory();
+        this.$nextTick(() => { this.scrollChatBottom(); try { window.lucide?.createIcons(); } catch {} });
+      };
+      es.onmessage = (e) => {
+        clearGrace();
+        let ev; try { ev = JSON.parse(e.data); } catch { return; }
+        if (ev.t === 'tok') { asst.text = (asst.text || '') + ev.v; this.$nextTick(() => this.scrollChatBottom()); }
+        else if (ev.t === 'tool') { asst.tools = [...(asst.tools || []), { name: ev.name, cmd: ev.cmd }]; this.$nextTick(() => this.scrollChatBottom()); }
+        else if (ev.t === 'run') { asst.runs = [...(asst.runs || []), ev]; this.fetchRuns(); this.$nextTick(() => { try { window.lucide?.createIcons(); } catch {} }); }
+        else if (ev.t === 'done') {
+          asst.text = ev.result || (asst.text || '').trim() || (ev.state === 'cancelled' ? 'Turno cancelado.' : (ev.error ? `⚠ ${ev.error}` : '(sem resposta)'));
+          asst.cost = ev.cost_usd; asst.turnState = ev.state;
+          this.applySession({ session_id: ev.session_id, session_runtime: ev.runtime, resume_command: ev.resume_command }, null);
+          finish();
+        }
+      };
+      es.onerror = () => {
+        // CLOSED = the server ended the stream without `done` (it died). CONNECTING = the
+        // EventSource reconnects on its own (Last-Event-ID resumes); 20 s of grace, then give up
+        // instead of an eternal "orquestrando…".
+        if (es.readyState === EventSource.CLOSED) { if (asst.streaming) finish('⚠ conexão encerrada. Recarregue a página.'); return; }
+        if (asst.streaming && !graceTimer) graceTimer = setTimeout(() => { if (asst.streaming) finish('⚠ conexão perdida (o servidor pode ter reiniciado). Recarregue a página.'); }, 20000);
+      };
+    },
+    // SIGTERM on the turn's process group; the stream ends with done.state = cancelled.
+    async cancelTurn() {
+      if (!this.chatTurnId || !this.chatId) return;
       try {
-        const r = await fetch('/api/actions/chat-shell', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: this.chatId, command: cmd }) }).then(x => x.json());
-        if (r.error || !r.job) { asst.text = `⚠ ${r.error || 'falha ao iniciar o comando'}`; asst.streaming = false; this.chatBusy = false; return; }
-        this.followChatJob(r.job.id, asst, 'shell');
-      } catch (e) { asst.text = `⚠ ${e.message}`; asst.streaming = false; this.chatBusy = false; }
+        await fetch(`/api/v1/conversations/${encodeURIComponent(this.chatId)}/turns/${encodeURIComponent(this.chatTurnId)}:cancel`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+          body: JSON.stringify({ project_id: this.canonicalProjectId }),
+        });
+      } catch {}
+    },
+    // A Run the maestro opened during the turn: the Runs tab, with that Run selected.
+    openRunFromChat(run) {
+      this.enterKind('runs');
+      this.$nextTick(() => { const it = (this.runs || []).find(x => x.trace_id === run.trace_id || x.trace_id === run.run_id); if (it) this.selectRun(it); });
+    },
+    // Kept as a compatibility method for old bookmarked UI state. The control
+    // plane intentionally has no browser shell route.
+    async runShell(cmd) {
+      this.chatMessages.push({ role: 'system', text: 'Comandos de shell não são aceitos pelo control plane do browser.' });
     },
     // `/<cmd>` — slash commands (client-side; no shell).
     runSlash(raw) {
@@ -1596,7 +2199,7 @@ function glance() {
             '`/route <brief>` — qual empresa/squad usar',
             '`/run <slug> <brief>` — despachar um trabalho',
             '`/fast` · `/agentic` — trocar o modo de roteamento',
-            '`!<comando>` — rodar um comando de shell (ex.: `!nrv list-businesses`)',
+            'Comandos de shell não são expostos pelo browser.',
           ].join('\n'));
           return;
       }
@@ -1656,6 +2259,12 @@ function glance() {
           asst.events = [...this.chatRunEvents];
         }
         this.saveChatToHistory();
+        if (this.canonicalProjectId && this.chatId?.startsWith('cnv_') && asst.text) {
+          fetch(`/api/v1/conversations/${encodeURIComponent(this.chatId)}/messages`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+            body: JSON.stringify({ project_id: this.canonicalProjectId, role: 'assistant', content: asst.text }),
+          }).catch(() => {});
+        }
         this.$nextTick(() => { this.scrollChatBottom(); try { window.lucide?.createIcons(); } catch {} });
       };
       // Final safety net: if nothing signals 'done' (hung job), don't leave an
@@ -1764,7 +2373,7 @@ function glance() {
     // ─── Selection ───
     async select(item) {
       this.selected = item;
-      this.tab = this.kind === 'projects' ? 'dag' : (this.kind === 'businesses' ? 'overview' : 'overview');
+      this.tab = this.kind === 'projects' ? 'dag' : (this.kind === 'businesses' ? 'org-chart' : 'overview');
       this.detail = null;
       this.mindCloneContent = null;
       try {
@@ -1905,7 +2514,7 @@ function glance() {
       if (e.message) return e.message.slice(0, 80);
       if (e.target) return `→ ${e.target}`;
       if (e.target_business || e.target_squad) return `→ ${e.target_business || e.target_squad}`;
-      const keys = Object.keys(e).filter(k => !['timestamp','ts','event_type','event','classification','stage','_file'].includes(k));
+      const keys = Object.keys(e).filter(k => !['timestamp','ts','event_type','event','classification','stage','_file','_ce'].includes(k));
       if (keys.length) return keys.slice(0,2).map(k => `${k}=${JSON.stringify(e[k]).slice(0,30)}`).join(' ');
       return '';
     },
@@ -1967,6 +2576,30 @@ function glance() {
         this.flash(`✗ ${e.message}`, 4000);
       }
     },
+    // ─── Admission gate ───
+    // Read-only: the server runs `nrv validate --json` in a child with a
+    // timeout, so a slow entity answers 504 instead of freezing the cockpit.
+    async verifyEntity(kind, slug) {
+      if (!slug || this.verifyBusy) return;
+      this.verifyBusy = true;
+      this.verifyKey = `${kind}:${slug}`;
+      this.verifyReport = null;
+      try {
+        const r = await fetch(`/api/v1/verify/${kind}/${encodeURIComponent(slug)}`);
+        const data = await r.json();
+        if (!r.ok) { this.flash(`✗ ${data.title || 'verify'}: ${data.detail || r.status}`, 5000); this.verifyKey = null; return; }
+        this.verifyReport = data;
+        const s = data.summary || {};
+        this.flash(`${data.verdict} · ${s.errors || 0} erro(s), ${s.warnings || 0} aviso(s)`, 3000);
+      } catch (e) {
+        this.flash(`✗ ${e.message}`, 4000);
+        this.verifyKey = null;
+      } finally {
+        this.verifyBusy = false;
+      }
+    },
+    verifyShown(kind, slug) { return !!this.verifyReport && this.verifyKey === `${kind}:${slug}`; },
+    verifyFixable() { return (this.verifyReport?.findings || []).some(f => f.autofix === 'mechanical'); },
     confirmAction(name, body, prompt) {
       if (!window.confirm(prompt)) return;
       this.runAction(name, body);

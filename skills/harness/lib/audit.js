@@ -1,8 +1,21 @@
+/** Stamp an envelope, tolerating an engine that cannot reach its key. */
+function stampEvent(envelope) {
+  try { return require('../../_shared/lib/audit-provenance.js').stamp(envelope); }
+  catch { return envelope; }
+}
+
 /**
  * Audit logger (JSONL append-only) for the Harness Protocol v1.
  *
  * Writes events to ~/.harness-logs/<YYYY-MM-DD>/audit.jsonl.
  * Schema: ~/.nirvana/skills/_shared/schemas/core-schemas.json#/definitions/audit_event
+ *
+ * On-disk form: a CloudEvents 1.0 structured-mode envelope, one per line, built
+ * by _shared/lib/cloudevents.js. The ~187k events written before that cut are
+ * flat and stay flat — nothing is rewritten. Every reader passes its parsed
+ * line through `toLegacyEvent()`, which returns the flat shape for an envelope
+ * and the object itself, by identity, for anything else. If you add a reader,
+ * read through `parseAuditLine()` and it handles both.
  *
  * Events: the closed enum is ALLOWED_EVENTS below — the single source of
  * truth. The event table in references/03-audit.md is GENERATED from it
@@ -24,18 +37,30 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const ce = require('../../_shared/lib/cloudevents.js');
+const { ensureDir } = require('../../_shared/lib/ensure-dir.js');
 
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), '.nirvana', 'skills')) ? path.join(os.homedir(), '.nirvana', 'skills') : path.join(os.homedir(), '.claude', 'skills'));
 
 const ALLOWED_EVENTS = new Set([
   'brief_received', 'brief_amplified', 'routing_decision', 'invocation_start', 'invocation_end',
-  'cost_emission', 'handoff', 'ticket_opened', 'ticket_resolved',
+  'cost_emission', 'handoff',
   'escalation_trigger_fired', 'human_notification_required', 'human_response_received',
   'resume', 'approval_checkpoint', 'approval_granted', 'approval_rejected',
-  'budget_violation', 'memory_write', 'isolation_violation', 'validation_failed',
+  'budget_violation', 'isolation_violation', 'validation_failed',
   'humanization_applied', 'humanization_skipped', 'loop_detected', 'context_budget_warning',
   'stall_detected', 'stall_retry', 'gate_failed', 'gate_passed',
+  // Plan cut 5 (.nirvana/plans/event-contract.md) re-measured every "allowed
+  // but never emitted by code" entry in this original batch. Kept — a real
+  // producer or a real, cited design, never a guess (CHANGELOG.md carries the
+  // reasoning per name): handoff, escalation_trigger_fired,
+  // human_notification_required (emitted for real — `supervisor.ts` calls it
+  // through the `emitAudit()` wrapper, which is why the gate's `emit(` literal
+  // regex missed it), human_response_received, budget_violation,
+  // isolation_violation, humanization_applied/skipped, invocation_start/end.
+  // Removed, same measurement, no producer, no doc, no reader found anywhere:
+  // chunk_gate_passed/failed (below), memory_write, ticket_opened, ticket_resolved.
   // Phase A — dispatch quality invariants (see docs/plans/dispatch-quality-gate-and-mind-clone-injection.md)
   'dispatch_business',         // maestro dispatched a business (agentic path) — canonical business_slug
   'dispatch_squad',            // maestro dispatched a squad (agentic path) — canonical squad_name
@@ -56,8 +81,9 @@ const ALLOWED_EVENTS = new Set([
   'clarification_received',    // user answered the questions
   // Phase 7 — streaming outputs (nirvana-evolution)
   'chunk_emitted',             // a streaming chunk was written by chunk-writer
-  'chunk_gate_passed',         // per-chunk partial gate passed
-  'chunk_gate_failed',         // per-chunk partial gate failed (warning, non-blocking)
+  // chunk_gate_passed / chunk_gate_failed — planned here, never built: only
+  // the writer half of Phase 7 (chunk-writer.ts, chunk_emitted) shipped, no
+  // caller ever implemented a per-chunk gate. Removed, plan cut 5.
   // routing-360 Phase 4 — dispatch-side lifecycle events. These were already
   // emitted for real by dispatch.ts / team-orchestrator.ts / squad-exec.ts /
   // delivery-pipeline.ts via raw appenders; converting the dispatch side to
@@ -133,7 +159,7 @@ function logPath(dateStr, cwd) {
  */
 function ensureLogDir(dateStr, cwd) {
   const { dir, file } = logPath(dateStr, cwd);
-  fs.mkdirSync(dir, { recursive: true });
+  ensureDir(dir);
   return file;
 }
 
@@ -194,6 +220,15 @@ function emit(event, payload, ctx) {
     if (ctx.session_id) base.session_id = ctx.session_id;
   }
   const ev = Object.assign(base, payload || {});
+  // Emitted from an Orca terminal, the event says which workspace and pane:
+  // the reader (Glance, `nrv audit where`) can then point at the tab a run
+  // happened in. Outside Orca the block is absent — nothing else changes.
+  if (ev.orca === undefined) {
+    try {
+      const orcaCtx = require('../../_shared/lib/orca.js').orcaAuditContext();
+      if (orcaCtx) ev.orca = orcaCtx;
+    } catch { /* detection is best-effort */ }
+  }
   // Dual-write: SQLite primary (when available) + JSONL fallback. The JSONL
   // continues to be authoritative for legacy readers; SQLite is the new
   // race-safe substrate. When SQLite is rolled out across all readers, we
@@ -210,7 +245,21 @@ function emit(event, payload, ctx) {
     } catch { /* non-fatal: JSONL still writes */ }
   }
   const file = ensureLogDir(undefined, cwd);
-  fs.appendFileSync(file, JSON.stringify(ev) + '\n', 'utf8');
+  // The line on disk is a CloudEvents 1.0 structured-mode envelope; every
+  // reader accepts both forms (cloudevents.js `toLegacyEvent`). The SQLite
+  // side above keeps the flat shape on purpose: its own columns already give
+  // the filter-without-parsing property the envelope buys for the file.
+  //
+  // The stamp goes on the ENVELOPE, not the inner event, because that is what
+  // lands on disk and what a reader parses. This is the path `nrv audit emit`
+  // takes — the one the protocol tells agents to use — and leaving it unstamped
+  // was the hole that made the whole signal useless on 2026-09-04: the internal
+  // emitters were stamped and the canonical one was not, so a legitimate
+  // agent-emitted event was indistinguishable from a line somebody typed. The
+  // distinction being drawn is "went through engine code" versus "raw append",
+  // and an agent calling `nrv audit emit` is on the right side of it.
+  const envelope = stampEvent(ce.toEnvelope(ev, ctx));
+  fs.appendFileSync(file, JSON.stringify(envelope) + '\n', 'utf8');
   return { path: file, event: ev };
 }
 
@@ -232,7 +281,7 @@ function readAuditEvents(filters = {}, limit = 200) {
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     for (const ln of lines) {
       try {
-        const ev = JSON.parse(ln);
+        const ev = ce.parseAuditLine(ln);
         if (filters.event && ev.event !== filters.event) continue;
         if (filters.trace_id && ev.trace_id !== filters.trace_id) continue;
         if (filters.project_id && ev.project_id !== filters.project_id) continue;
@@ -288,14 +337,15 @@ function rotate(retentionDays) {
 /**
  * Read recent audit events (most recent first) up to `limit`.
  * Useful for diagnostics. Reads the current day file by default.
+ * `cwd` (optional) anchors which root is read — see harnessLogsRoot.
  */
-function readRecent(limit = 100, dateStr) {
-  const { file } = logPath(dateStr);
+function readRecent(limit = 100, dateStr, cwd) {
+  const { file } = logPath(dateStr, cwd);
   if (!fs.existsSync(file)) return [];
   const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
   const tail = lines.slice(-limit);
   return tail.map((l) => {
-    try { return JSON.parse(l); } catch { return { _parse_error: true, line: l }; }
+    try { return ce.parseAuditLine(l); } catch { return { _parse_error: true, line: l }; }
   }).reverse();
 }
 

@@ -39,6 +39,15 @@ async function hostDriver() {
   return _hostDriver;
 }
 
+/** First runtime on the driver's roster that is actually installed here. */
+async function firstInstalledRuntime(): Promise<string | null> {
+  try {
+    const driver = await hostDriver();
+    if (!driver) return null;
+    return driver.listRuntimes().map((r) => r.name).find((n) => driver.runtimeAvailable(n)) ?? null;
+  } catch { return null; }
+}
+
 /**
  * Judge runtime selection — consult the user's runtime rules (USE_* /
  * NOT_USE_* in .env, via runtime-rules.ts decideRuntime) instead of blindly
@@ -65,7 +74,11 @@ async function resolveJudgePreferredRuntime(
     const decision = rules_mod.decideRuntime({
       brief: input.brief ?? "",
       explicitRuntime: null,
-      defaultRuntime: currentHost ?? "claude-code",
+      // Placeholder only: with no detectable session host the decision below
+      // is discarded (see the `source === "default"` guard). It is the first
+      // INSTALLED runtime rather than a vendor literal, so the veto message a
+      // NOT_USE rule prints names a CLI that actually exists here.
+      defaultRuntime: currentHost ?? (await firstInstalledRuntime()) ?? "claude-code",
       rules,
       mode: "fast",
       available,
@@ -140,15 +153,32 @@ function buildPersona(rubric: RubricMeta): string {
   ].join("\n");
 }
 
+/** Above this an artifact is worth flagging to the judge, so a long deliverable
+ *  is not graded as if its opening were the whole of it. It is a NOTICE, never a
+ *  cut: the artifact always travels whole. */
+export const JUDGE_LARGE_ARTIFACT_CHARS = 30_000;
+
 function buildUserMessage(input: JudgeInput): string {
   const briefBlock = input.brief ? `\n## Brief\n${input.brief}\n` : "";
   const kindBlock = input.artifact_kind ? `\n## Artifact kind\n${input.artifact_kind}\n` : "";
   const ctxBlock = input.context ? `\n## Context\n${JSON.stringify(input.context, null, 2)}\n` : "";
   return [
     `## Artifact to evaluate`,
+    // The whole artifact. This used to be `.slice(0, 30_000)` with a
+    // `[…truncated…]` marker, which made the gate certify what it had not read:
+    // `quality-gate.ts` hands over a file's full content, so a 300 KB report was
+    // graded on its first ten percent and `gate_passed` was emitted for the file.
+    // A 120-page opinion could pass on its introduction. A judge that reads part
+    // of a deliverable and returns a verdict on all of it is worse than no judge,
+    // because the verdict is believed. When an artifact is large enough to be
+    // worth flagging, the size is stated below and on `judge_invoked`, and the
+    // model is told to weigh coverage — never silently handed a fragment.
     `\`\`\``,
-    input.artifact.length > 30_000 ? input.artifact.slice(0, 30_000) + "\n[…truncated…]" : input.artifact,
+    input.artifact,
     `\`\`\``,
+    input.artifact.length > JUDGE_LARGE_ARTIFACT_CHARS
+      ? `\n> Este artefato tem ${input.artifact.length} caracteres, acima de ${JUDGE_LARGE_ARTIFACT_CHARS}. Ele foi entregue INTEIRO acima — avalie o conjunto, não só o começo.\n`
+      : ``,
     briefBlock,
     kindBlock,
     ctxBlock,
@@ -245,6 +275,8 @@ export async function judge(input: JudgeInput, opts: JudgeOpts = {}): Promise<Ju
   audit().emit("judge_invoked", {
     rubric_name: input.rubric.name,
     artifact_chars: input.artifact.length,
+    // So a verdict on a very large artifact can be told apart afterwards.
+    artifact_large: input.artifact.length > JUDGE_LARGE_ARTIFACT_CHARS,
     pass_threshold: input.rubric.pass_threshold,
     target_model: input.rubric.target_model,
   }, {
@@ -282,7 +314,12 @@ export async function judge(input: JudgeInput, opts: JudgeOpts = {}): Promise<Ju
   const preferredHost = await resolveJudgePreferredRuntime(input, opts, available);
 
   const call = await driver.callHostAgentAsync(persona, userMsg, {
-    timeoutMs: opts.timeoutMs ?? 60_000,
+    // No floor of our own: the driver's budget is a budget of SILENCE, and a
+    // judge grading a long artifact against a seven-criterion rubric routinely
+    // thinks for more than the 60s this used to allow. `claude -p
+    // --output-format json` prints nothing until it is done, so those 60s were
+    // a wall clock, and the verdict they produced was a runtime error.
+    ...(typeof opts.timeoutMs === "number" ? { timeoutMs: opts.timeoutMs } : {}),
     ...(preferredHost ? { preferredHost } : {}),
   });
 

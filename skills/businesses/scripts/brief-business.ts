@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { exec, paths, EXIT, BUN_BIN } from "../../_shared/lib/bun-helpers.ts";
 import { resolveScope, enumerate, outputsDir } from "../../_shared/lib/scope.ts";
+import { briefExcerpt } from "../../_shared/lib/brief-excerpt.ts";
 
 const skillDir = path.join(paths.CLAUDE_SKILLS_DIR, "businesses");
 // Single scope, reused for the business lookup AND outputsDir (don't resolve twice).
@@ -68,14 +69,21 @@ if (!projectId) {
 }
 
 // Resolve outputs root via canonical scope helper. Defaults to
-// <projectRoot>/.nirvana/outputs (or HOME fallback when not in a project).
+// <projectRoot>/outputs (or HOME fallback when not in a project).
 // Honors NIRVANA_OUTPUTS_DIR override. Reuses the single `scope` resolved above.
 const outputsRoot = outputsDir(scope);
 
+// Only the dir we are about to write into. `handoffs/`, `tickets/` and
+// `employees/` used to be pre-created here on the chance something landed in
+// them; most runs write to none of the three, so every brief left empty
+// directories behind — 13 of the 15 empties measured in one real project.
+// Whoever writes a handoff creates it then, with `recursive: true`, and the
+// only reader (artifact-indexer) already guards with existsSync. `tickets`
+// was the worst of the three: the protocol retired it (RETIRED_MANIFEST_FIELDS
+// and RETIRED_FILES in verify/kinds/business.ts), so the brief was creating a
+// directory the validator rejects.
 const projectDir = path.join(outputsRoot, projectId, "businesses", slug);
-fs.mkdirSync(path.join(projectDir, "handoffs"), { recursive: true });
-fs.mkdirSync(path.join(projectDir, "tickets"), { recursive: true });
-fs.mkdirSync(path.join(projectDir, "employees"), { recursive: true });
+fs.mkdirSync(projectDir, { recursive: true });
 
 const briefFile = path.join(outputsRoot, projectId, "brief.md");
 fs.mkdirSync(path.dirname(briefFile), { recursive: true });
@@ -91,12 +99,18 @@ fs.writeFileSync(briefFile, `# Brief
 ${brief}
 `);
 
+// The event carries the trace AND a bounded excerpt of the brief. Without the
+// trace it landed in buildRuns' "no-trace" bucket and the business's own run card
+// read "(no brief captured)"; with only `brief_chars` there was nothing to show
+// even once it arrived. `brief_chars` stays as the TRUE length beside the excerpt.
 const auditFile = path.join(projectDir, "audit.jsonl");
 const auditEntry = JSON.stringify({
   ts: submitted,
   event: "brief_received",
+  trace_id: projectId,
   project_id: projectId,
   business_slug: slug,
+  brief_excerpt: briefExcerpt(brief),
   brief_chars: brief.length,
 });
 fs.appendFileSync(auditFile, auditEntry + "\n");
@@ -169,16 +183,24 @@ if (manifestFile) {
 // so a run that finished — or died — reached nobody. Making it a side effect of
 // the prep step the agent must run anyway is what turns the guarantee from prose
 // into coverage. Fail-soft: openAgenticRun warns and returns null, never throws.
+//
+// Not under a scripted dispatch: `nrv dispatch --exec` spawns this script only to scaffold and
+// tracks the run in the ledger itself, which it states with NIRVANA_DISPATCH_TRACKS_RUN=1. The
+// agentic row would then be a second one that no process closes, escalated to a human as
+// stalled once its lease expired.
+const trackedByDispatch = process.env.NIRVANA_DISPATCH_TRACKS_RUN === "1";
 let runId: string | null = null;
-try {
-  const { openAgenticRun } = require(path.join(skillDir, "..", "harness", "lib", "run-ledger.ts"));
-  runId = openAgenticRun({
-    projectId, traceId: projectId, targetSlug: slug, targetKind: "business",
-    outputsRoot: projectDir, projectDir,
-    meta: { opened_by: "brief-business", brief_path: briefFile },
-  })?.runId ?? null;
-} catch (e: any) {
-  console.error(`[brief-business] WARN: run-ledger unavailable (${e.message}) — this dispatch will not be supervised`);
+if (!trackedByDispatch) {
+  try {
+    const { openAgenticRun } = require(path.join(skillDir, "..", "harness", "lib", "run-ledger.ts"));
+    runId = openAgenticRun({
+      projectId, traceId: projectId, targetSlug: slug, targetKind: "business",
+      outputsRoot: projectDir, projectDir,
+      meta: { opened_by: "brief-business", brief_path: briefFile },
+    })?.runId ?? null;
+  } catch (e: any) {
+    console.error(`[brief-business] WARN: run-ledger unavailable (${e.message}) — this dispatch will not be supervised`);
+  }
 }
 
 // Initial HANDOFF.json — minimum state to allow resume after /clear or crash.
@@ -212,6 +234,21 @@ if (!intake) {
   process.exit(EXIT.FAILURES);
 }
 
+// The org chart, named in the output the caller is already reading. Until
+// 2026-09-04 this block told the caller to "spawn employee '<intake>'" — one
+// seat — and a business with fourteen of them did exactly that, crediting six
+// in the deliverable with a single dispatch event behind them. An instruction
+// in SKILL.md only reaches a session that re-read it; this reaches the session
+// that ran the command.
+let seatSummary = "(no employees/ directory)";
+try {
+  const names = fs.readdirSync(path.join(target, "employees"))
+    .filter(f => f.endsWith(".md")).map(f => path.basename(f, ".md")).sort();
+  seatSummary = names.length
+    ? `${names.length} seat(s) — ${names.join(", ")}`
+    : "(no seats declared)";
+} catch { /* keep the fallback */ }
+
 console.log(`OK: brief registered.
 
   Project ID:    ${projectId}
@@ -220,11 +257,24 @@ console.log(`OK: brief registered.
   Project dir:   ${projectDir}
   Brief file:    ${briefFile}
   Audit log:     ${auditFile}
-  Run ID:        ${runId ?? "(not tracked — see the warning above)"}
+  Run ID:        ${runId ?? (trackedByDispatch ? "(tracked by the dispatch that spawned this step)" : "(not tracked — see the warning above)")}
 
-Next step (run by the skill via the Agent tool):
-  Spawn employee '${intake}' with the brief above as context. Wait for the handoff
-  artifact in ${projectDir}/handoffs/.
+Org chart:     ${seatSummary}
+
+Next step — a business runs its ORG CHART, not one agent:
+  nrv team plan --business ${slug} --brief ${briefFile} \\
+                --project ${projectDir} --outputs ${projectDir}/outputs \\
+                --project-id ${projectId} --save ${projectDir}/chain.json
+
+  Then, for each step it returns, in order:
+  nrv team step --plan ${projectDir}/chain.json --index <n>
+  → run the printed prompt in your own subagent, verbatim. Each step emits
+    dispatch_business with the seat on it, and injects that seat's mind-clone.
+
+  Spawning '${intake}' alone is correct ONLY when \`team plan\` returns a
+  one-step chain — and then it says why. Do not decide that yourself: a seat
+  credited in a deliverable with no dispatch_business behind it is the fiction
+  the audit exists to prevent.
 ${runId ? `
 REQUIRED when you finish (this is what tells the owner it is done):
   nrv run-track close ${runId} --state delivered|withheld|failed [--error "<reason>"]` : ""}`);

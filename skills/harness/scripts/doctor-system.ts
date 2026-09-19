@@ -26,9 +26,20 @@ import * as os from "node:os";
 import { execSync, spawnSync } from "node:child_process";
 import { paths as nrvPaths } from "../../_shared/lib/bun-helpers.ts";
 import { resolveScope, enumerate } from "../../_shared/lib/scope.ts";
-import { RUNTIME_TARGETS, RUNTIME_SKILL_DIRS, PROJECT_CONTRACT_FILES } from "../../_shared/lib/runtime-dirs.ts";
-import { scanLibrary, authorsPacks, STRIP_HINT } from "../../_shared/lib/watermark-scan.ts";
-import { listRuntimes } from "../../_shared/lib/host-agent-driver.ts";
+import { RUNTIME_TARGETS, RUNTIME_SKILL_DIRS, PROJECT_CONTRACT_FILES, RUNTIME_ENTRIES, SKILLS as SKILL_NAMES } from "../../_shared/lib/runtime-dirs.ts";
+import { classifyRuntimeEntry, foreignProvider } from "../../_shared/lib/runtime-install.ts";
+import { listRuntimes, whichSync } from "../../_shared/lib/host-agent-driver.ts";
+import { resolveRunRuntime } from "../lib/runtime-rules.ts";
+import { resolvePinnedEffort, resolveSystemModel } from "../../_shared/lib/system-model.ts";
+import { classifySkillsLitter } from "../lib/skills-litter.ts";
+import { openclawAgentsOnProjects } from "../../_shared/lib/openclaw.ts";
+import { detectOrca, orcaHooksStatus, orcaHostActive, orcaStatus, resolveOrcaExecutable } from "../../_shared/lib/orca.ts";
+import { codexConfigPath, codexHookTrustEntries, codexHooksPath } from "../../_shared/lib/codex-hooks.ts";
+import { expandEnv, findTempNrvEntries, readUserPath, tempRoots } from "../../_shared/lib/windows-user-path.ts";
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
+import {
+  describeSettingSource, discoverProjectRoot, engineConfigPath, globalConfigPath, projectConfigPath, resolveAllSettings, resolveSetting,
+} from "../../_shared/lib/settings.ts";
 
 const ANSI = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
@@ -59,11 +70,20 @@ const HOME = process.env.NIRVANA_HOME || os.homedir();
 const SKILLS = process.env.NIRVANA_SKILLS_DIR || (fs.existsSync(path.join(HOME, ".nirvana", "skills")) ? path.join(HOME, ".nirvana", "skills") : path.join(HOME, ".claude", "skills"));
 
 // SECTION 1: BINARIES
+//
+// `which` is not a Windows program — `where.exe` is, and Git for Windows keeps
+// its `which` in `\\Git\\usr\\bin`, which is not on the Windows PATH. So on a real
+// Windows desktop this probe returned null for everything: `bun` reported "not
+// found in PATH" while the doctor was running under Bun, `git` failed beside it,
+// all nine agent runtimes warned, and `runtimesOnPath === 0` produced the
+// critical "nothing can dispatch" verdict on a correct install. CI never caught
+// it because the Windows job runs under Git Bash, where `which` exists.
+//
+// `whichSync` is the resolver every other caller in the engine already uses:
+// `where` on win32, `command -v` elsewhere, plus a manual PATH scan that knows
+// about `.cmd` shims. The doctor was the one place that had its own copy.
 function which(bin: string): string | null {
-  try {
-    const r = spawnSync("which", [bin], { encoding: "utf8" });
-    return r.status === 0 ? r.stdout.trim() : null;
-  } catch { return null; }
+  try { return whichSync(bin); } catch { return null; }
 }
 
 const bins = [
@@ -122,21 +142,214 @@ add(
     : `no agent runtime on PATH — dispatch cannot run; install one (claude, codex, gemini, …)${headlessCI ? " (CI environment: reported as warning)" : ""}`,
 );
 
+// SECTION 1a-bis: WHICH ONE WILL RUN — the roster above says what EXISTS; this
+// says what a dispatch started right now would actually use. The rule is that
+// the work runs where the user is working, and it stopped being observable
+// exactly when it stopped being true: on a client machine the routing was
+// correct and one caller carried a vendor literal, so every business director
+// ran on a Claude Code session that user never opened. Nothing in the report
+// would have shown it.
+{
+  const choice = resolveRunRuntime({ projectRoot: process.cwd() });
+  const how = {
+    host: "the session you are in",
+    env: "execution.default_runtime",
+    "path-scan": "first installed (no session marker, no setting)",
+    fallback: "nothing installed",
+  }[choice.defaultFrom];
+  const green = choice.installed.length ? choice.installed.join(", ") : "none";
+  add(
+    "runtime: session",
+    choice.defaultFrom === "fallback" ? "WARN" : "PASS",
+    `dispatch defaults to ${choice.runtime} — ${how}. Green here: ${green}.`
+    + " Name another with --runtime, a USE_* rule or the brief; one that is not green is refused, never substituted.",
+  );
+}
+
+// SECTION 1a-quater: WHAT THE DISPATCH SPECIFIES — which should be nothing.
+// Owner doctrine: a dispatch names no model and no effort unless the user did,
+// so each CLI runs on what its own configuration says. Visible here because the
+// opposite failed silently: a vendor variable in the environment was being
+// turned into `--model opus` for all nine runtimes, including the ones that
+// have no such model.
+{
+  const pinnedModel = resolveSystemModel() ?? null;
+  const pinnedEffort = resolvePinnedEffort();
+  const parts: string[] = [];
+  parts.push(pinnedModel ? `model ${pinnedModel} (pinned in execution.model)` : "no model");
+  parts.push(pinnedEffort ? `effort ${pinnedEffort} (pinned in execution.effort)` : "no effort");
+  const pinned = pinnedModel || pinnedEffort;
+  add(
+    "runtime: model & effort",
+    "PASS",
+    `a dispatch specifies: ${parts.join(", ")}.`
+    + (pinned
+      ? " Clear the pin to let each CLI use its own default."
+      : " Each CLI uses what its own configuration says, which is the intended default.")
+    + " Effort reaches claude (--effort) and codex (model_reasoning_effort); no other runtime has the concept.",
+  );
+}
+
+// SECTION 1a-ter: CLAWS ON PROJECTS — OpenClaw works in an agent's workspace,
+// not in cwd, so the only way a Nirvana project meets an OpenClaw agent is to
+// BE that agent's workspace. This line says which agents are bound that way.
+// Informational: a machine with no binding is not degraded.
+if (which("openclaw")) {
+  const bound = openclawAgentsOnProjects();
+  add("openclaw: agents on projects", "PASS",
+    bound.length
+      ? bound.map((a) => `${a.id} → ${a.workspace!.replace(HOME, "~")}`).join(", ")
+      : "none bound — `openclaw agents add <name> --workspace <project> --non-interactive` makes a project the agent's home");
+}
+
+// SECTION 1a-orca: THE ORCA HOST — Orca is a host, not a runtime: it manages
+// workspaces and the terminals the agents run in. Inside one of its terminals
+// the engine projects every run onto the workspace card and runs headless
+// dispatches as worker terminals (ADR-009). Informational: a machine without
+// Orca is not degraded, and one with Orca closed is told how to open it.
+{
+  const exe = resolveOrcaExecutable();
+  if (which(exe)) {
+    const status = orcaStatus();
+    const here = detectOrca();
+    const session = here ? `; this terminal: ${here.worktreeId ? `worktree ${here.worktreeId.split("::").pop()}` : "an Orca pane"}` : "";
+    if (!status.running) {
+      add("orca: host", "PASS", `${exe} on PATH; app not running (start it with: ${exe} open)${session}`);
+    } else {
+      const hooks = orcaHooksStatus();
+      const hookText = hooks ? (hooks.installed.length ? `hooks on ${hooks.installed.join(", ")}` : "no agent hooks installed") : "hooks: unknown";
+      const orch = status.orchestration ? "orchestration available" : "orchestration not advertised (Settings → Experimental)";
+      const mode = orcaHostActive() ? "host active" : "host inactive here (auto = inside an Orca terminal)";
+      add("orca: host", "PASS", `app ${status.appVersion ?? "?"}; ${hookText}; ${orch}; ${mode}${session}`);
+    }
+  }
+}
+
+// SECTION 1a-quater: CODEX AUDIT HOOKS — present is not enough; Codex skips a
+// hook nobody trusted, silently, so `codex exec` would audit nothing while the
+// file looked wired. `nrv setup` writes both; this line checks both.
+if (which("codex")) {
+  const entries = codexHookTrustEntries(codexHooksPath(), codexConfigPath(), "audit-emit-from-hook.ts");
+  const untrusted = entries.filter((e) => !e.trusted);
+  if (entries.length === 0) add("codex: audit hooks", "WARN", `not wired in ${codexHooksPath().replace(HOME, "~")} — run: nrv setup`);
+  else if (untrusted.length) add("codex: audit hooks", "WARN", `${untrusted.length}/${entries.length} present but not trusted — a headless run skips them; run: nrv setup`);
+  else add("codex: audit hooks", "PASS", `${entries.length} hook(s) wired and trusted (PreToolUse/PostToolUse: Bash|apply_patch)`);
+}
+
+// SECTION 1a-bis-judge: GAUNTLET EVALUATOR — which evaluator a Gauntlet started
+// today would get, by the same selection the three canaries use
+// (lib/gauntlet/evaluator-selection.ts), without running anything. The
+// judgement is agentic by policy: an installed squad declaring
+// quality.specification_conformance, else the engine's judge-x on a runtime
+// that has a persona and is on PATH. The offline heuristic only by explicit
+// opt-in, and no agentic evaluator at all means the Gauntlet will not start.
+try {
+  const { CONFORMANCE_CAPABILITY, describeRanking, loadInstalledSquads, selectGauntletEvaluator } = await import("../lib/gauntlet/evaluator-selection.ts");
+  const { resolveJudgeXPromptPath } = await import("../lib/gauntlet/judge-x.ts");
+  const agentsDir = path.join(SKILLS, "_shared", "agents");
+  const judgeRuntimes = listRuntimes().filter((rt) => which(rt.cli) && resolveJudgeXPromptPath(rt.name, agentsDir)).map((rt) => rt.name);
+  const judge = judgeRuntimes.length
+    ? { available: true as const }
+    : { available: false as const, reason: runtimesOnPath > 0 ? `no judge-x persona in ${agentsDir.replace(HOME, "~")} for a runtime on PATH` : "no agent runtime on PATH" };
+  // The gauntlet.evaluator setting: the variable, else the project or global config.
+  const evaluatorSetting = resolveSetting("gauntlet.evaluator");
+  const envValue = evaluatorSetting.value || undefined;
+  const chosenBy = evaluatorSetting.source === "env"
+    ? `${evaluatorSetting.variable}=${evaluatorSetting.raw}`
+    : `gauntlet.evaluator=${evaluatorSetting.value} (${describeSettingSource(evaluatorSetting).replace(HOME, "~")})`;
+  // Any producer that is not a squad sees every installed squad as independent; the doctor asks as a business would.
+  const selection = selectGauntletEvaluator({ envValue, producer: { kind: "business", slug: "doctor" }, installed: loadInstalledSquads(), judge });
+  if (selection.kind === "heuristic") {
+    add("gauntlet: evaluator", "WARN", `offline heuristic by explicit opt-in (${chosenBy}) — rounds are scored by the quality gate, not judged; unset it to judge with ${judgeRuntimes.length ? "judge-x" : "an agentic evaluator"}`);
+  } else if (selection.kind === "unavailable") {
+    // A warning, not a failure: standard dispatches run without a judge; only a Gauntlet refuses to start.
+    add("gauntlet: evaluator", "WARN",
+      `none — a Gauntlet will not start (${selection.reason}); install a squad declaring ${CONFORMANCE_CAPABILITY} and run nrv index, or a runtime with a judge-x persona (nrv update refreshes the engine's personas)`);
+  } else if (selection.target.kind === "squad") {
+    // The registry rung ranks (Squad Protocol v6 §30) — print WHY this squad won, not just that it did.
+    const why = selection.source === "env" ? chosenBy
+      : selection.ranking ? `registry, declares ${CONFORMANCE_CAPABILITY}; ${describeRanking(selection.ranking)}`
+      : `registry, declares ${CONFORMANCE_CAPABILITY}`;
+    add("gauntlet: evaluator", "PASS", `squad:${selection.target.slug}:${selection.target.capabilityId} (${why})`);
+  } else {
+    add("gauntlet: evaluator", "PASS", `${selection.target.slug} (${selection.source === "env" ? chosenBy : "engine default: no installed squad declares " + CONFORMANCE_CAPABILITY}; runtimes with a persona on PATH: ${judgeRuntimes.join(", ")})`);
+  }
+} catch (e) {
+  add("gauntlet: evaluator", "WARN", `cannot be selected: ${(e as Error).message}`);
+}
+
 // SECTION 1a-ter: RUNTIME SKILL LINKAGE — a runtime on PATH whose skills dir
 // lacks the engine link is the "installed everything, typed a brief, nothing
 // dispatched" failure (owner report, 2026-08-21: OpenClaw fresh from npm has
 // no ~/.agents until first run; the old dir-exists proxy skipped the link in
 // silence). The installer now creates the dir; this check catches installs
 // done before the fix, or dirs removed since.
+// A runtime dir holds ONE engine entry, the `nirvana` door (harness, squads,
+// businesses and _shared are engine-internal and reached by absolute path). It
+// may come from another installer (skills.sh puts a real dir in ~/.agents/skills
+// and relative links elsewhere), which is fine and is named as such.
 for (const t of RUNTIME_TARGETS) {
   if (!which(t.bin)) continue; // runtime absent — nothing to link
-  const harnessLink = path.join(t.skillsDir, "harness");
-  if (fs.existsSync(harnessLink)) {
-    add(`skills link: ${t.name}`, "PASS", t.skillsDir);
-  } else {
-    add(`skills link: ${t.name}`, "WARN",
-      `'${t.bin}' on PATH but ${t.skillsDir} has no engine link — re-run: bun scripts/install.ts`);
+  for (const s of RUNTIME_ENTRIES) {
+    const label = s === RUNTIME_ENTRIES[0] ? `skills link: ${t.name}` : `skills link: ${t.name} (${s})`;
+    const link = path.join(t.skillsDir, s);
+    if (!fs.existsSync(link)) {
+      add(label, "WARN", `'${t.bin}' on PATH but ${t.skillsDir} has no ${s} entry — re-run: bun scripts/install.ts`);
+      continue;
+    }
+    add(label, "PASS", foreignProvider(link, s, SKILLS)
+      ? `${t.skillsDir} — '${s}' provided by another installer (skills.sh), kept`
+      : t.skillsDir);
   }
+}
+
+// SECTION 1a-quater: nrv ON PATH — the installer writes ~/.local/bin/nrv and
+// persists the PATH line for NEW shells only. The shell that ran the install
+// (an agent's Bash tool, typically) still cannot find `nrv`, and an agent
+// then declares the install broken thirty seconds after it succeeded.
+{
+  const localNrv = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "nrv.cmd" : "nrv");
+  const onPath = which("nrv");
+  if (onPath) {
+    add("env: nrv on PATH", "PASS", onPath);
+  } else if (fs.existsSync(localNrv)) {
+    add("env: nrv on PATH", "WARN",
+      `${localNrv} exists but 'nrv' is not on this shell's PATH — for this session: export PATH="$HOME/.local/bin:$PATH" (new shells already have it)`);
+  }
+}
+
+// SECTION 1a-sexies: DEPENDENCY HOME — everything the engine installs belongs
+// in ~/.nirvana, and until this check existed nothing noticed when it didn't.
+// Two failure modes, both silent: the shared store missing its own libraries
+// (bare `require('yaml')` then throws at runtime, in whichever script gets
+// there first), and dependency trees installed OUTSIDE the store, which is how
+// one squad activation cost 276 MB in ~/squads and another 276 MB in the pack
+// source. Cheap: a readdir on the store and a bounded walk of the content roots.
+try {
+  const DEPS = await import("../../_shared/lib/deps-home.ts");
+  const store = DEPS.depsStore();
+  if (!fs.existsSync(store)) {
+    add("deps: store", "FAIL", `${store} missing — run: bun scripts/install.ts`);
+  } else {
+    const core = ["yaml", "zod", "marked"].filter((m) => !fs.existsSync(path.join(store, m)));
+    if (core.length) {
+      add("deps: store", "FAIL", `${store} is missing ${core.join(", ")} — bare require() will throw at runtime; re-run: bun scripts/install.ts`);
+    } else {
+      add("deps: store", "PASS", `${store} (yaml, zod, marked resolve)`);
+    }
+  }
+
+  const strays = DEPS.findStrays(DEPS.defaultScanRoots());
+  if (strays.length === 0) {
+    add("deps: scatter", "PASS", "no dependency tree installed outside the store");
+  } else {
+    const total = strays.reduce((a, s) => a + s.bytes, 0);
+    const worst = strays.slice(0, 3).map((s) => `${s.dir.replace(HOME, "~")} (${DEPS.human(s.bytes)})`).join(", ");
+    add("deps: scatter", "WARN",
+      `${strays.length} tree(s) outside ${store.replace(HOME, "~")} · ${DEPS.human(total)} duplicated — ${worst}${strays.length > 3 ? ", …" : ""}; fold in with: nrv deps adopt --apply`);
+  }
+} catch (e) {
+  add("deps: store", "WARN", `could not be checked: ${(e as Error).message.slice(0, 80)}`);
 }
 
 // SECTION 1a-quinquies: SQUAD DEPENDENCIES — a squad that calls ffmpeg,
@@ -194,6 +407,47 @@ if (process.platform === "win32") {
           `literal 'nul' file in ${dir} — remove with: del "\\\\?\\${dir}\\nul"`);
       }
     } catch { /* unreadable dir — skip */ }
+  }
+}
+
+// SECTION 1a-quinquies-bis: STRAY LAUNCHD AGENTS (macOS) — this engine
+// registers nothing with launchd/systemd/schtasks on any platform: `nrv
+// supervisor install` was removed (see the top-of-file note in
+// supervisor.ts — "the session IS the supervisor"). A label still loaded
+// under launchctl, or a plist still sitting in ~/Library/LaunchAgents, is
+// residue from a previous engine version — possibly from a component that
+// no longer exists anywhere in this codebase. This only REPORTS: deleting
+// someone else's registration is worse than leaving it, so there is no
+// fixer here, automated or otherwise — verify each label by hand before
+// touching it.
+if (process.platform === "darwin") {
+  const NIRVANA_LABEL = /^(sh|com)\.nirvana\./;
+  let loaded: string[] = [];
+  try {
+    const r = spawnSync("launchctl", ["list"], { encoding: "utf8", timeout: 10_000 });
+    if (r.status === 0) {
+      loaded = (r.stdout || "").split("\n")
+        .map((l) => l.trim().split(/\s+/).pop() || "")
+        .filter((label) => NIRVANA_LABEL.test(label));
+    }
+  } catch { /* launchctl not on PATH — best-effort */ }
+
+  const agentsDir = path.join(HOME, "Library", "LaunchAgents");
+  let files: string[] = [];
+  try { files = fs.readdirSync(agentsDir).filter((f) => NIRVANA_LABEL.test(f)); } catch { /* dir absent — fine */ }
+
+  if (loaded.length === 0 && files.length === 0) {
+    add("launchd: stray agents", "PASS",
+      "no sh.nirvana.*/com.nirvana.* LaunchAgent loaded or on disk — this engine registers nothing with launchd");
+  } else {
+    const loadedNote = loaded.length ? `${loaded.length} loaded (${loaded.join(", ")})` : "none loaded";
+    const filesNote = files.length
+      ? `${files.length} file(s) in ~/Library/LaunchAgents (${files.slice(0, 6).join(", ")}${files.length > 6 ? ", …" : ""})`
+      : "none on disk";
+    add("launchd: stray agents", "WARN",
+      `${loadedNote}; ${filesNote} — residue from before this engine stopped registering with launchd. `
+      + "Verify each label first (it may not even be ours); remove by hand with: "
+      + "launchctl bootout gui/$(id -u)/<label>, then rm the plist.");
   }
 }
 
@@ -332,10 +586,36 @@ if (which("claude")) {
   }
 
   try { fs.rmSync(envTmp, { recursive: true, force: true }); } catch { /* tmp */ }
+
+  // user PATH (Windows): engines up to 0.8.0 persisted %USERPROFILE%\.local\bin
+  // to HKCU\Environment\Path even when USERPROFILE was a test's temporary HOME,
+  // and deleting that HOME never removed the entry (issue #87: 22 of them on
+  // one machine). The value is read as stored, so an unexpanded
+  // %LOCALAPPDATA%\Temp\nrv-* entry is found too. Only reported here;
+  // `nrv install --repair-path --apply` removes exactly these.
+  if (process.platform === "win32") {
+    const reg = readUserPath();
+    if (!reg) {
+      add("env: user PATH", "WARN", "could not read HKCU\\Environment\\Path (no such value, or PowerShell unavailable) — temporary nrv entries not checked");
+    } else {
+      const stale = findTempNrvEntries(reg.value, tempRoots());
+      if (stale.length === 0) {
+        add("env: user PATH", "PASS", "no temporary nrv entries in HKCU\\Environment\\Path");
+      } else {
+        const exists = (e: string) => fs.existsSync(expandEnv(e));
+        const missing = stale.filter((e) => !exists(e)).length;
+        const shown = stale.slice(0, 3).map((e) => `${e}${exists(e) ? "" : " (missing)"}`);
+        add("env: user PATH", "WARN",
+          `${stale.length} temporary nrv entr${stale.length === 1 ? "y" : "ies"} in HKCU\\Environment\\Path, ${missing} pointing at `
+          + `directories that no longer exist: ${shown.join("; ")}${stale.length > shown.length ? `; … ${stale.length - shown.length} more` : ""}`
+          + " — review with `nrv install --repair-path`, remove with `nrv install --repair-path --apply`");
+      }
+    }
+  }
 }
 
 // SECTION 2: SKILLS
-const requiredSkills = ["harness", "businesses", "squads", "_shared"];
+const requiredSkills = ["harness", "businesses", "squads", "_shared", "nirvana"];
 for (const s of requiredSkills) {
   const p = path.join(SKILLS, s);
   if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
@@ -361,8 +641,15 @@ if (fs.existsSync(agentsSkillsDir)) {
   });
   const doubled = new Map<string, string[]>();
   for (const s of requiredSkills) {
+    // Our own per-skill link into ~/.agents/skills (OpenClaw is a wired runtime)
+    // and the skills.sh layout (canonical dir there, relative links elsewhere)
+    // both reach one file through two names by design. The conflict this check
+    // was built for is the whole directory symlinked to another runtime's tree
+    // (runtime-dirs.ts), which leaves entries that are neither.
+    const entry = path.join(agentsSkillsDir, s);
+    if (classifyRuntimeEntry(entry, [SKILLS]) === "ours" || foreignProvider(entry, s, SKILLS)) continue;
     let target = "";
-    try { target = fs.realpathSync(path.join(agentsSkillsDir, s)); } catch { continue; }
+    try { target = fs.realpathSync(entry); } catch { continue; }
     const also = otherDirs.filter(d => {
       try { return fs.realpathSync(path.join(d, s)) === target; } catch { return false; }
     });
@@ -377,33 +664,57 @@ if (fs.existsSync(agentsSkillsDir)) {
   }
 }
 
-// Backup litter. Two shapes, two harms. A *.bak / *backup* entry INSIDE a
-// runtime skills dir gets scanned like a skill, so a stale pre-migration copy
-// loads next to the real one (seen live: squads.pre-nirvana.*.bak under
+// Dependencies inside a skills root. Codex's skill scanner follows symlinks,
+// prunes only hidden directories and stops after 20,000 entries per root — a
+// `node_modules` link inside a skill (what installs before 0.13.2 wrote) sends
+// it through the whole dependency store on every run, with a "traversal limit"
+// error and shortened skill descriptions as the visible symptoms. The installer
+// now links deps BESIDE each skills dir; this catches the old layout and any
+// tree a hand install left behind.
+{
+  const inside: string[] = [];
+  // A runtime root is scanned as a whole, so nothing may sit at its top level
+  // either. The canonical tree is reached only through per-skill links, so its
+  // own root-level link (~/.nirvana/skills/node_modules) is the intended home.
+  const candidates = [
+    ...RUNTIME_SKILL_DIRS.flatMap(root => [path.join(root, "node_modules"), ...SKILL_NAMES.map(s => path.join(root, s, "node_modules"))]),
+    ...SKILL_NAMES.map(s => path.join(SKILLS, s, "node_modules")),
+  ];
+  for (const c of candidates) {
+    try { fs.lstatSync(c); inside.push(c.replace(HOME, "~")); } catch { /* absent — the goal */ }
+  }
+  if (inside.length) {
+    add("skills: deps inside a skills root", "WARN",
+      `${inside.length} node_modules under a skills directory (${inside.slice(0, 4).join(", ")}${inside.length > 4 ? ", …" : ""}) — Codex's skill scanner walks into it and hits its entry limit. \`nrv update\` rewrites the layout; a real directory (not a link) is yours to remove.`);
+  } else {
+    add("skills: deps inside a skills root", "PASS", "no node_modules under any skills directory");
+  }
+}
+
+// Backup litter. Two shapes, two harms. A conventional copy INSIDE a runtime
+// skills dir gets scanned like a skill, so a stale pre-migration copy loads
+// next to the real one (seen live: squads.pre-nirvana.*.bak under
 // ~/.antigravity/skills). And skills-backup-* piling up beside ~/.nirvana/skills
 // are full copies of the tree nothing will ever read — `nrv update` keeps
 // exactly one (the latest) and prunes the rest, so more than one here means
 // that prune is not running.
 {
-  const litter: string[] = [];
-  for (const d of RUNTIME_SKILL_DIRS) {
-    try {
-      for (const entry of fs.readdirSync(d)) {
-        if (/\.bak$|\.old$|backup/i.test(entry)) litter.push(path.join(d, entry).replace(HOME, "~"));
-      }
-    } catch { /* dir absent — fine */ }
-  }
+  // Two claims with two confidences; classifySkillsLitter carries the reasoning
+  // and the case that forced it (issue #251).
+  const { copies, unsure } = classifySkillsLitter(RUNTIME_SKILL_DIRS, HOME);
+  const litter = copies;
   let staleBackups: string[] = [];
   try {
     staleBackups = fs.readdirSync(path.dirname(SKILLS))
       .filter((e) => e.startsWith("skills-backup-")).sort();
   } catch { /* parent unreadable — fine */ }
   const extra = staleBackups.length > 1 ? staleBackups.slice(0, -1) : [];
-  if (litter.length || extra.length) {
+  if (litter.length || extra.length || unsure.length) {
     const parts: string[] = [];
-    if (litter.length) parts.push(`${litter.length} stale entr${litter.length === 1 ? "y" : "ies"} inside skills dirs (${litter.join(", ")}) — loaded as if they were skills`);
-    if (extra.length) parts.push(`${extra.length} old skills-backup-* beside ~/.nirvana/skills — nrv update keeps only the latest`);
-    add("skills: backup litter", "WARN", parts.join("; ") + ". Safe to delete.");
+    if (litter.length) parts.push(`${litter.length} stale cop${litter.length === 1 ? "y" : "ies"} inside skills dirs (${litter.join(", ")}) — loaded as if they were skills. Safe to delete`);
+    if (extra.length) parts.push(`${extra.length} old skills-backup-* beside ~/.nirvana/skills — nrv update keeps only the latest. Safe to delete`);
+    if (unsure.length) parts.push(`${unsure.length} director${unsure.length === 1 ? "y" : "ies"} named like a backup with no SKILL.md (${unsure.join(", ")}) — the runtime scans them as skills and they are not. Check before removing`);
+    add("skills: backup litter", "WARN", parts.join("; ") + ".");
   } else {
     add("skills: backup litter", "PASS", "no *.bak inside skills dirs, at most one skills-backup");
   }
@@ -465,6 +776,36 @@ for (const [reg, label] of [[squadsReg, "squads"], [bizReg, "businesses"], [clon
   } else {
     add(`registry: ${label}`, "FAIL", "missing — run `nrv index`");
   }
+}
+
+// SECTION 3b: WHAT INSTALLED SQUADS DECLARE OF THE HOST — credentials and MCP
+// servers live in dependencies.yaml and belong to the runtime and the operator,
+// not to the engine. The check used to run only inside `nrv activate`; here it
+// runs over every installed squad, as warnings with the names to set or the
+// server to configure. Never a failure: a squad without its key runs degraded.
+try {
+  const { squadPreflight } = await import("../../_shared/lib/squad-preflight.ts");
+  const reg = fs.existsSync(squadsReg) ? JSON.parse(fs.readFileSync(squadsReg, "utf8")) : null;
+  const entries: Array<[string, any]> = reg?.squads ? Object.entries(reg.squads) : [];
+  let declared = 0, credWarn = 0, mcpWarn = 0, mcpDeclared = 0;
+  const lines: Array<[string, string]> = [];
+  for (const [slug, e] of entries) {
+    const dir = typeof e?.manifest_path === "string" ? path.dirname(e.manifest_path) : (typeof e?.dir === "string" ? e.dir : null);
+    if (!dir) continue;
+    const pre = squadPreflight(dir);
+    if (!pre.declared) continue;
+    declared++;
+    mcpDeclared += pre.mcps.length;
+    if (pre.missingRequired.length) { credWarn++; lines.push([`credentials: ${slug}`, `required and not set: ${pre.missingRequired.map((v) => v.name).join(", ")}`]); }
+    for (const m of pre.mcpsNotConfigured) { mcpWarn++; lines.push([`mcp: ${slug}`, `declares '${m.name}'${m.purpose ? ` (${m.purpose})` : ""}; no host config names it — configure it in the runtime that runs the squad (~/.claude.json, ~/.codex/config.toml, ~/.gemini/settings.json or .mcp.json)`]); }
+  }
+  const CAP = 20;
+  for (const [name, note] of lines.slice(0, CAP)) add(name, "WARN", note);
+  if (lines.length > CAP) add("squads: host declarations", "WARN", `${lines.length - CAP} more squad(s) with missing credentials or MCP servers — run \`nrv activate <slug> --dry-run\` per squad`);
+  if (credWarn === 0) add("credentials: required env vars", "PASS", `${declared} squad(s) declare host dependencies; every required variable is set`);
+  if (mcpDeclared > 0 && mcpWarn === 0) add("mcp: declared servers", "PASS", `${mcpDeclared} declared MCP server(s), all named in a host configuration`);
+} catch (e: any) {
+  add("squads: host declarations", "WARN", `could not read dependencies: ${e.message}`);
 }
 
 // SECTION 4: HOOKS
@@ -538,7 +879,7 @@ if (todayLines.length) {
   // report must not smooth over data it could not read.
   let unreadable = 0;
   for (const l of todayLines) {
-    try { const e = JSON.parse(l); counts[e.event] = (counts[e.event] || 0) + 1; }
+    try { const e = parseAuditLine(l); counts[e.event] = (counts[e.event] || 0) + 1; }
     catch { unreadable++; }
   }
   const summary = Object.entries(counts).map(([k, v]) => `${k}:${v}`).slice(0, 6).join(" ");
@@ -581,6 +922,66 @@ if (fs.existsSync(dnaLib)) {
   add("library: mind-clones", "PASS", `${cloneCount} clones in _library/dna/`);
 } else {
   add("library: mind-clones", "WARN", "no mind-clone library — run with --starter");
+}
+
+// SECTION 6.2: PROTOCOL
+//
+// What the library DECLARES, counted, so a rollout is visible before it is
+// enforced: how many squads are still on v5 while the engine reads v6, and how
+// many businesses still carry fields v2 retired. Never a FAIL — this is a
+// migration dashboard, and CI treats a doctor exit >= 2 as a broken machine.
+// Blocking is `nrv validate`'s job, behind its own flags.
+{
+  const RETIRED_SEAT_FIELDS = /^(heartbeat|self_score_contract|draws_from|dna_reference|budget_monthly_usd|mentions|escalation_triggers|disclosure_template|default_tools|project_tool_overrides):/m;
+  const declared = (file: string): string | null => {
+    // The whole manifest: five library squads declare `protocol:` after a
+    // 4 KB description, and a window that short counted them as unset.
+    try { return /^protocol:\s*["']?([\d.]+)/m.exec(fs.readFileSync(file, "utf8"))?.[1] ?? null; }
+    catch { return null; }
+  };
+  const dirsOf = (root: string): string[] => {
+    try { return fs.readdirSync(root).filter((d) => !d.startsWith("_") && !d.startsWith(".")); } catch { return []; }
+  };
+
+  if (fs.existsSync(homeSquads)) {
+    const byProtocol = new Map<string, number>();
+    for (const slug of dirsOf(homeSquads)) {
+      const manifest = path.join(homeSquads, slug, "squad.yaml");
+      if (!fs.existsSync(manifest)) continue;
+      const v = declared(manifest) ?? "unset";
+      byProtocol.set(v, (byProtocol.get(v) ?? 0) + 1);
+    }
+    const total = [...byProtocol.values()].reduce((a, b) => a + b, 0);
+    const spread = [...byProtocol.entries()].sort((a, b) => b[1] - a[1]).map(([v, n]) => `${n}×${v}`).join(" · ");
+    const belowSix = total - (byProtocol.get("6.0") ?? 0);
+    add("protocol: squads", belowSix > 0 ? "WARN" : "PASS",
+      belowSix > 0
+        ? `${spread} — ${belowSix} below 6.0; migrate one with \`nrv migrate <slug> --to 6\``
+        : `${total} squads, all on 6.0`);
+  }
+
+  if (fs.existsSync(homeBiz)) {
+    let v1 = 0, withRetired = 0, total = 0;
+    for (const slug of dirsOf(homeBiz)) {
+      const manifest = path.join(homeBiz, slug, "business.yaml");
+      if (!fs.existsSync(manifest)) continue;
+      total++;
+      if ((declared(manifest) ?? "1.0") !== "2.0") v1++;
+      const empDir = path.join(homeBiz, slug, "employees");
+      let hit = false;
+      try {
+        for (const f of fs.readdirSync(empDir)) {
+          if (!f.endsWith(".md")) continue;
+          if (RETIRED_SEAT_FIELDS.test(fs.readFileSync(path.join(empDir, f), "utf8").slice(0, 4096))) { hit = true; break; }
+        }
+      } catch { /* no employees/ is a different check's problem */ }
+      if (hit) withRetired++;
+    }
+    add("protocol: businesses", v1 > 0 || withRetired > 0 ? "WARN" : "PASS",
+      v1 > 0 || withRetired > 0
+        ? `${v1} of ${total} still on protocol 1.0 · ${withRetired} carry fields v2 retired — \`nrv validate business <slug> --fix\``
+        : `${total} businesses on protocol 2.0, no retired fields`);
+  }
 }
 
 // SECTION 6.5: PAID INSTALL
@@ -670,6 +1071,54 @@ try {
   add("routing: aliases", "WARN", `cannot read alias groups: ${(e as Error).message}`);
 }
 
+// Invocation keys nothing reads. `triggers:` and `trigger_threshold:` name a
+// command (`*full-tutoring`, `*wiki`) and how many must match before a workflow
+// fires — a convention from before the agentic router, and one NO version of
+// the protocol ever defined: v4 does not, v5 mentions it zero times, and v6
+// mentions it once, in the line that preserves it verbatim in `extensions`.
+// No code reads either key. Routing is decided by produces, keywords and
+// example_briefs, weighed by a maestro comparing candidates.
+//
+// So this reports and stops. There is no fixer, and there will not be one:
+// those commands are text the author wrote, the normalizer keeps them on
+// purpose, and deleting an author's content to clear a diagnostic line is the
+// opposite of what the fixers do. The goal is for dead surface to stop being
+// INVISIBLE, not to stop existing. WARN, never FAIL — same contract as the
+// Protocol section above.
+if (fs.existsSync(homeSquads)) {
+  try {
+    const { readSquadWorkflows } = await import("../../squads/lib/workflow-reader.ts");
+    const VESTIGIAL = ["triggers", "trigger_threshold"] as const;
+    const perKey = new Map<string, number>(VESTIGIAL.map((k) => [k, 0]));
+    let files = 0, squads = 0, workflows = 0;
+    for (const slug of fs.readdirSync(homeSquads)) {
+      if (slug.startsWith(".")) continue;
+      let hit = false;
+      for (const w of readSquadWorkflows(path.join(homeSquads, slug))) {
+        if (!w.normalized) continue;
+        workflows++;
+        const ext = w.normalized.canonical.extensions;
+        const found = VESTIGIAL.filter((k) => ext[k] !== undefined);
+        if (!found.length) continue;
+        files++; hit = true;
+        for (const k of found) perKey.set(k, (perKey.get(k) ?? 0) + 1);
+      }
+      if (hit) squads++;
+    }
+    const spread = VESTIGIAL.filter((k) => (perKey.get(k) ?? 0) > 0).map((k) => `${perKey.get(k)}× \`${k}\``).join(" · ");
+    if (files === 0) {
+      add("routing: vestigial triggers", "PASS", `${workflows} workflow(s) read, none declares an invocation key the router ignores`);
+    } else {
+      add("routing: vestigial triggers", "WARN",
+        `${files} of ${workflows} workflow(s) in ${squads} squad(s) declare ${spread} — decorative. `
+        + `No protocol version defines those keys and no code reads them; routing goes by produces, keywords and example_briefs. `
+        + `They are preserved verbatim in \`extensions\` and no fixer removes them: this line exists so the dead surface is visible, not so it gets deleted.`);
+    }
+  } catch (e) {
+    add("routing: vestigial triggers", "WARN", `could not read the workflow library: ${(e as Error).message}`);
+  }
+}
+
 // Corpus language, because it decides how good `fast` mode can be.
 //
 // The agentic router (the default) reads the digest and reasons, so it routes a
@@ -698,32 +1147,6 @@ try {
   add("corpus: language", "WARN", `could not weigh the corpus: ${(e as Error).message}`);
 }
 
-// Per-buyer watermarks in a library that AUTHORS packs. Rationale and mechanics
-// live in _shared/lib/watermark-scan.ts, shared with the end of `nrv update` — the
-// command that introduces them.
-{
-  const isAuthor = authorsPacks(HOME);
-  const libs = [nrvPaths.SQUADS_DIR, nrvPaths.BUSINESSES_DIR].filter(d => fs.existsSync(d));
-  let hits = 0, scanned = 0;
-  const dirty: string[] = [];
-  for (const lib of libs) {
-    const r = scanLibrary(lib);
-    hits += r.hits.length; scanned += r.scanned;
-    if (r.hits.length) dirty.push(`${lib.replace(HOME, "~")} (${r.hits.length})`);
-  }
-  if (!libs.length) {
-    add("library: watermarks", "PASS", "no content library on this machine");
-  } else if (!hits) {
-    add("library: watermarks", "PASS", `clean — ${scanned} files checked in ${libs.length} librar${libs.length > 1 ? "ies" : "y"}`);
-  } else if (isAuthor) {
-    add("library: watermarks", "FAIL",
-      `${hits} per-buyer marker(s) in ${dirty.join(", ")} — this machine authors packs, so they would ship and misattribute every buyer's copy. ${STRIP_HINT}`);
-  } else {
-    add("library: watermarks", "WARN",
-      `${hits} per-buyer marker(s) in ${dirty.join(", ")} — normal for installed paid content; only a problem if this machine builds packs`);
-  }
-}
-
 // SECTION 7: RECENT DISPATCHES
 // Count dispatched projects by REAL marker (business OR squad OR HANDOFF/brief),
 // not just `businesses/` — previously a squad dispatch (the starter pack is
@@ -744,6 +1167,29 @@ const keyFiles: [string, string][] = [
 ];
 for (const [file, label] of keyFiles) {
   add(`patch: ${label}`, fs.existsSync(file) ? "PASS" : "FAIL", fs.existsSync(file) ? "applied" : `missing ${file}`);
+}
+
+// SECTION 9: CONFIG — the effective value and origin of every operational
+// setting (_shared/lib/settings-schema.ts), by the same resolution every reader
+// uses (env > project > global > engine default > default): one line per key,
+// no secrets (the schema holds none). A config file the resolver cannot read is
+// a FAIL here, because every reader refuses it the same way.
+try {
+  const projectRoot = discoverProjectRoot();
+  const files: Array<[string, string | null]> = [
+    ["project", projectRoot ? projectConfigPath(projectRoot) : null],
+    ["global", globalConfigPath()],
+    ["engine", engineConfigPath()],
+  ];
+  const settings = resolveAllSettings(); // refuses a broken file before any line is added
+  add("config: files", "PASS", files
+    .map(([label, file]) => `${label} ${file ? `${file.replace(HOME, "~")}${fs.existsSync(file) ? "" : " (absent)"}` : "(none)"}`)
+    .join(" · "));
+  for (const setting of settings) {
+    add(`config: ${setting.key}`, "PASS", `${JSON.stringify(setting.value)} (${describeSettingSource(setting).replace(HOME, "~")})`);
+  }
+} catch (e) {
+  add("config: files", "FAIL", `${(e as Error).message} — fix the file; every reader refuses it the same way (nrv config list shows the same error)`);
 }
 
 // OUTPUT

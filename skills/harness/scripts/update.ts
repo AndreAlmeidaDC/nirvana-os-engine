@@ -26,8 +26,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
-import { scanLibrary, authorsPacks, STRIP_HINT } from "../../_shared/lib/watermark-scan.ts";
-import { paths as nrvPaths } from "../../_shared/lib/bun-helpers.ts";
+import { ensureDir } from "../../_shared/lib/ensure-dir.ts";
 
 const ANSI = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
@@ -40,6 +39,24 @@ function c(color: keyof typeof ANSI, s: string): string {
 }
 
 const args = process.argv.slice(2);
+// Asking for help is not asking for an update. `nrv update --help` used to fall
+// through to the default path and re-apply the engine (with a fresh backup
+// directory each time); an unknown flag did the same. Both stop here.
+const USAGE = [
+  "nrv update [<pack-slug>] [--check] [--force] [--branch=<name>] [--skip-pull]",
+  "  (no flag)        pull the engine repo and re-apply skills, with a backup of ~/.nirvana/skills",
+  "  <pack-slug>      update an installed pack instead (nrv update genesis-circle)",
+  "  --check          show local vs remote without changing anything",
+  "  --force          discard local changes in the engine repo before pulling",
+  "  --branch=<name>  pull a branch other than main",
+  "  --skip-pull      re-apply skills without pulling",
+].join("\n");
+if (args.includes("--help") || args.includes("-h")) { console.log(USAGE); process.exit(0); }
+{
+  const known = new Set(["--check", "--force", "--skip-pull", "--no-color"]);
+  const unknown = args.find((a) => a.startsWith("-") && !known.has(a) && !a.startsWith("--branch="));
+  if (unknown) { console.error(`nrv update: unknown flag ${unknown}\n${USAGE}`); process.exit(2); }
+}
 const checkOnly = args.includes("--check");
 const force = args.includes("--force");
 const skipPull = args.includes("--skip-pull");
@@ -63,32 +80,6 @@ const ENGINE_URL = process.env.NIRVANA_ENGINE_URL
   || `https://github.com/${ENGINE_REPO}/releases/latest/download/nirvana-os-engine.tar.gz`;
 const ENGINE_TARBALL = (process.env.NIRVANA_ENGINE_TARBALL || "").replace(/^file:\/\//, "");
 
-/**
- * An update pulls per-buyer content into ~/squads and ~/businesses. On a buyer's
- * machine that is exactly right. On a machine that AUTHORS packs it is contamination:
- * those directories are what packs are built from, and a marker that ships makes every
- * buyer's leak attribute to the author.
- *
- * Reported HERE, seconds after it lands, because the alternative already happened —
- * it sat unnoticed for a day and was found by accident during unrelated work.
- */
-function warnIfLibrariesWatermarked(): void {
-  try {
-    if (!authorsPacks(HOME)) return;   // a buyer's library is supposed to carry tags
-    const dirty: string[] = [];
-    let total = 0;
-    for (const lib of [nrvPaths.SQUADS_DIR, nrvPaths.BUSINESSES_DIR]) {
-      const r = scanLibrary(lib);
-      if (r.hits.length) { dirty.push(`${lib.replace(HOME, "~")} (${r.hits.length})`); total += r.hits.length; }
-    }
-    if (!total) return;
-    console.log("");
-    console.log(c("red", `⚠ ${total} per-buyer watermark(s) landed in your content library: ${dirty.join(", ")}`));
-    console.log(c("dim", "  This machine authors packs. Strip before building anything, or the markers ship:"));
-    console.log("  " + c("yellow", STRIP_HINT));
-  } catch { /* never let a diagnostic fail an update */ }
-}
-
 // Installed paid packs: after updating the engine (or on --check), run each
 // pack's --check with PROVENANCE — the buyer sees engine AND pack in a single
 // `nrv update`. Best-effort: network down or no PROVENANCE never breaks the update.
@@ -103,6 +94,61 @@ function checkInstalledPacks(): void {
     console.log(c("lime", "▶") + c("bold", ` Pack installed ('${slug}') — checking for an update...`));
     spawnSync(process.execPath, [script, slug, "--check"], { stdio: "inherit" });
   } catch { /* no PROVENANCE = no paid pack; stay silent */ }
+}
+
+/** Copy the deployed skills tree aside before anything overwrites it, and
+ *  answer where it went. Shared by BOTH update paths: the header of this file
+ *  presents the backup as unconditional, and on a release install — the path
+ *  every buyer who did not clone the repo takes — it never ran, so the rollback
+ *  command printed at the end named a directory that was never created
+ *  (issue #253). */
+function backupSkills(): string | null {
+  console.log("");
+  console.log(c("lime", "▶") + c("bold", ` Backing up ${SKILLS_ROOT}/...`));
+  if (!fs.existsSync(SKILLS_ROOT)) {
+    console.log(c("yellow", "  no existing skills/ to backup (fresh install)"));
+    return null;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const dir = path.join(path.dirname(SKILLS_ROOT), `skills-backup-${stamp}`);
+  fs.cpSync(SKILLS_ROOT, dir, { recursive: true });
+  console.log(c("dim", `  → ${dir}`));
+  return dir;
+}
+
+/** Keep only the copy this run made. Runs only after a SUCCESSFUL install, so a
+ *  failed update never deletes the copies that could still save it. */
+function pruneOldBackups(keepDir: string | null): void {
+  try {
+    const parent = path.dirname(SKILLS_ROOT);
+    const keep = keepDir ? path.basename(keepDir) : null;
+    for (const entry of fs.readdirSync(parent)) {
+      if (!entry.startsWith("skills-backup-") || entry === keep) continue;
+      fs.rmSync(path.join(parent, entry), { recursive: true, force: true });
+      console.log(c("dim", `  pruned old backup: ${entry}`));
+    }
+  } catch { /* hygiene, never fatal */ }
+}
+
+/** The `nirvana_updated` record. Never appeared on a release install, so those
+ *  machines had no trace of when the engine changed. `ensureDir` rather than a
+ *  bare mkdir: recursive mkdir can throw EEXIST under Bun on Windows, which is
+ *  how audit events were being dropped elsewhere. */
+function emitUpdated(fields: Record<string, unknown>): void {
+  try {
+    const auditDir = path.join(HOME, ".harness-logs", new Date().toISOString().slice(0, 10));
+    ensureDir(auditDir);
+    fs.appendFileSync(path.join(auditDir, "audit.jsonl"),
+      JSON.stringify({ ts: new Date().toISOString(), event: "nirvana_updated", ...fields }) + "\n");
+  } catch { /* the update succeeded; the record is best-effort */ }
+}
+
+/** What to run if the update made things worse. Printed by both paths. */
+function rollbackHint(backupDir: string | null): void {
+  if (!backupDir) return;
+  console.log(c("dim", "If something broke, the owner can roll back with (do not run unasked):"));
+  console.log("  " + c("yellow", `rm -rf ${SKILLS_ROOT} && mv ${backupDir} ${SKILLS_ROOT}`));
+  console.log("");
 }
 
 async function updateFromRelease(): Promise<never> {
@@ -151,10 +197,28 @@ async function updateFromRelease(): Promise<never> {
   }
   const installer = path.join(root, "scripts", "install.ts");
   if (!fs.existsSync(installer)) { console.error(c("red", "invalid engine asset: scripts/install.ts not found.")); process.exit(1); }
+  // The installer writes over ~/.nirvana/skills in place, exactly as the git
+  // path does, so it needs the copy just as much.
+  const backupDir = backupSkills();
   console.log(c("lime", "▶") + c("bold", " Re-running installer (engine only)..."));
   const r = spawnSync(process.execPath, [installer, "--no-starter"], { stdio: "inherit" });
-  if ((r.status ?? 1) === 0) checkInstalledPacks();
+  const ok = (r.status ?? 1) === 0;
+  if (ok) {
+    pruneOldBackups(backupDir);
+    emitUpdated({ path: "release", source: ENGINE_TARBALL || ENGINE_URL, to_version: releaseVersion(root), backup: backupDir });
+    checkInstalledPacks();
+  } else {
+    console.error(c("red", "✗ installer failed (exit code " + r.status + ")"));
+  }
+  console.log("");
+  rollbackHint(backupDir);
   process.exit(r.status ?? 1);
+}
+
+/** The version the downloaded asset carries, for the audit record. */
+function releaseVersion(root: string): string | null {
+  try { return fs.readFileSync(path.join(root, "skills", "VERSION"), "utf8").trim() || null; }
+  catch { return null; }
 }
 
 const isGitCheckout = fs.existsSync(REPO) && fs.existsSync(path.join(REPO, ".git"));
@@ -268,17 +332,8 @@ if (!skipPull) {
 }
 
 // Step 3: backup current deployment
-console.log("");
 const skillsDir = SKILLS_ROOT;
-console.log(c("lime", "▶") + c("bold", ` Backing up ${skillsDir}/...`));
-const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-const backupDir = path.join(path.dirname(skillsDir), `skills-backup-${ts}`);
-if (fs.existsSync(skillsDir)) {
-  fs.cpSync(skillsDir, backupDir, { recursive: true });
-  console.log(c("dim", `  → ${backupDir}`));
-} else {
-  console.log(c("yellow", "  no existing skills/ to backup (fresh install)"));
-}
+const backupDir = backupSkills();
 
 // Step 4: re-run installer
 console.log("");
@@ -297,8 +352,10 @@ const installer = spawnSync("bun", [INSTALL_SCRIPT, "--no-starter"], {
 if (installer.status !== 0) {
   console.error(c("red", "✗ installer failed (exit code " + installer.status + ")"));
   console.error("");
-  console.error(c("yellow", "Rollback your skills/:"));
-  console.error(`  rm -rf ${skillsDir} && cp -r ${backupDir} ${skillsDir}`);
+  if (backupDir) {
+    console.error(c("yellow", "Rollback your skills/:"));
+    console.error(`  rm -rf ${skillsDir} && cp -r ${backupDir} ${skillsDir}`);
+  }
   process.exit(1);
 }
 
@@ -308,15 +365,7 @@ if (installer.status !== 0) {
 // nothing would ever read again. One backup is a rollback path; eleven are
 // litter. Pruning runs only AFTER the installer succeeded, so a failed update
 // never deletes the copies that could still save it.
-try {
-  const parent = path.dirname(skillsDir);
-  const keep = path.basename(backupDir);
-  for (const entry of fs.readdirSync(parent)) {
-    if (!entry.startsWith("skills-backup-") || entry === keep) continue;
-    fs.rmSync(path.join(parent, entry), { recursive: true, force: true });
-    console.log(c("dim", `  pruned old backup: ${entry}`));
-  }
-} catch { /* hygiene, never fatal */ }
+pruneOldBackups(backupDir);
 
 // Step 5: re-index registries
 console.log("");
@@ -327,21 +376,15 @@ if (index.status !== 0) {
 }
 
 // Step 6: emit audit event
-try {
-  const today = new Date().toISOString().slice(0, 10);
-  const auditDir = path.join(HOME, ".harness-logs", today);
-  fs.mkdirSync(auditDir, { recursive: true });
-  fs.appendFileSync(path.join(auditDir, "audit.jsonl"), JSON.stringify({
-    ts: new Date().toISOString(),
-    event: "nirvana_updated",
-    from_head: currentHead,
-    to_head: git("rev-parse", "--short", "HEAD").stdout,
-    branch,
-    force,
-    skip_pull: skipPull,
-    backup: backupDir,
-  }) + "\n");
-} catch {}
+emitUpdated({
+  path: "git",
+  from_head: currentHead,
+  to_head: git("rev-parse", "--short", "HEAD").stdout,
+  branch,
+  force,
+  skip_pull: skipPull,
+  backup: backupDir,
+});
 
 // Step 7: final report
 console.log("");
@@ -352,10 +395,7 @@ console.log("  " + c("yellow", "nrv doctor") + c("dim", "         # verify every
 console.log("  " + c("yellow", "nrv tui") + c("dim", "            # live cockpit"));
 console.log("");
 checkInstalledPacks();
-warnIfLibrariesWatermarked();
 console.log("");
-console.log(c("dim", "If something broke, the owner can roll back with (do not run unasked):"));
-console.log("  " + c("yellow", `rm -rf ${skillsDir} && mv ${backupDir} ${skillsDir}`));
-console.log("");
+rollbackHint(backupDir);
 
 process.exit(0);

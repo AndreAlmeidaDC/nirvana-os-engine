@@ -127,6 +127,23 @@ describe("the gate runs and reports", () => {
     expect(d.entries).toBe(2);
     expect(d.dead).toBe(1);
   }, 60_000);
+
+  test("a fence that fires on its own capability's brief is counted as self-firing, and only counted", () => {
+    // The opposite defect to a dead fence: this one vetoes the squad on the
+    // brief it should win. Information only — the exit code does not move.
+    const r = run(["--json", "--registry", fixture({
+      "a.b.c": [{ squad: "s", not_for: ["seo audit", "live streaming"], example_briefs: ["run an seo audit for my site"] }],
+      "d.e.f": [{ squad: "t", not_for: ["seo audit"], example_briefs: ["stream my launch live"] }],
+    })]);
+    const d = JSON.parse(r.out);
+    expect(d.self_fire).toBe(1);
+    expect(r.code).toBe(0);
+    const one = run(["s", "--registry", fixture({
+      "a.b.c": [{ squad: "s", not_for: ["seo audit"], example_briefs: ["run an seo audit for my site"] }],
+    })]);
+    expect(one.code).toBe(0);
+    expect(one.out).toMatch(/1\/1 self-firing/);
+  }, 60_000);
 });
 
 /**
@@ -215,6 +232,32 @@ describe("the ceiling refuses growth, and refuses new content that arrives dead"
 
     expect(`${one("declared-name").stdout}`).toMatch(/declared-name: .*1\/1 dead/);
     expect(`${one("some-dir").stdout}`).toContain("no not_for entries");
+    rmSync(pack, { recursive: true, force: true });
+  }, 60_000);
+
+  test("--pack reads the business fence, which lives at the top of business.yaml", () => {
+    // A business declares one `not_for` for the whole entity (Business Protocol
+    // 2.0 §6.9); `capabilities` there is a list of ids, so the per-capability
+    // loop read nothing and every business fence was outside this gate.
+    const pack = mkdtempSync(join(tmpdir(), "notfor-biz-"));
+    const biz = join(pack, "businesses", "some-dir");
+    mkdirSync(biz, { recursive: true });
+    writeFileSync(join(biz, "business.yaml"), [
+      "name: fixture-biz",
+      "capabilities:",
+      "  - legal.holding_setup.execute",
+      "not_for:",
+      `  - "${DEAD}"`,
+      `  - "${LIVE}"`,
+      "example_briefs:",
+      '  - "something else entirely"',
+      "",
+    ].join("\n"), "utf8");
+
+    const r = spawnSync(process.execPath, [GATE, "fixture-biz", "--pack", pack], { cwd: REPO, encoding: "utf8" });
+    // The long entry fires against no brief in the pack; the short one is a
+    // substring fence and always fires.
+    expect(`${r.stdout}`).toMatch(/fixture-biz: .*1\/2 dead/);
     rmSync(pack, { recursive: true, force: true });
   }, 60_000);
 

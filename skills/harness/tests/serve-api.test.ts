@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 const root = mkdtempSync(join(tmpdir(), "serve-api-"));
 const serveDir = join(root, "serve");
@@ -35,7 +36,14 @@ if (process.env.FIXTURE_RESERVATIONS === "1") {
 if (process.env.FIXTURE_BUDGET_ECHO === "1") {
   fs.writeFileSync(path.join(out, "budget.txt"), String(val("--max-budget")));
 }
-process.exit(parseInt(process.env.FIXTURE_EXIT || "0", 10));
+if (process.env.FIXTURE_ENV_DUMP === "1") {
+  fs.writeFileSync(path.join(out, "env-dump.txt"), ["CANARY_SECRET_TOKEN", "FIXTURE_ENV_DUMP", "NIRVANA_CHILD_ENV"].map((k) => k + "=" + (process.env[k] ?? "absent")).join("\\n") + "\\n");
+}
+if (process.env.FIXTURE_LEAK === "1") {
+  fs.writeFileSync(path.join(out, "deliverable.md"), "# entrega\\n\\nthe key is " + process.env.LEAKED_API_KEY + "\\n");
+  fs.writeFileSync(path.join(out, "_SUMMARY.md"), "summary mentions " + process.env.LEAKED_API_KEY);
+}
+if (process.env.FIXTURE_SLEEP_MS) {\n  // Alive on purpose, so a test can cancel a run that is really running.\n  await new Promise((r) => setTimeout(r, parseInt(process.env.FIXTURE_SLEEP_MS, 10)));\n}\nprocess.exit(parseInt(process.env.FIXTURE_EXIT || "0", 10));
 `);
 
 let server: { stop: () => void; port: number };
@@ -71,6 +79,10 @@ beforeAll(async () => {
   process.env.NIRVANA_SERVE_SESSIONS_ROOT = join(root, "sessions");
   process.env.NIRVANA_SERVE_DISPATCH_BIN = dispatchFixture;
   process.env.NIRVANA_RUN_LEDGER_DB = join(root, "ledger.sqlite");
+  process.env.NIRVANA_SERVE_WEBHOOK_SWEEP_MS = "30";
+  // The served child receives an allowlist of the environment; the fixture's
+  // switches are named so they reach it.
+  process.env.NIRVANA_CHILD_ENV_EXTRA = "FIXTURE_RESERVATIONS,FIXTURE_BUDGET_ECHO,FIXTURE_EXIT,FIXTURE_ENV_DUMP,FIXTURE_SLEEP_MS,FIXTURE_RUNTIME_ERROR";
   mkdirSync(serveDir, { recursive: true });
 
   const { keygen } = await import("../lib/serve/auth.ts");
@@ -192,7 +204,7 @@ describe("library scope", () => {
     })).json();
     await waitTerminal(session_id, trace_id);
     // outputs under the session, never in a shared root
-    const artifact = join(root, "sessions", session_id, ".nirvana", "outputs", trace_id, "deliverable.md");
+    const artifact = join(root, "sessions", session_id, "outputs", trace_id, "deliverable.md");
     expect(readFileSync(artifact, "utf8")).toContain("conteúdo real");
   });
 
@@ -302,4 +314,248 @@ describe("webhooks", () => {
     const r = await api("/v1/webhooks", { method: "POST", body: JSON.stringify({ url: "file:///etc/passwd" }) });
     expect(r.status).toBe(400);
   });
+});
+
+describe("jobs — session-agnostic, the polling floor", () => {
+  test("proves the polling floor: submit, never listen, retrieve the terminal state afterwards", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "nunca escutei o SSE" }),
+    })).json();
+    // No /events call anywhere in this test — only polling, the mechanism
+    // that does not depend on connectivity between updates.
+    const deadline = Date.now() + 15000;
+    let env: any;
+    while (Date.now() < deadline) {
+      env = await (await api(`/v1/jobs/${trace_id}`)).json();
+      if (env.state !== "queued" && env.state !== "running") break;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    expect(env.state).toBe("delivered");
+    expect(env.trace_id).toBe(trace_id);
+    expect(env.artifacts.some((a: any) => a.path === "deliverable.md")).toBe(true);
+
+    // The fixture writes deliverable.md and _SUMMARY.md, and the summary is not
+    // an artifact: it is promoted into the envelope as a field, and it is run
+    // plumbing besides. So exactly one artifact remains and /result answers with
+    // the work itself. Before, the client asking for "the result" got a listing
+    // with instrumentation in it.
+    const result = await api(`/v1/jobs/${trace_id}/result`);
+    expect(result.status).toBe(200);
+    expect(await result.text()).toContain("conteúdo real");
+    expect(env.artifacts.some((a: any) => a.path === "_SUMMARY.md")).toBe(false);
+
+    const download = await api(`/v1/jobs/${trace_id}/artifacts/deliverable.md`);
+    expect(await download.text()).toContain("conteúdo real");
+  });
+
+  test("a job belongs to the key that created it — another key gets job_not_found, never someone else's case", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "caso privado" }),
+    })).json();
+
+    const { keygen } = await import("../lib/serve/auth.ts");
+    const other = keygen({ label: "intruder-jobs" });
+    const r = await fetch(`${base}/v1/jobs/${trace_id}`, { headers: { Authorization: `Bearer ${other.token}` } });
+    expect(r.status).toBe(404);
+    expect((await r.json()).error).toBe("job_not_found");
+  });
+
+  test("an unknown job id is not found", async () => {
+    const r = await api("/v1/jobs/run_does_not_exist");
+    expect(r.status).toBe(404);
+  });
+
+  test("result on a still-running job is a conflict, not a partial answer", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "ainda rodando" }),
+    })).json();
+    // The fixture is fast, so this is a best-effort race — assert the
+    // CONTRACT (409 while non-terminal) rather than depend on timing when it
+    // happens to still be queued/running.
+    const r = await api(`/v1/jobs/${trace_id}/result`);
+    if (r.status === 409) {
+      expect((await r.json()).error).toBe("job_not_finished");
+    } else {
+      expect(r.status).toBe(200);
+    }
+  });
+
+  test("events by job id streams the same feed as events by session+run", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "stream por job id" }),
+    })).json();
+    const res = await api(`/v1/jobs/${trace_id}/events`);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    await res.body?.cancel();
+  });
+});
+
+describe("webhook delivery — signed, timed, idempotent, referenced not embedded", () => {
+  test("the delivered request verifies, carries a stable delivery id, and never embeds the summary by value", async () => {
+    const received: { body: string; headers: Record<string, string> }[] = [];
+    const receiver = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = await req.text();
+        received.push({ body, headers: Object.fromEntries(req.headers) });
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    try {
+      const reg = await api("/v1/webhooks", {
+        method: "POST",
+        body: JSON.stringify({ url: `http://127.0.0.1:${receiver.port}/hook` }),
+      });
+      const { secret } = await reg.json();
+
+      process.env.FIXTURE_EXIT = "0";
+      const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+      const { trace_id } = await (await api(`/v1/sessions/${session_id}/briefs`, {
+        method: "POST", body: JSON.stringify({ brief: "caso com webhook" }),
+      })).json();
+
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && received.length === 0) await new Promise((r) => setTimeout(r, 50));
+      expect(received.length).toBeGreaterThan(0);
+
+      const delivery = received[0];
+      const { verifyWebhook } = await import("../lib/serve/webhooks.ts");
+      const verdict = verifyWebhook({
+        body: delivery.body,
+        signature: delivery.headers["x-nirvana-signature"],
+        timestamp: delivery.headers["x-nirvana-timestamp"],
+        secret,
+      });
+      expect(verdict.valid).toBe(true);
+      expect(delivery.headers["x-nirvana-delivery-id"]).toBeTruthy();
+
+      const payload = JSON.parse(delivery.body);
+      expect(payload.trace_id).toBe(trace_id);
+      expect(payload.state).toBe("delivered");
+      expect(payload.job_url).toContain(`/v1/jobs/${trace_id}`);
+      // Payload by reference, never by value: the summary text must not
+      // travel inside the webhook body — a legal case is sensitive.
+      expect(delivery.body).not.toContain("resumo de uma p");
+      expect(payload.summary).toBeUndefined();
+      expect(payload.artifacts).toBeUndefined();
+    } finally {
+      receiver.stop(true);
+    }
+  }, spawnBudgetMs(1));
+});
+
+describe("secrets hardening", () => {
+  test("the dispatched child does not see an undeclared secret of the server; a declared name passes", async () => {
+    process.env.CANARY_SECRET_TOKEN = "canary-value-0123456789";
+    process.env.FIXTURE_ENV_DUMP = "1";
+    try {
+      const s = await (await api("/v1/sessions", { method: "POST" })).json();
+      const r = await api(`/v1/sessions/${s.session_id}/briefs`, { method: "POST", body: JSON.stringify({ brief: "dump env" }) });
+      expect(r.status).toBe(202);
+      const { trace_id } = await r.json();
+      const env = await waitTerminal(s.session_id, trace_id);
+      expect(["delivered", "withheld", "indeterminate", "failed"]).toContain(env.state);
+      const dump = await api(`/v1/sessions/${s.session_id}/runs/${trace_id}/artifacts/env-dump.txt`);
+      expect(dump.status).toBe(200);
+      const text = await dump.text();
+      expect(text).toContain("CANARY_SECRET_TOKEN=absent");
+      expect(text).toContain("FIXTURE_ENV_DUMP=1");
+      expect(text).toContain("NIRVANA_CHILD_ENV=declared");
+    } finally {
+      delete process.env.CANARY_SECRET_TOKEN;
+      delete process.env.FIXTURE_ENV_DUMP;
+    }
+  }, spawnBudgetMs(20_000));
+
+  test("a summary and an artifact that carry a known secret value leave the server redacted", async () => {
+    process.env.LEAKED_API_KEY = "leaked-value-9876543210";
+    process.env.FIXTURE_LEAK = "1";
+    process.env.NIRVANA_CHILD_ENV_EXTRA = `${process.env.NIRVANA_CHILD_ENV_EXTRA},FIXTURE_LEAK,LEAKED_API_KEY`;
+    try {
+      const s = await (await api("/v1/sessions", { method: "POST" })).json();
+      const r = await api(`/v1/sessions/${s.session_id}/briefs`, { method: "POST", body: JSON.stringify({ brief: "leak it" }) });
+      const { trace_id } = await r.json();
+      const env = await waitTerminal(s.session_id, trace_id);
+      expect(String(env.summary)).toContain("[redacted:LEAKED_API_KEY]");
+      expect(String(env.summary)).not.toContain("leaked-value-9876543210");
+      const art = await api(`/v1/sessions/${s.session_id}/runs/${trace_id}/artifacts/deliverable.md`);
+      const text = await art.text();
+      expect(text).not.toContain("leaked-value-9876543210");
+      expect(art.headers.get("X-Nirvana-Redactions")).toBe("1");
+    } finally {
+      delete process.env.LEAKED_API_KEY;
+      delete process.env.FIXTURE_LEAK;
+    }
+  }, spawnBudgetMs(20_000));
+});
+
+describe("stopping a run", () => {
+  // A run had no way to end but its own: an expensive one could only be stopped
+  // by SSH, which a client of an HTTP API cannot do.
+  test("DELETE on a running job stops it, and says a process was actually reached", async () => {
+    process.env.FIXTURE_SLEEP_MS = "8000";
+    try {
+      const s1 = await (await api("/v1/sessions", { method: "POST" })).json();
+      const { trace_id } = await (await api(`/v1/sessions/${s1.session_id}/briefs`, {
+        method: "POST", body: JSON.stringify({ brief: "algo demorado" }),
+      })).json();
+      // Let it actually start before stopping it.
+      const deadline = Date.now() + 5000;
+      let state = "queued";
+      while (Date.now() < deadline && state !== "running") {
+        state = (await (await api(`/v1/jobs/${trace_id}`)).json()).state;
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      expect(state).toBe("running");
+
+      const res = await api(`/v1/jobs/${trace_id}`, { method: "DELETE" });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.state).toBe("cancelled");
+      expect(body.cancelled).toBe(true);
+      expect(body.signalled).toBe(true);
+      expect(body.gate).toBeNull();
+
+      // And it stays cancelled: the close that follows the signal is a
+      // consequence, not a new verdict.
+      await new Promise((r) => setTimeout(r, 400));
+      expect((await (await api(`/v1/jobs/${trace_id}`)).json()).state).toBe("cancelled");
+    } finally { delete process.env.FIXTURE_SLEEP_MS; }
+  }, spawnBudgetMs(25_000));
+
+  test("cancelling a finished run is a no-op that reports what it became", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const s1 = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${s1.session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "rápido" }),
+    })).json();
+    await waitTerminal(s1.session_id, trace_id);
+    const body = await (await api(`/v1/jobs/${trace_id}`, { method: "DELETE" })).json();
+    expect(body.state).toBe("delivered");
+    expect(body.cancelled).toBe(false);
+  }, spawnBudgetMs(20_000));
+
+  test("another key cannot stop someone else's run", async () => {
+    process.env.FIXTURE_EXIT = "0";
+    const s1 = await (await api("/v1/sessions", { method: "POST" })).json();
+    const { trace_id } = await (await api(`/v1/sessions/${s1.session_id}/briefs`, {
+      method: "POST", body: JSON.stringify({ brief: "privado" }),
+    })).json();
+    const { keygen } = await import("../lib/serve/auth.ts");
+    const other = keygen({ label: "intruder-cancel" });
+    const res = await fetch(`${base}/v1/jobs/${trace_id}`, {
+      method: "DELETE", headers: { Authorization: `Bearer ${other.token}` },
+    });
+    expect(res.status).toBe(404);
+  }, spawnBudgetMs(20_000));
 });

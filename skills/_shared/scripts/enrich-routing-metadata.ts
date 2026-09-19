@@ -46,6 +46,7 @@ import { spawnSync } from "node:child_process";
 import { resolveScope } from "../lib/scope.ts";
 import { paths } from "../lib/bun-helpers.ts";
 import { runHeadless, runtimeAvailable, type Runtime } from "../../harness/lib/host-agent-driver.ts";
+import { canonicalRuntimeName, resolveRunRuntime } from "../../harness/lib/runtime-rules.ts";
 import { runGate, type GateResult } from "./self-retrieval-gate.ts";
 
 const YAML = require("yaml");
@@ -561,13 +562,21 @@ export function restoreBackup(entry: BackupEntry): void {
 // ── LLM plumbing ────────────────────────────────────────────────────────────
 
 export function extractJson(raw: string): any | null {
-  let t = (raw || "").trim();
+  const t = (raw || "").trim();
+  const span = (s: string): any | null => {
+    const start = s.indexOf("{");
+    const end = s.lastIndexOf("}");
+    if (start === -1 || end <= start) return null;
+    try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; }
+  };
+  // The whole text first. Fence-first cut a JSON object at the FIRST ``` it
+  // contained — and a string value that carries fenced code (a README with a
+  // ```bash block) contains one, so the object came back as a truncated
+  // fragment and the parse failed even when the model answered bare JSON.
+  const whole = span(t);
+  if (whole !== null) return whole;
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fence) t = fence[1].trim();
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start === -1 || end <= start) return null;
-  try { return JSON.parse(t.slice(start, end + 1)); } catch { return null; }
+  return fence ? span(fence[1].trim()) : null;
 }
 
 interface GenOptions {
@@ -1260,7 +1269,13 @@ if (import.meta.main) {
   const dry = has("dry");
   const limit = Number(flag("limit") || 10);
   const attempts = Math.max(1, Number(flag("attempts") || 2));
-  const runtime = (flag("runtime") || "claude-code") as Runtime;
+  // `--runtime` when given; otherwise the session this script is being run
+  // FROM, then whatever is installed. It used to be one vendor's name, so this
+  // script spent that vendor's quota from inside every other CLI — and died on
+  // its stale credential when the user had not opened it in weeks.
+  const runtime = (flag("runtime")
+    ? canonicalRuntimeName(flag("runtime")!)
+    : resolveRunRuntime({}).runtime) as Runtime;
   const model = flag("model") || undefined;
   const scratch = flag("scratch") || path.join(os.tmpdir(), "nirvana-enrich-routing");
   const timeoutMs = Math.max(1, Number(flag("timeout-min") || 12)) * 60 * 1000;

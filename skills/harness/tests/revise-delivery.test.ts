@@ -14,18 +14,21 @@
 // a FAKE `claude` on PATH (exits 0, prints the runtime's JSON envelope, writes
 // nothing) over a pre-seeded outputs dir. What the artifacts are decides the
 // outcome — nothing is stubbed inside the pipeline.
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
 import { describe, expect, test, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { writeFakeCli } from "./helpers/fake-cli.ts";
+import { SCOPE_GUARD_PT_BR } from "../../_shared/lib/scope-guard.ts";
+import { spawnBudgetMs, TEARDOWN_BUDGET_MS } from "./helpers/test-budgets.ts";
 
 const SKILLS = path.resolve(import.meta.dir, "..", "..");
 const REVISE = path.join(SKILLS, "harness", "scripts", "revise.ts");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "nrv-revise-test-"));
 
-afterAll(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* best-effort */ } });
+afterAll(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* best-effort */ } }, TEARDOWN_BUDGET_MS);
 
 const PASSING_MD = [
   "# Relatório revisado",
@@ -72,6 +75,8 @@ interface ReviseCase {
   stdout: string;
   audit: any[];
   runtimeCalls: number;
+  /** Everything the fake runtime received: its argv and its stdin. */
+  prompt: string;
   oroot: string;
 }
 
@@ -100,6 +105,7 @@ function runRevise(files: Record<string, string | Buffer>, opts: { env?: Record<
   const binDir = path.join(home, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   const callsFile = path.join(home, "runtime-calls.log");
+  const promptFile = path.join(home, "runtime-prompt.log");
   // Bun/TS body with a per-OS launcher: a `#!/bin/sh` fake is invisible to
   // Windows, which is why this whole file used to fail there.
   const envelope = opts.runtimeFails
@@ -109,8 +115,10 @@ function runRevise(files: Record<string, string | Buffer>, opts: { env?: Record<
     : { type: "result", is_error: false, result: "ok", session_id: "sess-fake", total_cost_usd: 0 };
   writeFakeCli(binDir, "claude", `
     import * as fs from "node:fs";
-    try { await Bun.stdin.text(); } catch {}
+    let stdin = "";
+    try { stdin = await Bun.stdin.text(); } catch {}
     try { fs.appendFileSync(${JSON.stringify(callsFile)}, "call\\n"); } catch {}
+    try { fs.writeFileSync(${JSON.stringify(promptFile)}, process.argv.slice(2).join("\\n") + "\\n" + stdin); } catch {}
     console.log(JSON.stringify(${JSON.stringify(envelope)}));
     process.exit(0);
   `);
@@ -134,10 +142,11 @@ function runRevise(files: Record<string, string | Buffer>, opts: { env?: Record<
   const day = new Date().toISOString().slice(0, 10);
   const auditFile = path.join(logs, day, "audit.jsonl");
   const audit = fs.existsSync(auditFile)
-    ? fs.readFileSync(auditFile, "utf8").split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return {}; } })
+    ? fs.readFileSync(auditFile, "utf8").split("\n").filter(Boolean).map(l => { try { return parseAuditLine(l); } catch { return {}; } })
     : [];
   const runtimeCalls = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8").split("\n").filter(Boolean).length : 0;
-  return { status: r.status, stdout: (r.stdout || "") + (r.stderr || ""), audit, runtimeCalls, oroot };
+  const prompt = fs.existsSync(promptFile) ? fs.readFileSync(promptFile, "utf8") : "";
+  return { status: r.status, stdout: (r.stdout || "") + (r.stderr || ""), audit, runtimeCalls, prompt, oroot };
 }
 
 /** DELIVERY-level events only. quality-gate.ts appends its own per-file
@@ -146,6 +155,12 @@ function runRevise(files: Record<string, string | Buffer>, opts: { env?: Record<
 const events = (c: ReviseCase) => c.audit.filter(l => !l.artifact).map(l => l.event);
 
 describe("nrv revise — the outcome goes through the delivery pipeline", () => {
+  test("the revision prompt the runtime receives carries the scope guard in PT-BR", () => {
+    const c = runRevise({ "nota.md": PASSING_MD });
+    expect(c.runtimeCalls).toBeGreaterThanOrEqual(1);
+    expect(c.prompt).toContain(SCOPE_GUARD_PT_BR);
+  }, 30_000);
+
   test("THE FAIL-OPEN, CLOSED: zero text files never claims a gate pass", () => {
     // Not one .md/.txt/.json. The old gate looped zero times, kept allPass=true
     // and emitted gate_passed + delivered (gate "pass") with exit 0.
@@ -189,7 +204,7 @@ describe("nrv revise — the outcome goes through the delivery pipeline", () => 
   }, 30_000);
 
   test("spawned BY THE SUPERVISOR (NRV_IN_SWEEP=1): zero revision runs, verdict handed back", () => {
-    // Budget rule: an unattended launchd sweep must not spend LLM money in a
+    // Budget rule: an unattended sweep must not spend LLM money in a
     // revision loop nobody is watching. Same artifacts as the case above.
     const c = runRevise({ "nota.md": FAILING_MD }, { env: { NRV_IN_SWEEP: "1" } });
     expect(c.status).toBe(2);
@@ -208,7 +223,7 @@ describe("nrv revise — the outcome goes through the delivery pipeline", () => 
     const r = spawnSync(process.execPath, [REVISE], { encoding: "utf8" });
     expect(r.status).toBe(4);
     expect(r.stderr).toContain("Usage: nrv revise");
-  });
+  }, spawnBudgetMs(1));
 
   test("a FAILED revision still judges what is on disk instead of abandoning it", () => {
     // The runtime errors, but the artifacts exist. Old behavior: exit 1, nothing
@@ -218,7 +233,7 @@ describe("nrv revise — the outcome goes through the delivery pipeline", () => 
     expect(events(c)).toContain("revision_failed");  // the error is never swallowed
     expect(events(c)).toContain("x_runtime_errored_with_artifacts");
     expect(events(c)).toContain("delivered");
-  });
+  }, spawnBudgetMs(2));
 
   test("a FAILED revision whose artifacts fail the gate is WITHHELD, never delivered", () => {
     const c = runRevise({ "guia.md": FAILING_MD }, { runtimeFails: true });
@@ -226,12 +241,12 @@ describe("nrv revise — the outcome goes through the delivery pipeline", () => 
     expect(events(c)).toContain("x_runtime_errored_with_artifacts");
     expect(events(c)).toContain("x_delivery_withheld");
     expect(events(c)).not.toContain("delivered");
-  });
+  }, spawnBudgetMs(2));
 
   test("a FAILED revision with nothing on disk keeps the historical exit 1", () => {
     const c = runRevise({}, { runtimeFails: true });
     expect(c.status).toBe(1);
     expect(events(c)).toContain("revision_failed");
     expect(events(c)).not.toContain("delivered");
-  });
+  }, spawnBudgetMs(2));
 });

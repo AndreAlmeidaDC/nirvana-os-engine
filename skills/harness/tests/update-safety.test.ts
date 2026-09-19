@@ -605,8 +605,12 @@ describe("engine update safety", () => {
     mkdirSync(join(home, ".gemini"), { recursive: true });
     expect(runEngine(home, { copySkills: true }).code).toBe(0);
 
-    const mirror = join(home, ".codex", "skills", "harness", "SKILL.md");
-    const genericMirror = join(home, ".gemini", "skills", "harness", "SKILL.md");
+    // RUNTIME_ENTRIES is ["nirvana"] since 2026-09-16: a runtime's skills dir
+    // receives ONE entry, the door. harness/ and the other trees stay in
+    // ~/.nirvana/skills as engine internals and are no longer materialized here,
+    // so this test asserts on the entry the installer actually writes.
+    const mirror = join(home, ".codex", "skills", "nirvana", "SKILL.md");
+    const genericMirror = join(home, ".gemini", "skills", "nirvana", "SKILL.md");
     expect(existsSync(mirror)).toBe(true);
     expect(existsSync(genericMirror)).toBe(true);
     writeFileSync(mirror, `${readFileSync(mirror, "utf8")}\nRUNTIME MIRROR CUSTOMIZATION\n`);
@@ -626,12 +630,12 @@ describe("engine update safety", () => {
       ownership: "engine-managed",
       reason: "runtime-mirror-drift",
       kind: "runtime-mirror",
-      slug: "codex--harness",
+      slug: "codex--nirvana",
     }), expect.objectContaining({
       ownership: "engine-managed",
       reason: "runtime-mirror-drift",
       kind: "runtime-mirror",
-      slug: "gemini-cli--harness",
+      slug: "gemini-cli--nirvana",
     })]));
   }, 180_000);
 });

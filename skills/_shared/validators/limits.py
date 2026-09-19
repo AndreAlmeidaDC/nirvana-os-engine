@@ -50,6 +50,8 @@ DEFAULTS: dict[str, Any] = {
     "business_example_briefs_item_max": 1000,
     "business_keywords_max": 100,
     "business_capabilities_max": 100,
+    # Business Protocol 2.0 §6.9: routing fences.
+    "business_not_for_max": 40,
 
     # ── employee frontmatter ──
     # None = sem teto (comportamento histórico). Pode receber um inteiro.
@@ -65,6 +67,17 @@ DEFAULTS: dict[str, Any] = {
 
     # ── squad.yaml ──
     "squad_capabilities_max": 50,
+
+    # ── workflow document (Squad Protocol v6) — PAYLOAD SIZE ──
+    # Corpo em prosa de um workflow Markdown, em palavras: é teto, nunca
+    # rejeição (o lint avisa sob qualquer protocolo). 2500 palavras é ~6x o
+    # maior corpo que a biblioteca tem hoje.
+    "workflow_body_words_max": 2500,
+    # Alvo de bytes de documentos de agente + task que o prompt de squad
+    # carrega. Todo documento referenciado viaja por inteiro de qualquer jeito
+    # — é um teto flexível sinalizado numa nota ao ser cruzado, nunca um corte
+    # (squad-exec.ts).
+    "squad_prompt_components_bytes_max": 65536,
 
     # ── mind-clone DNA frontmatter ──
     "dna_max_turns_max": 1000,
@@ -102,6 +115,7 @@ SAFETY_BOUNDS: dict[str, tuple[Optional[float], Optional[float]]] = {
     "business_example_briefs_item_max": (200, 2000),
     "business_keywords_max": (15, 300),
     "business_capabilities_max": (20, 500),
+    "business_not_for_max": (5, 200),
 
     "employee_description_max": (200, 8000),  # se definido (None ignora)
     "employee_max_turns_max": (50, 1000),     # >1000 é risco de runaway
@@ -113,6 +127,9 @@ SAFETY_BOUNDS: dict[str, tuple[Optional[float], Optional[float]]] = {
     "capability_keywords_max": (10, 200),
 
     "squad_capabilities_max": (10, 200),
+
+    "workflow_body_words_max": (200, 20_000),
+    "squad_prompt_components_bytes_max": (8_192, 1_048_576),
 
     "dna_max_turns_max": (40, 1000),
 
@@ -134,6 +151,19 @@ SAFETY_BOUNDS: dict[str, tuple[Optional[float], Optional[float]]] = {
 _USER_CONFIG = Path.home() / ".claude" / "nirvana-limits.yaml"
 _PROJECT_CONFIG_NAME = ".nirvana-limits.yaml"
 _ENV_PREFIX = "NIRVANA_LIMIT_"
+
+# Opt out of the whole cascade and answer with DEFAULTS. A process that writes a
+# DISTRIBUTABLE artifact sets this: the cascade is a local operator affordance,
+# and a file every consumer reads may only embed numbers that are committed.
+# Mirror of DEFAULTS_ONLY_ENV in limits.ts.
+DEFAULTS_ONLY_ENV = "NIRVANA_LIMITS_DEFAULTS_ONLY"
+
+
+def _defaults_only() -> bool:
+    value = os.environ.get(DEFAULTS_ONLY_ENV)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _log(msg: str) -> None:
@@ -248,12 +278,20 @@ def _apply_safety_bounds(key: str, value: Any) -> Any:
 
 
 def load_limits() -> dict[str, Any]:
-    """Carrega os limites com cascata user → project → env + safety bounds."""
+    """Carrega os limites com cascata user → project → env + safety bounds.
+
+    NIRVANA_LIMITS_DEFAULTS_ONLY=1 pula as três camadas e responde DEFAULTS.
+    """
     limits: dict[str, Any] = dict(DEFAULTS)
     sources: dict[str, str] = {k: "default" for k in limits}
 
+    # Um artefato distribuível lê DEFAULTS e mais nada. Os safety bounds abaixo
+    # continuam rodando: os DEFAULTS cabem dentro deles por construção, e uma
+    # única saída impede que os dois modos divirjam.
+    pinned = _defaults_only()
+
     # 1. User-level (~/.claude/nirvana-limits.yaml)
-    user_cfg = _load_config_file(_USER_CONFIG)
+    user_cfg = {} if pinned else _load_config_file(_USER_CONFIG)
     for k, v in user_cfg.items():
         if k in limits:
             limits[k] = _coerce_to_default_type(v, DEFAULTS[k])
@@ -262,7 +300,7 @@ def load_limits() -> dict[str, Any]:
             _log(f"WARN: chave desconhecida ignorada em {_USER_CONFIG}: {k!r}")
 
     # 2. Project-level (.nirvana-limits.yaml — sobrescreve user)
-    project_path = _find_project_config()
+    project_path = None if pinned else _find_project_config()
     if project_path is not None:
         project_cfg = _load_config_file(project_path)
         for k, v in project_cfg.items():
@@ -275,7 +313,7 @@ def load_limits() -> dict[str, Any]:
     # 3. Env vars (NIRVANA_LIMIT_* — precedência máxima)
     for k in limits:
         env_key = _ENV_PREFIX + k.upper()
-        if env_key in os.environ:
+        if not pinned and env_key in os.environ:
             limits[k] = _coerce_to_default_type(
                 _coerce_scalar(os.environ[env_key]), DEFAULTS[k]
             )

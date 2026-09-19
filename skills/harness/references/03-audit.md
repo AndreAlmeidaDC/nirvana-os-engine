@@ -21,15 +21,77 @@ authoritative for legacy readers, SQLite is the race-safe substrate.
 
 ## JSONL format
 
-Append-only, one JSON object per line, UTF-8.
+Append-only, one JSON object per line, UTF-8. Two forms live in the same file
+and both are readable, forever: the flat form below, which is what the ~187k
+events written before 2026-08-28 look like, and the CloudEvents envelope
+`audit.emit` writes from that date on.
 
 ```jsonl
-{"ts":"2026-08-05T17:30:11.241Z","event":"brief_received","trace_id":"01HZ...","brief":"...","command":"route"}
+{"ts":"2026-08-05T17:30:11.241Z","event":"brief_received","trace_id":"01HZ...","brief_excerpt":"...","brief_chars":142,"command":"route"}
 {"ts":"2026-08-05T17:30:11.342Z","event":"routing_decision","signal":"HIGH","target_id":"squad_capability:audio-suite:audio_video.transcribe","route_tier":"stage2_squad"}
 {"ts":"2026-08-05T17:30:12.001Z","event":"dispatch_business","trace_id":"01HZ...","business_slug":"ars-libri"}
 {"ts":"2026-08-05T17:31:14.901Z","event":"cost_emission","agent":"transcriber","model":"sonnet","tokens_input":1200,"tokens_output":340,"cost_usd":0.0228}
 {"ts":"2026-08-05T17:31:20.000Z","event":"gate_passed","trace_id":"01HZ...","score":0.91}
 ```
+
+## The CloudEvents envelope
+
+`audit.emit` writes a [CloudEvents 1.0](https://github.com/cloudevents/spec)
+structured-mode envelope, built by `_shared/lib/cloudevents.js`. Context
+attributes serialize apart from `data`, so a consumer filters on type, source
+or subject without deserializing the payload.
+
+```jsonl
+{"specversion":"1.0","id":"3bca1f48354d5d27b8c9028e42383bf4","source":"/squad/seo-geo-aeo","type":"sh.squads.nirvana.dispatch.dispatch_squad","subject":"01HZ...","time":"2026-08-28T17:30:12.001Z","datacontenttype":"application/json","projectid":"proj-...","data":{"squad_name":"seo-geo-aeo","brief_excerpt":"...","brief_chars":142}}
+```
+
+| attribute | value | derived from |
+|---|---|---|
+| `type` | `sh.squads.nirvana.<domain>.<event>` | the legacy event name, verbatim after the domain |
+| `source` | `/squad/<slug>` · `/business/<slug>` · `/engine/<component>` | `squad_name` / `squad_slug` / `squad`, then `business_slug` / `business`, then `host` |
+| `subject` | the run's `trace_id` | `ctx.trace_id` |
+| `id` | idempotency key: sha256 of the line's own content, 32 hex | computed |
+| `projectid` | extension attribute | `ctx.project_id` |
+| `dataschema` | URI of the `data` schema, optional | only when a caller supplies one |
+| `data` | the payload, everything that is not an attribute | the `payload` argument plus the rest of `ctx` |
+
+### Reading it
+
+**Never `JSON.parse` an audit line by hand.** Use `parseAuditLine(line)` from
+`_shared/lib/cloudevents.js`: it returns the flat shape for an envelope and the
+parsed object itself, by identity, for a legacy line, and it throws on
+malformed JSON exactly like `JSON.parse` so a caller counting unreadable lines
+keeps counting them. `toLegacyEvent(obj)` does the same for an object you
+already parsed. The envelope's own attributes arrive on `_ce`
+(`{specversion, id, source, type}`) — `source` in particular, because the flat
+shape has no room for it: `source` is already a payload key on 713 lines.
+
+Raw appenders — `brief-squad.ts`, `brief-business.ts`, `squad-exec.ts`,
+`quality-gate.ts` and the rest that call `fs.appendFileSync` directly — still
+write the flat form. That is why dual-read is permanent, not a migration
+window.
+
+### `data` is bounded
+
+`data` is capped at 4 KiB serialized. Over the cap, the longest strings are cut
+to `BRIEF_EXCERPT_MAX` (300 chars, `_shared/lib/brief-excerpt.ts`) longest
+first, and `data._truncated` lists the keys that were cut with `data._bytes`
+giving their original size. Content travels by reference with an excerpt; a
+whole brief, a whole output or a whole transcript does not belong on an event.
+
+### Schema evolution: additive only
+
+This is a published contract from the moment `nrv serve` answers a request, and
+the consumer is software you do not control. So:
+
+- new fields arrive **optional, with a default** — never required;
+- old fields are **deprecated in a comment**, never renamed and never removed;
+- a `type` never changes meaning; a new meaning gets a **new** `type`;
+- the extension vocabulary stays open. Limit the shape, never the *what*.
+
+The first case that tests the rule is already here: `source` now carries the
+attribution, and `business_slug`, `squad_name`, `squad` and `business` all stay
+inside `data` anyway, because readers read them today.
 
 ## Canonical fields
 
@@ -59,8 +121,9 @@ Event names have two tiers:
    instead of crashing the caller; a name already starting with `x_` passes
    through silently. Extension events SHOULD be spelled with the explicit
    `x_` prefix at the call site so the source literal matches the log
-   (`x_route_ambiguous_autopicked`, `x_delivery_withheld`,
-   `x_runtime_errored_with_artifacts`, `x_research_completed`, ...). Set
+   (`x_route_ambiguous_autopicked`, `x_capability_resolved`,
+   `x_delivery_withheld`, `x_runtime_errored_with_artifacts`,
+   `x_research_completed`, ...). Set
    `NIRVANA_AUDIT_STRICT=1` to make unknown
    names throw (used by the schema tests).
 
@@ -69,7 +132,7 @@ when the docs prescribe a non-enum, non-`x_` event or when code emits one.
 
 <!-- BEGIN GENERATED: audit-events (scripts/gen-audit-events-doc.ts — do not edit by hand) -->
 
-96 events in the closed enum (declaration order of `ALLOWED_EVENTS` in `lib/audit.js`):
+91 events in the closed enum (declaration order of `ALLOWED_EVENTS` in `lib/audit.js`):
 
 ```
 brief_received
@@ -79,8 +142,6 @@ invocation_start
 invocation_end
 cost_emission
 handoff
-ticket_opened
-ticket_resolved
 escalation_trigger_fired
 human_notification_required
 human_response_received
@@ -89,7 +150,6 @@ approval_checkpoint
 approval_granted
 approval_rejected
 budget_violation
-memory_write
 isolation_violation
 validation_failed
 humanization_applied
@@ -116,8 +176,6 @@ brief_scored
 clarification_emitted
 clarification_received
 chunk_emitted
-chunk_gate_passed
-chunk_gate_failed
 delivered
 verify_passed
 verify_failed
@@ -175,11 +233,14 @@ Regenerate with `bun scripts/gen-audit-events-doc.ts --write`;
 `skills/harness/tests/audit-events-doc.test.ts` asserts this file matches the
 enum, so a stale table is a test failure, not a silent lie.
 
-Note: part of the enum is the **maestro-emitted surface** — events the
-orchestrating model writes via `nrv audit emit` during an agentic run
-(`target_plan_committed`, `human_notification_required`, `stall_detected`,
-`memory_write`, ...). No engine code path emits those; their presence in the
-enum is the contract that the maestro's writes validate cleanly.
+Note: part of the enum is the **maestro/adapter-emitted surface** — events the
+orchestrating model or an adapter wrapper writes via `nrv audit emit` during an
+agentic run (`target_plan_committed`, `escalation_trigger_fired`,
+`budget_violation`, ...). No engine code path emits those directly; their
+presence in the enum is the contract that those writes validate cleanly.
+`scripts/check-audit-parity.ts` prints this set as "ALLOWED but NEVER EMITTED
+BY CODE" — informational, not a discrepancy, and re-argued per name in plan
+cut 5 (`.nirvana/plans/event-contract.md`).
 
 ## Emitting
 
@@ -220,14 +281,26 @@ TODAY=$(date -u +%Y-%m-%d)
 wc -l < ~/.harness-logs/$TODAY/audit.jsonl
 ```
 
+### Reading both forms from the shell
+
+The file holds flat lines and envelopes. This `jq` filter flattens either into
+the shape the recipes below expect, so put it first:
+
+```bash
+FLATTEN='if .specversion then (.data + {ts: .time, event: (.type | sub("^sh\\.squads\\.nirvana\\.[^.]+\\.";"")), trace_id: .subject, project_id: .projectid}) else . end'
+```
+
 ### Signal distribution
 
 ```bash
 TODAY=$(date -u +%Y-%m-%d)
-jq -r 'select(.event=="routing_decision") | .signal' ~/.harness-logs/$TODAY/audit.jsonl | sort | uniq -c
+jq -r "$FLATTEN"' | select(.event=="routing_decision") | .signal' ~/.harness-logs/$TODAY/audit.jsonl | sort | uniq -c
 ```
 
 ### NO_MATCH of the last 7 days (input for planning new capabilities)
+
+`signal` lives in `data` on an envelope, so match the key rather than the whole
+`"key":"value"` pair — `grep` sees the same bytes in both forms that way.
 
 ```bash
 for i in 0 1 2 3 4 5 6; do
@@ -265,9 +338,12 @@ cutoff; call it periodically (cron / runtime hook).
 
 ## Privacy
 
-- Prefer `brief_length` / `brief_excerpt` over the full brief in events; some
-  writers do log the full brief (`brief_received` from the router CLI) — keep
-  that in mind when sharing logs.
+- Never put a full brief on an event. `brief_excerpt`
+  (`_shared/lib/brief-excerpt.ts`) is the only sanctioned form: bounded at 300
+  characters, single line, with `brief_chars` beside it carrying the true length.
+  The router CLI used to send the whole brief; it no longer does. A field that
+  grows without a ceiling on a file appended thousands of times a day is a
+  defect, not a feature.
 - Hash custom fields containing PII before `emit`.
 - The isolation guard keeps other projects' audit logs out of the current
   session.

@@ -25,6 +25,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { exec, paths, EXIT, BUN_BIN } from "../../_shared/lib/bun-helpers.ts";
 import { resolveScope, enumerate, outputsDir } from "../../_shared/lib/scope.ts";
+import { briefExcerpt } from "../../_shared/lib/brief-excerpt.ts";
+import { scopeGuard } from "../../_shared/lib/scope-guard.ts";
+import { preflightWarnings, squadPreflight } from "../../_shared/lib/squad-preflight.ts";
 
 const skillDir = path.join(paths.CLAUDE_SKILLS_DIR, "squads");
 const scope = resolveScope();
@@ -66,6 +69,12 @@ if (!validate.ok) {
   process.exit(validate.code ?? EXIT.FAILURES);
 }
 
+// What the squad declares of its host (credentials, MCP servers): said here,
+// before the dispatch, instead of surfacing as an empty string mid-run.
+for (const line of preflightWarnings(squadPreflight(target, { cwd: process.cwd() }), slug)) {
+  console.error(`[brief-squad] WARN: ${line}`);
+}
+
 // Project ID (auto if not given) — same shape as brief-business.
 if (!projectId) {
   const ts = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
@@ -73,8 +82,12 @@ if (!projectId) {
 }
 
 const outputsRoot = outputsDir(scope);
+// Only the dir we are about to write into: `handoffs/` was pre-created on the
+// chance a handoff landed there, and most runs write none, so every brief left
+// an empty directory behind. Whoever writes one creates it then, and the only
+// reader (artifact-indexer) already guards with existsSync.
 const projectDir = path.join(outputsRoot, projectId, "squads", slug);
-fs.mkdirSync(path.join(projectDir, "handoffs"), { recursive: true });
+fs.mkdirSync(projectDir, { recursive: true });
 
 const briefFile = path.join(outputsRoot, projectId, "brief.md");
 fs.mkdirSync(path.dirname(briefFile), { recursive: true });
@@ -88,15 +101,28 @@ fs.writeFileSync(briefFile, `# Brief
 ## Conteúdo
 
 ${brief}
+
+${scopeGuard("pt-BR")}
 `);
 
 // Audit — the whole point. Emit brief_received AND dispatch_squad with the
 // normalized `squad_name` field (the improver/learning loop reads squad_name).
 // Dual-write: project-local audit.jsonl + the harness daily log (so nrv glance,
 // nrv doctor and validate-chain see it). This runs regardless of runtime.
+//
+// Both events carry `trace_id` and both carry the brief excerpt. Neither used to:
+// brief_received had no trace, so buildRuns filed it under "no-trace" and the run
+// that asked for the work never got its own brief; and the only emitter that did
+// carry the text was the router CLI, which has no trace at all. Half the record in
+// each of two events reached nobody. `brief_chars` stays: it is the TRUE length,
+// which the bounded excerpt can no longer tell you.
 const auditFile = path.join(projectDir, "audit.jsonl");
+const excerpt = briefExcerpt(brief);
 function emit(event: string, extra: Record<string, unknown> = {}): void {
-  const line = JSON.stringify({ ts: submitted, event, project_id: projectId, squad_name: slug, ...extra });
+  const line = JSON.stringify({
+    ts: submitted, event, trace_id: projectId, project_id: projectId, squad_name: slug,
+    brief_excerpt: excerpt, brief_chars: brief.length, ...extra,
+  });
   fs.appendFileSync(auditFile, line + "\n");
   try {
     const { harnessLogsDir } = require(path.join(skillDir, "..", "_shared", "lib", "log-paths.ts"));
@@ -105,8 +131,8 @@ function emit(event: string, extra: Record<string, unknown> = {}): void {
     fs.appendFileSync(path.join(auditDir, "audit.jsonl"), line + "\n");
   } catch { /* non-fatal */ }
 }
-emit("brief_received", { brief_chars: brief.length });
-emit("dispatch_squad", { trace_id: projectId });
+emit("brief_received");
+emit("dispatch_squad");
 
 // Open the dispatch run-ledger row for this agentic dispatch. Same reasoning as
 // the audit events above, one layer up: the supervisor's never-forgotten
@@ -115,17 +141,33 @@ emit("dispatch_squad", { trace_id: projectId });
 // so a run that finished — or died — reached nobody. Making it a side effect of
 // the prep step the agent must run anyway is what turns the guarantee from prose
 // into coverage. Fail-soft: openAgenticRun warns and returns null, never throws.
+//
+// Not under a scripted dispatch: `nrv dispatch --exec` spawns this script only to scaffold and
+// tracks the run in the ledger itself, which it states with NIRVANA_DISPATCH_TRACKS_RUN=1. The
+// agentic row would then be a second one that no process closes, escalated to a human as
+// stalled once its lease expired.
+const trackedByDispatch = process.env.NIRVANA_DISPATCH_TRACKS_RUN === "1";
 let runId: string | null = null;
-try {
-  const { openAgenticRun } = require(path.join(skillDir, "..", "harness", "lib", "run-ledger.ts"));
-  runId = openAgenticRun({
-    projectId, traceId: projectId, targetSlug: slug, targetKind: "squad",
-    outputsRoot: projectDir, projectDir,
-    meta: { opened_by: "brief-squad", brief_path: briefFile },
-  })?.runId ?? null;
-} catch (e: any) {
-  console.error(`[brief-squad] WARN: run-ledger unavailable (${e.message}) — this dispatch will not be supervised`);
+if (!trackedByDispatch) {
+  try {
+    const { openAgenticRun } = require(path.join(skillDir, "..", "harness", "lib", "run-ledger.ts"));
+    runId = openAgenticRun({
+      projectId, traceId: projectId, targetSlug: slug, targetKind: "squad",
+      outputsRoot: projectDir, projectDir,
+      meta: { opened_by: "brief-squad", brief_path: briefFile },
+    })?.runId ?? null;
+  } catch (e: any) {
+    console.error(`[brief-squad] WARN: run-ledger unavailable (${e.message}) — this dispatch will not be supervised`);
+  }
 }
+
+// A business that delegates is alive: when an employee dispatches this squad under
+// the business's project, beat the business's agentic row as a side effect. Its
+// employee never has to remember a heartbeat. Fail-soft: beatAgenticRuns never throws.
+try {
+  const { beatAgenticRuns } = require(path.join(skillDir, "..", "harness", "lib", "run-ledger.ts"));
+  beatAgenticRuns({ projectId, traceId: projectId, source: "brief-squad" });
+} catch { /* the ledger is not this script's job */ }
 
 // Initial HANDOFF.json — minimum state to allow resume after /clear or crash.
 try {
@@ -154,7 +196,7 @@ console.log(`OK: brief registered.
   Project dir:   ${projectDir}
   Brief file:    ${briefFile}
   Audit log:     ${auditFile}
-  Run ID:        ${runId ?? "(not tracked — see the warning above)"}
+  Run ID:        ${runId ?? (trackedByDispatch ? "(tracked by the dispatch that spawned this step)" : "(not tracked — see the warning above)")}
 
 Next step (run by the skill via the Agent tool):
   Spawn a subagent over ${slug}/squad.yaml + workflow, with the brief above and

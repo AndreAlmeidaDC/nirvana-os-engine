@@ -54,14 +54,24 @@ Creates a new business via interactive wizard.
 | `--domain <slug>,...` | (interactive) | Override domains (skips the user prompt) |
 | `--employee-count <n>` | (interactive) | Pre-sets the wizard's employee count |
 
-### `validate-business.ts <path-or-slug>`
+### `validate-business.ts <path-or-slug>|--all`
 
-Validates manifest + integrity.
+The admission gate. Delegates to the shared runner, so this script and
+`nrv validate business` are the same code path and the same catalog
+(`BUSINESS_PROTOCOL_V2.md` §16: 16 errors, 23 warnings).
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `<path-or-slug>` (positional) | required | Absolute path or slug (resolved against `BUSINESSES_DIR`) |
-| `--strict` | (off) | Promotes warnings to errors (BP7 antagonist, intake unique, schema strict) |
+| `<path-or-slug>` (positional) | required unless `--all` | Absolute path or slug (resolved against the scope, then `BUSINESSES_DIR`) |
+| `--all` | (off) | Every business the scope resolves, one batch report |
+| `--fix` | (off) | Applies the mechanical fixers with backup, re-check and rollback |
+| `--strict` | (off) | Warnings reject too (exit 2) |
+| `--json` | (off) | `nirvana.verify-report/v1`, or `nirvana.verify-batch/v1` with `--all` |
+| `--report` | (off) | Also writes the JSON to `.audit-state/<slug>/verify.json` |
+| `--no-retrieval` | (off) | Skips the self-retrieval axis |
+
+Exit: `0` admitted · `1` an error the baseline does not cover · `2` only
+warnings, under `--strict` · `64` usage error or unknown business.
 
 ### `index-businesses.ts [options]`
 
@@ -115,7 +125,8 @@ Each business has a manifest with optional fields:
 |---|---|---|
 | `operation_mode` | `zero_human` | `zero_human` (autonomous), `hybrid` (escalation gates), `human_in_loop` (every decision validated with a human) |
 | `authority_level` | `tier-2` | `tier-1` (board approval for changes), `tier-2` (default), `tier-3` (more permissive) |
-| `runtime_requirements.minimum[]` | `[{runtime: claude-code}]` | Which runtimes are supported (claude-code, codex, antigravity-cli, gemini-cli, cursor, openclaw, opencode) |
+| `runtime_requirements.policy` | `declared` | `declared` requires `minimum[]`; `active` uses the session runtime without an allowlist |
+| `runtime_requirements.minimum[]` | `[{runtime: claude-code}]` | Which runtimes are supported under `policy: declared` |
 | `features_required[]` | `[]` | Features that MUST exist in the runtime: `max_turns, tool_whitelist, subagent_spawning, audit_trail, scheduled_invocation, event_bus, hooks, sandboxing, session_memory, project_memory, global_memory, handoff_artifacts, fork_context, teammate_primitive, telemetry_otel` |
 | `features_optional[]` | `[]` | Features that improve experience but do not block |
 | `env_required[]` | `[]` | List of env var keys that must exist before the business can operate |
@@ -134,7 +145,7 @@ Each `employees/<name>.md` has YAML frontmatter with:
 | `role` | required | Free text ≥3 chars describing the role |
 | `type` | `functional_specialist` | `functional_specialist` (generic) or `mind_clone` (embodies a public persona) |
 | `description` | required, ≥20 chars | Short persona/responsibility summary |
-| `maxTurns` | required, 1-200 | Turn limit for agent invocation. **Cap 200 hardcoded in the schema.** |
+| `maxTurns` | 1-1000, padrão 15 | Turn limit for agent invocation. Teto em `limits.ts#employee_max_turns_max`; o padrão desceu de 400 para 15 em 12/09/2026. |
 | `reports_to` | `null` | Slug of the manager OR `null` (CEO / root) |
 | `manages[]` | `[]` | Slugs of direct reports (must match their `reports_to`) |
 | `tools[]` | (none) | Subset of the v5 §10.7 whitelist. Free-form accepted. |
@@ -228,7 +239,7 @@ These come from `~/.nirvana/skills/_shared/schemas/`:
 | `description` length | 20-500 chars | business.schema.json |
 | `domains[]` length | 1-10 entries | business.schema.json |
 | `employee_count` | 1-100 | business.schema.json |
-| `employee.maxTurns` | 1-200 | core-schemas.json#employee |
+| `employee.maxTurns` | 1-1000 (padrão 15) | validators.ts#EmployeeFrontmatter |
 | `self_score_contract.criteria[].threshold` | 0.0-1.0 | core-schemas.json#employee |
 | `self_score_contract.max_revise_iterations` | 0-5 | core-schemas.json#employee |
 
@@ -254,7 +265,7 @@ Schemas validated by `~/.nirvana/skills/_shared/validators/validators.{ts,py}` (
 - **SKILL.md** — skill entry in Claude Code
 - **README.md** — overview + tutorials
 - **TUTORIAL.md** — step-by-step tutorial
-- **BUSINESS_PROTOCOL_V1.md** — full spec (~1850 lines)
+- **BUSINESS_PROTOCOL_V2.md** — the v2 delta · **BUSINESS_PROTOCOL_V1.md** — everything it leaves untouched (~1850 lines)
 - **~/.nirvana/skills/_shared/CONFIGURATION.md** — central schemas + validators
 - **~/.nirvana/skills/harness/CONFIGURATION.md** — config of the router that consumes this registry
 - **~/.nirvana/skills/_shared/SCRIPT_CONTRACT.md** — the system-wide bash script contract (portable shebang, no stdin, structured exit codes, two-mode flags)

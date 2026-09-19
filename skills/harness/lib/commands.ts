@@ -49,10 +49,11 @@ export const COMMANDS: Command[] = [
   { name: "help", aliases: ["--help", "-h"], custom: true, category: "first-run", summary: "Show this help", visibility: "user" },
 
   // install & lifecycle
-  { name: "install", custom: true, category: "install", args: "<source> | --bootstrap | --check", summary: "Install an asset (squad/business/clone/pack); --bootstrap wires audit hooks", visibility: "user" },
+  { name: "install", custom: true, category: "install", args: "<source> | --bootstrap | --check | --repair-path", summary: "Install an asset (squad/business/clone/pack); --bootstrap wires audit hooks; --repair-path cleans the Windows user PATH", visibility: "user" },
+  { name: "setup", target: "_shared/scripts/install.ts", category: "install", summary: "Install or repair audit hooks across supported agents", visibility: "user" },
   { name: "uninstall", custom: true, category: "install", args: "<name> | --engine | --hooks", summary: "Remove an asset, the engine (keeps content), or just the hooks", visibility: "user" },
   { name: "installed", aliases: ["list-installed"], target: "_shared/scripts/list-installed.ts", category: "install", summary: "List active installations", visibility: "user" },
-  { name: "update", aliases: ["self-update", "upgrade"], target: "harness/scripts/update.ts", category: "install", args: "[--check]", summary: "Update the engine: git pull (dev) or re-fetch the latest release (npx)", visibility: "user" },
+  { name: "update", aliases: ["self-update", "upgrade"], target: "harness/scripts/update.ts", category: "install", args: "[<pack-slug>] [--check]", summary: "Update the engine: git pull (dev) or re-fetch the latest release (npx)", visibility: "user" },
   { name: "update-check", target: "harness/scripts/update-check.ts", category: "install", args: "[--status|--refresh|--print]", summary: "Whether a newer engine release exists (cached; NIRVANA_NO_UPDATE_CHECK=1 disables)", visibility: "user" },
 
   // core
@@ -61,19 +62,27 @@ export const COMMANDS: Command[] = [
   { name: "doctor", aliases: ["capability-doctor"], custom: true, category: "core", args: "[--system|--capability]", summary: "Full system diagnostic", visibility: "user" },
   { name: "route", target: "harness/scripts/route.ts", category: "core", args: '"<brief>"', summary: "Route a brief (HIGH/AMBIGUOUS/NO_MATCH)", visibility: "user" },
   { name: "find", target: "harness/scripts/find.ts", category: "core", args: '"<query>"', summary: "Dry-run capability discovery", visibility: "user" },
-  { name: "validate", target: "harness/scripts/validate.ts", category: "core", summary: "Self-test (delegates to doctor: binaries, skills, registries, hooks)", visibility: "user" },
+  { name: "validate", aliases: ["verify"], target: "_shared/scripts/verify.ts", category: "core", args: "<squad|business|mind-clone> <slug|path> [--fix] [--strict] [--json] | <kind> --all [--record] | --pack <dir>", summary: "Admission gate: verify an entity, --fix it, record debt (exit 0/1/2/64; bare = deprecated doctor alias)", visibility: "user" },
   { name: "index", target: "harness/scripts/index.ts", category: "core", summary: "Re-index squads + businesses", visibility: "user" },
+  { name: "config", target: "harness/scripts/config.ts", category: "core", args: "list|get|set|unset|explain [<key> [<value>]] [--global|--project]", summary: "Operational settings: effective value + origin per key; set/unset write the project or the global config.yaml", visibility: "user" },
+  { name: "deps", target: "_shared/scripts/deps.ts", category: "core", args: "[status|scan|adopt|link|install|env] [--apply] [--json]", summary: "The one dependency home (~/.nirvana): where packages live, what escaped it, and how to fold it back in", visibility: "user" },
 
   // dispatch & execute
   { name: "dispatch", target: "harness/scripts/dispatch.ts", category: "dispatch", args: '<business> "<brief>"', summary: "Scaffold a run (brief + DNA injection + audit; no exec)", visibility: "user" },
   { name: "run", aliases: ["autopilot"], custom: true, category: "dispatch", args: '<business> "<brief>" [--zip --pdf --html]', summary: "Autopilot: dispatch + execute + verify + gate", visibility: "user" },
   { name: "auto", custom: true, category: "dispatch", args: '"<brief>" [--zip --pdf --html]', summary: "Autopilot with auto-selected business (= run --auto)", visibility: "user" },
+  { name: "audit-where", target: "harness/scripts/audit-where.ts", category: "observability", args: "[--project <dir>] [--trace <id>]", summary: "Which audit files a run wrote, and why those", visibility: "user" },
+  { name: "audit-tail", target: "harness/scripts/audit-tail.ts", category: "observability", args: "[--follow] [--trace <id>] [--only orchestration|hooks|all]", summary: "Follow a run's audit, normalized, from now on", visibility: "user" },
+  { name: "team", target: "harness/scripts/chain.ts", category: "dispatch", args: "plan|step|review|verdict ...", summary: "A business's org chart: plan the chain, get each seat's prompt, review it", visibility: "user" },
   { name: "revise", target: "harness/scripts/revise.ts", category: "dispatch", args: '<project> "<change>"', summary: "Apply a change keeping the same runtime session", visibility: "user" },
   { name: "ask", target: "harness/scripts/ask.ts", category: "dispatch", args: "<clone> [question]", summary: "Talk to a single mind-clone (DNA injected)", visibility: "user" },
+  { name: "exec", target: "harness/scripts/exec.ts", category: "dispatch", args: '[--runtime=<rt>] "<prompt>"', summary: "The runtime as itself: one prompt, its answer, no persona and no gate", visibility: "user" },
+  { name: "mine-briefs", target: "harness/scripts/mine-real-briefs.ts", category: "observability", args: "[--write] [--all] [--out <file>]", summary: "Build a routing eval corpus from dispatches that already ran", visibility: "user" },
   { name: "launch", target: "harness/scripts/launch.ts", category: "dispatch", args: "<name> [--pillars=...]", summary: "Scaffold a multi-pillar 360 launch", visibility: "user" },
   { name: "clean", aliases: ["clean-project", "purge"], target: "harness/scripts/clean-project.ts", category: "dispatch", args: "<project> [--hard]", summary: "Remove a project scaffold (trash by default)", visibility: "user" },
-  { name: "run-track", target: "harness/scripts/run-track.ts", category: "dispatch", args: "open|beat|close|list ...", summary: "Ledger door for agent-orchestrated runs — so nothing is ever forgotten", visibility: "user" },
-  { name: "supervisor", target: "harness/scripts/supervisor.ts", category: "dispatch", args: "sweep|status|watch|install|uninstall", summary: "Dispatch-ledger supervisor: resume/re-dispatch stalled runs (never-stall)", visibility: "user" },
+  { name: "run-track", target: "harness/scripts/run-track.ts", category: "dispatch", args: "open|beat|close|list|status|wait ...", summary: "Ledger door for agent-orchestrated runs — so nothing is ever forgotten", visibility: "user" },
+  { name: "multi-target", aliases: ["mt"], target: "harness/scripts/multi-target.ts", category: "dispatch", args: "plan|run|status <plan.json>", summary: "Multi-target engine by plan file: plan compiles the waves, run executes them over the Run Kernel (opt-in), status reads the projection", visibility: "user" },
+  { name: "supervisor", target: "harness/scripts/supervisor.ts", category: "dispatch", args: "sweep|status [--follow]|watch", summary: "Dispatch-ledger supervisor: what's running and what it's doing, resume/re-dispatch stalled runs (never-stall)", visibility: "user" },
 
   // distribution
   { name: "pack", target: "harness/scripts/pack.ts", category: "distribution", args: "create|inspect|publish", summary: "Bundle / inspect / publish an asset pack", visibility: "dev" },
@@ -98,7 +107,6 @@ export const COMMANDS: Command[] = [
   { name: "license", aliases: ["verify-license", "whoami"], target: "_shared/scripts/license.ts", category: "license", args: "[status|check|install [<path>]|activate]", summary: "Show your copy's provenance, install a PROVENANCE.json, activate (offline-safe)", visibility: "user" },
 
   // advanced / dev
-  { name: "setup", target: "_shared/scripts/install.ts", category: "dev", summary: "Re-wire audit hooks (= install --bootstrap)", visibility: "dev" },
   { name: "install-content", target: "_shared/scripts/install-content.ts", category: "dev", args: "<dir> --slug <slug>", summary: "Overlay a content pack onto the engine (used by a pack's setup.ts)", visibility: "dev" },
   { name: "use-businesses", aliases: ["business", "businesses"], target: "harness/scripts/route.ts", category: "dev", summary: "Route forcing business-first preference", visibility: "dev" },
   { name: "use-squads", aliases: ["squad", "squads"], target: "harness/scripts/route.ts", category: "dev", summary: "Route forcing squad-first preference", visibility: "dev" },
@@ -110,6 +118,7 @@ export const COMMANDS: Command[] = [
   { name: "gate", custom: true, category: "dev", summary: "Quality gate (voice-fidelity)", visibility: "dev" },
   { name: "guard", target: "harness/scripts/guard.ts", category: "dev", args: "tick --project <dir> --action <sig>", summary: "Loop-guard tick — circuit breaker for the maestro loop", visibility: "dev" },
   { name: "fix-squad", aliases: ["doctor-squad"], target: "squads/scripts/fix-squad.ts", category: "libraries", args: "<slug|path> [--apply]", summary: "Diagnose and auto-fix a squad", visibility: "user" },
+  { name: "migrate", aliases: ["migrate-squad"], target: "squads/scripts/migrate-squad.ts", category: "libraries", args: "<slug|path> --to 6 [--apply] [--all] [--map-refs] [--rollback <ts>]", summary: "Convert a squad to Squad Protocol 6.0: canonical workflow documents, extension-less refs, acceptance from success_indicators (dry-run by default; backup, report, rollback)", visibility: "user" },
   { name: "changes", aliases: ["surface"], target: "_shared/scripts/nirvana-changes.ts", category: "libraries", args: "<gen|diff|show|pending|ack> ...", summary: "Superfície de contrato dos artefatos (gen/diff/pending/ack)", visibility: "user" },
   { name: "memory", aliases: ["mem"], target: "harness/scripts/memory.ts", category: "qol", args: "<add|list|supersede|gc> ...", summary: "Temporal cross-session memory (supersede-never-delete); `gc` runs TTL eviction + dedup", visibility: "user" },
   { name: "activate", aliases: ["activate-squad", "squad-activate"], target: "harness/scripts/activate.ts", category: "libraries", args: "<slug>|--all [--dry-run] [--confirm-heavy] [--only-declared]", summary: "Install what a squad's dependencies.yaml declares (--all walks the library)", visibility: "user" },
@@ -117,7 +126,7 @@ export const COMMANDS: Command[] = [
   { name: "graph", aliases: ["entity-graph"], target: "harness/scripts/graph.ts", category: "dev", args: "<closure|order|check> [--business <slug>] [--pack <dir>] [--strict] [--json]", summary: "Typed dependency graph: entity closure for a business, install order, integrity check", visibility: "dev" },
   { name: "validate-chain", aliases: ["chain-validate", "chain"], target: "harness/scripts/validate-chain.ts", category: "dev", args: "<project> [--strict|--all]", summary: "Audit-chain integrity check", visibility: "dev" },
   { name: "validate-trace", aliases: ["trace-validate"], target: "harness/scripts/validate-trace.ts", category: "dev", summary: "Validate a single audit trace", visibility: "dev" },
-  { name: "validate-mind-clones", aliases: ["mc-validate"], target: "_shared/scripts/validate-mind-clones.ts", category: "dev", summary: "Audit mind-clone canonical files", visibility: "dev" },
+  { name: "validate-mind-clones", aliases: ["mc-validate"], target: "_shared/scripts/validate-mind-clones.ts", category: "dev", summary: "Audit the mind-clone library (alias of validate mind-clone --all; legacy JSON keys kept)", visibility: "dev" },
   { name: "pack-manifest", aliases: ["gen-pack-manifest"], target: "_shared/scripts/gen-pack-manifest.ts", category: "dev", summary: "Generate a pack manifest", visibility: "dev" },
   { name: "validate-starter", aliases: ["starter-validate"], custom: true, category: "dev", summary: "Dev-only: validate a starter/content pack (needs the packs repo)", visibility: "dev" },
 ];

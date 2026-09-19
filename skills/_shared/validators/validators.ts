@@ -1,7 +1,7 @@
 /**
  * Nirvana Protocol Validators (TypeScript / Zod)
  *
- * Fail-closed validators for Squad Protocol v5, Business Protocol v1, and Harness Protocol v1.
+ * Fail-closed validators for Squad Protocol v5/v6, Business Protocol v1/v2, and Harness Protocol v1.
  *
  * Used by:
  * - skills/squads (squad.yaml validation, capability validation)
@@ -35,12 +35,38 @@ const TICKET_ID = /^TKT-\d{4}-\d{2}-\d{2}-\d+$/
 const SHA256 = /^sha256:[a-f0-9]{64}$/
 const ENV_VAR = /^[A-Z][A-Z0-9_]*$/
 const MENTION = /^@[a-z][a-z0-9-]+$/
+const ACCEPTANCE_ID = /^[a-z][a-z0-9_-]*$/
+/** A capability id, optionally qualified by the providing squad: `slug:ns.cap.verb`. */
+const REQUIRES_REF = /^(?:[a-z][a-z0-9-]{1,63}:)?[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/
+
+// The nine the driver can execute, plus the two hosts that are declarable but
+// not exec targets (`cursor`, `openclaw`) and the short `antigravity`. The list
+// had stopped at the driver's sixth runtime, so a squad could not declare that
+// it needs kimi, grok or qwen — and the business schema, written separately,
+// disagreed with this one about `pi` and `antigravity-cli`.
+/** How these schemas are projected to JSON Schema. Lives here, next to the Zod
+ *  source, because the generator and the parity test must pass the same options
+ *  and the generator script executes on import (it has no `import.meta.main`
+ *  guard), so importing it from a test would silently regenerate the files the
+ *  test is there to compare.
+ *
+ *  `io: "input"` is what a MANIFEST schema means. Zod's default, "output",
+ *  describes the parsed value, where a defaulted field is always present and
+ *  therefore `required` — so the published schemas declared `score_boost`,
+ *  `model_hint` and `parallel_safe` mandatory while both validators default
+ *  them and the docs label them optional (issue #252). Defaults are still
+ *  published; only the `required` lists change. */
+export const JSON_SCHEMA_OPTIONS = { unrepresentable: "any", io: "input" } as const;
 
 const Runtime = z.enum([
-  'claude-code', 'codex', 'gemini-cli', 'cursor', 'antigravity', 'antigravity-cli',
-  'openclaw', 'opencode', 'pi',
+  'claude-code', 'codex', 'antigravity-cli', 'antigravity', 'gemini-cli', 'pi',
+  'kimi-cli', 'grok-cli', 'qwen-code', 'opencode', 'cursor', 'openclaw',
 ])
-const Model = z.enum(['haiku', 'sonnet', 'opus', 'inherit'])
+// `fable` was missing while the engine's own alias resolver
+// (_shared/lib/system-model.ts) already recognised it, so a capability could
+// not declare a hint for a model the engine knows how to name. `inherit` is the
+// member that means "no value": use whatever the user's runtime is set to.
+const Model = z.enum(['haiku', 'sonnet', 'opus', 'fable', 'inherit'])
 const Severity = z.enum(['low', 'medium', 'high'])
 const FidelityStatus = z.enum(['validated', 'experimental', 'drifted', 'retired'])
 
@@ -126,12 +152,33 @@ export const CapabilitySchema = z.object({
     produces: z.array(z.string()).max(8).optional(),
     consumes: z.array(z.string()).max(8).optional(),
   }).strict()).max(8).optional(),
+  // Squad Protocol v6 (accepted, not yet read). Optional, so a v5 manifest
+  // parses to the same object as before; bounded, so the shapes the next cuts
+  // author are the shapes the validator already knows. No reader consumes them.
+  acceptance: z.array(z.object({
+    id: z.string().regex(ACCEPTANCE_ID),
+    description: z.string().min(1),
+    blocking: z.boolean().optional(),
+    minimumScore: z.number().min(0).max(1).optional(),
+    // v6.1 (§36): a criterion may name the file it promises, so the disk can be
+    // checked against it the way employee acceptance already is (§29.1).
+    path: z.string().min(1).optional(),
+    min_bytes: z.number().int().min(0).optional(),
+  }).strict()).max(12).optional(),
+  evaluator: z.object({
+    scorecard: z.string().min(1),
+    rubric: z.string().min(1),
+    dimensions: z.array(z.string()).optional(),
+    max_cost_usd: z.number().min(0).optional(),
+  }).strict().optional(),
+  requires: z.array(z.string().regex(REQUIRES_REF)).max(8).optional(),
+  consumes: z.array(z.string().min(3).max(80)).max(20).optional(),
 }).strict()
 
 export const SquadManifestSchema = z.object({
   name: z.string().regex(KEBAB_CASE),
   version: z.string().regex(SEMVER),
-  protocol: z.enum(['4.0', '4.1', '5.0']),
+  protocol: z.enum(['4.0', '4.1', '5.0', '6.0']),
   description: z.string().min(20).optional(),
   author: z.string().optional(),
   license: z.string().default('MIT'),
@@ -146,13 +193,20 @@ export const SquadManifestSchema = z.object({
     schemas: z.array(z.string()).optional(),  // JSON Schemas the squad ships for output validation
   }).strict(),
   runtime_requirements: z.object({
+    // `active` (the default since 6.1.2): the squad runs on the runtime hosting
+    // the session, on that runtime's own model and effort; `minimum` and
+    // `compatible` are information, not an allowlist. `declared` is explicit
+    // and restricts the run to `minimum` + `compatible`: for a squad built
+    // around one runtime's tools.
+    policy: z.enum(['declared', 'active']).default('active'),
     minimum: z.array(z.object({
       runtime: Runtime,
       version: z.string().optional(),
-    }).strict()).min(1),
+    }).strict()).min(1).optional(),
     compatible: z.array(z.unknown()).optional(),
     incompatible: z.array(z.unknown()).optional(),
-  }).strict().optional(),
+  }).strict().refine((r) => r.policy === 'active' || (r.minimum?.length ?? 0) > 0,
+    'runtime_requirements.minimum is required when policy is declared').optional(),
   features_required: z.array(Feature).optional(),
   features_optional: z.array(z.string()).optional(),
   output: z.object({
@@ -168,6 +222,46 @@ export const SquadManifestSchema = z.object({
 // Philosophy (b): tolerate unknown top-level keys (user/system extras) instead
 // of failing; the capability validator WARNs per unknown key for visibility.
 }).passthrough()
+
+// ──────────────────────────────────────────────────────────────────────
+// Squad Protocol v6 — the workflow document (§28.1)
+// ──────────────────────────────────────────────────────────────────────
+//
+// One shape for a graph the library writes in eight dialects. The schema is
+// strict on purpose: `skills/squads/lib/workflow-reader.ts normalizeWorkflow()`
+// is the only thing that produces it, and it parks every legacy key it does not
+// own in `step.meta` / `extensions` rather than dropping it. A shape that fails
+// here is a normalizer bug, never authored content — authored content is judged
+// by the lint, which reports by protocol instead of rejecting.
+
+const WORKFLOW_ID = /^[a-z][a-z0-9_-]*$/
+
+export const WorkflowStepSchema = z.object({
+  id: z.string().regex(WORKFLOW_ID),
+  /** Required: a step without an agent has nobody to run it. */
+  agent: z.string().min(1),
+  /** Always a reference (`tasks/<task>.md`), never prose. Prose lives in the body. */
+  task: z.string().min(1).optional(),
+  /** Step ids this step depends on. */
+  requires: z.array(z.string()).default([]),
+  creates: z.array(z.string()).default([]),
+  on_failure: z.enum(['abort', 'retry', 'escalate', 'continue']).optional(),
+  parallel_safe: z.boolean().optional(),
+  /** Legacy step keys kept verbatim: `validation`, `inputs`, `phase`, `gates`… */
+  meta: z.record(z.string(), z.unknown()).default({}),
+}).strict()
+
+export const WorkflowSchema = z.object({
+  /** Equal to the file stem, lowercase. */
+  name: z.string().regex(WORKFLOW_ID),
+  description: z.string().optional(),
+  version: z.string().optional(),
+  steps: z.array(WorkflowStepSchema).min(1),
+  success_indicators: z.array(z.string()).optional(),
+  on_failure: z.enum(['abort', 'retry', 'escalate', 'continue']).optional(),
+  /** Legacy top-level keys kept verbatim: `harness`, `retry_policy`, `triggers`… */
+  extensions: z.record(z.string(), z.unknown()).default({}),
+}).strict()
 
 // ──────────────────────────────────────────────────────────────────────
 // Business Protocol v1
@@ -214,7 +308,11 @@ export const EmployeeFrontmatterSchema = z.object({
     : z.string().min(20),
   // maxTurns + self_score_contract: default-friendly so older businesses load
   // without a forced rewrite (matches the canonical pydantic defaults).
-  maxTurns: z.number().int().min(1).max(LIMITS.employee_max_turns_max!).default(400),
+  // 15 by owner decision (2026-09-12): a seat that has not finished in fifteen
+  // turns is looping, and the previous default of 400 let it burn wall clock
+  // before anyone saw it. A seat that genuinely needs more declares more — the
+  // ceiling is still LIMITS.employee_max_turns_max.
+  maxTurns: z.number().int().min(1).max(LIMITS.employee_max_turns_max!).default(15),
   reports_to: z.union([z.string().regex(/^[a-z][a-z0-9-]+$/), z.null()]).optional(),
   manages: z.array(z.string().regex(/^[a-z][a-z0-9-]+$/)).optional(),
   tools: z.array(z.string()).optional(),
@@ -232,6 +330,21 @@ export const EmployeeFrontmatterSchema = z.object({
   is_brief_intake: z.boolean().default(false),
   antagonizes: z.array(z.string()).optional(),
   squads_authorized: z.array(z.string().regex(KEBAB_CASE)).optional().nullable(),
+  // Business Protocol v2 (accepted, not yet read): pinned clones (max 2 — the
+  // prompt injects three at most), open squad preference, acceptance per role.
+  pinned_mind_clones: z.array(z.string()).max(2).optional(),
+  squads_preferred: z.array(z.string().regex(KEBAB_CASE)).optional(),
+  acceptance: z.array(z.object({
+    id: z.string().regex(ACCEPTANCE_ID),
+    description: z.string().min(1),
+    // Business Protocol 2.0 §11: a declared requirement blocks unless the
+    // author says otherwise — a non-blocking acceptance criterion is a note.
+    blocking: z.boolean().default(true),
+    minimum_score: z.number().min(0).max(1).optional(),
+    capability: z.string().optional(),
+    path: z.string().optional(),
+    min_bytes: z.number().int().min(0).optional(),
+  }).strict()).optional(),
   draws_from: z.array(z.object({
     source: z.string(),
     weight: z.number().min(0).max(1).optional(),
@@ -255,7 +368,11 @@ export const EmployeeFrontmatterSchema = z.object({
   squad_dispatched: z.array(z.string()).optional(),
   // Fields officialized 2026-05-21 so rich legacy employees (galinha-squads
   // generation) validate without rewrite — mirrors the canonical validators.py.
-  effort: z.enum(['low', 'medium', 'high']).optional(),
+  // The five levels `claude --effort` accepts and the range codex takes in
+  // `model_reasoning_effort`. It was three, so a seat could not declare the
+  // `xhigh` the owner's own codex config runs at. Optional, and absent means
+  // the dispatch passes NO effort — the CLI uses the user's default.
+  effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
   authority_level: z.enum(['tier-1', 'tier-2', 'tier-3']).optional(),
   assigned_mind_clones: z.array(z.string()).optional(),
   operation_mode: z.enum(['zero_human', 'hybrid', 'human_in_loop']).optional(),
@@ -271,7 +388,7 @@ export const EmployeeFrontmatterSchema = z.object({
 export const BusinessManifestSchema = z.object({
   name: z.string().regex(KEBAB_CASE),
   version: z.string().regex(SEMVER),
-  protocol: z.literal('1.0'),
+  protocol: z.enum(['1.0', '2.0']),
   description: z.string().min(20).max(LIMITS.business_description_max!),
   author: z.string().optional(),
   license: z.string().default('MIT'),
@@ -283,6 +400,17 @@ export const BusinessManifestSchema = z.object({
   example_briefs: z.array(z.string().min(20).max(LIMITS.business_example_briefs_item_max!)).max(LIMITS.business_example_briefs_max!).optional(),
   keywords: z.array(z.string().min(2).max(60)).max(LIMITS.business_keywords_max!).optional(),
   squads_authorized: z.array(z.string().regex(KEBAB_CASE)).optional().nullable(),
+  // Business Protocol v2 (accepted, not yet read): open preference list, routing
+  // fences and a per-run budget. The manifest is passthrough, so `not_for`
+  // stays as loose as it already was; the others are new keys.
+  squads_preferred: z.array(z.string().regex(KEBAB_CASE)).optional(),
+  // Business Protocol 2.0 §6.9. Bounded like a fence, not like prose: the
+  // router fires an entry <=25 chars by substring and a longer one by >=60%
+  // token overlap, and 902 of the 910 long entries measured across the library
+  // fired against no real brief at all. 80 chars is the ceiling above which an
+  // entry is a sentence; the count ceiling is configurable.
+  not_for: z.array(z.string().min(5).max(80)).max(LIMITS.business_not_for_max!).optional(),
+  run_budget_usd: z.number().min(0).optional(),
   operation_mode: z.enum(['zero_human', 'hybrid', 'human_in_loop']).default('zero_human'),
   output: z.object({
     base_dir: z.string().default('default'),
@@ -303,13 +431,15 @@ export const BusinessManifestSchema = z.object({
     }).strict().optional(),
   }).strict().optional(),
   runtime_requirements: z.object({
+    policy: z.enum(['declared', 'active']).default('active'),
     minimum: z.array(z.object({
       runtime: Runtime,
       version: z.string().optional(),
-    }).strict()).min(1),
+    }).strict()).min(1).optional(),
     compatible: z.array(z.unknown()).optional(),
     incompatible: z.array(z.unknown()).optional(),
-  }).strict(),
+  }).strict().refine((r) => r.policy === 'active' || (r.minimum?.length ?? 0) > 0,
+    'runtime_requirements.minimum is required when policy is declared'),
   features_required: z.array(Feature).optional(),
   features_optional: z.array(z.string()).optional(),
   env_required: z.array(z.string().regex(ENV_VAR)).optional(),
@@ -583,7 +713,7 @@ export const ApprovalChainSchema = z.object({
 export const RegistrySquadsSchema = z.object({
   schema_version: z.string().default('1.0.0'),
   generated_at: z.string().datetime(),
-  host_protocol_version: z.enum(['5.0', '4.0']),
+  host_protocol_version: z.enum(['6.0', '5.0', '4.0']),
   squads_root_dirs: z.array(z.string()),
   squads: z.record(
     z.string().regex(/^[a-z][a-z0-9-]+$/),
@@ -617,6 +747,32 @@ export const RegistrySquadsSchema = z.object({
       fidelity_status: FidelityStatus.optional(),
       invoke: z.record(z.string(), z.unknown()).optional(),
       score_boost: z.number().default(1.0),
+      // Discovery metadata the indexer has emitted since routing-360 Phase 2 —
+      // declared here so the strict write-schema describes the live registry.
+      produces: CapabilitySchema.shape.produces,
+      example_briefs: CapabilitySchema.shape.example_briefs,
+      keywords: CapabilitySchema.shape.keywords,
+      /** Body the capability executes, resolved through invoke.ref at index time. */
+      body_text: z.string().optional(),
+      // Contract, scheduling, overlay and v6 fields the registry stopped
+      // dropping. Shapes are borrowed from CapabilitySchema so the index can
+      // never accept something the manifest could not have declared; all
+      // optional, because the registry emits only what a capability declares.
+      inputs: CapabilitySchema.shape.inputs,
+      outputs: CapabilitySchema.shape.outputs,
+      tools_required: CapabilitySchema.shape.tools_required,
+      writes_paths: CapabilitySchema.shape.writes_paths,
+      contributions: CapabilitySchema.shape.contributions,
+      acceptance: CapabilitySchema.shape.acceptance,
+      evaluator: CapabilitySchema.shape.evaluator,
+      requires: CapabilitySchema.shape.requires,
+      consumes: CapabilitySchema.shape.consumes,
+      estimated_cost_usd: CapabilitySchema.shape.estimated_cost_usd,
+      fidelity: CapabilitySchema.shape.fidelity,
+      // Optional rather than defaulted: in a manifest these carry a default,
+      // in the registry their absence is the fact that nothing was declared.
+      model_hint: Model.optional(),
+      parallel_safe: z.boolean().optional(),
     }).strict()),
   ),
   domains: z.record(z.string().regex(SNAKE_CASE), z.array(z.string())).optional(),
@@ -631,7 +787,7 @@ export const RegistryBusinessesSchema = z.object({
     z.string().regex(/^[a-z][a-z0-9-]+$/),
     z.object({
       version: z.string(),
-      protocol: z.literal('1.0'),
+      protocol: z.enum(['1.0', '2.0']),
       manifest_path: z.string(),
       manifest_hash: z.string().regex(SHA256),
       // Routing signal (routing-360 Phase 2.1): manifest name + description are
@@ -648,6 +804,10 @@ export const RegistryBusinessesSchema = z.object({
       produces: z.array(z.string()).optional(),
       example_briefs: z.array(z.string()).optional(),
       keywords: z.array(z.string()).optional(),
+      // Business Protocol 2.0 §6.9: the exclusion fence. Declared by live
+      // businesses long before this, and dropped here — `.strict()` with no
+      // field meant the indexer could not emit it even if it read it.
+      not_for: z.array(z.string()).optional(),
     }).strict(),
   ),
 }).strict()
@@ -662,8 +822,15 @@ export interface BusinessLoadContext {
   org_chart: z.infer<typeof OrgChartSchema>
 }
 
-export function validateBusinessIntegrity(ctx: BusinessLoadContext): { valid: boolean; errors: string[] } {
+/**
+ * Cross-artifact integrity. Returns warnings alongside errors since Business
+ * Protocol 2.0: `employee_count` is derived from disk (§6.12), so a stale
+ * declaration is an authoring smell the gate reports, never a load failure.
+ * Callers that only read `errors` keep their old behavior.
+ */
+export function validateBusinessIntegrity(ctx: BusinessLoadContext): { valid: boolean; errors: string[]; warnings: string[] } {
   const errors: string[] = []
+  const warnings: string[] = []
 
   // BP7: businesses with > 5 employees MUST have antagonist
   if (ctx.employees.length > 5) {
@@ -734,13 +901,142 @@ export function validateBusinessIntegrity(ctx: BusinessLoadContext): { valid: bo
     }
   }
 
-  // Manifest employee_count matches
+  // Manifest employee_count (Business Protocol 2.0 §6.12: derived, not authored).
+  // All 61 live businesses declared it, the registry recomputed it from disk
+  // anyway, and a stale number failed the load — the author owned a value the
+  // system already knew. Divergence is now a warning; the gate strips the field.
   if (ctx.manifest.employee_count && ctx.manifest.employee_count !== ctx.employees.length) {
-    errors.push(`Manifest employee_count (${ctx.manifest.employee_count}) doesn't match actual count (${ctx.employees.length})`)
+    warnings.push(`Manifest employee_count (${ctx.manifest.employee_count}) doesn't match actual count (${ctx.employees.length}) — employee_count is derived (v2 §6.12)`)
   }
 
-  return { valid: errors.length === 0, errors }
+  return { valid: errors.length === 0, errors, warnings }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Mind-Clone Manifest (MANIFEST.yaml) — Zod mirror of
+// _shared/schemas/mind-clone.schema.json, reconciled against the library
+// (555 clones, 2026-08-26). Consumed by the admission gate
+// (_shared/lib/verify/kinds/mind-clone.ts). Shape and identity are strict;
+// what the validation pipeline produces (verdict, scores, dna_layers,
+// source_material) is optional here and reported by the gate as debt.
+// skills/_shared/tests/mind-clone-schema-parity.test.ts keeps keys and enums
+// of the JSON and this schema identical.
+// ──────────────────────────────────────────────────────────────────────
+
+export const MIND_CLONE_CATEGORY = /^[a-z][a-z0-9-]+$/
+
+export const MIND_CLONE_VALIDATION_VERDICTS = [
+  'APPROVED',
+  'APPROVED_LIMITED_CORPUS',
+  'COMPILED_FROM_CANONICAL_KNOWLEDGE',
+  'NEEDS_REVISION',
+  'REJECTED',
+  // Live in the library (11, 8 and 3 clones): admitted rather than rejected.
+  'ARCHETYPE_PERSONA',
+  'EXTRACTED_FROM_PUBLIC_CORPUS',
+  'PACKAGED_FROM_EXISTING_DOSSIER',
+] as const
+
+export const MIND_CLONE_ARTIFACT_STATUS = ['present', 'missing', 'pending'] as const
+
+export const MIND_CLONE_DNA_LAYER_KEYS = [
+  'L1_philosophies', 'L2_mental_models', 'L3_heuristics', 'L4_frameworks', 'L5_methodologies',
+] as const
+
+// The routing block per _shared/MIND_CLONE_ROUTING_CONTRACT.md. `when_to_use`
+// is the pre-split legacy of `serves`; `delegates_to` was retired on
+// 2026-08-18 and is tolerated (ignored) — the gate reports it, never rejects it.
+export const MindCloneRoutingSchema = z.object({
+  one_liner: z.string().optional(),
+  domains: z.array(z.string()).optional(),
+  serves: z.string().optional(),
+  when_to_use: z.string().optional(),
+  not_for: z.string().optional(),
+  refuses: z.array(z.string()).optional(),
+  delegates_to: z.array(z.string()).optional(),
+}).loose()
+
+export const MindCloneArtifactSchema = z.object({
+  path: z.string().min(1),
+  status: z.enum(MIND_CLONE_ARTIFACT_STATUS).optional(),
+  size_bytes: z.number().int().min(0).optional(),
+  sha256: z.string().optional(),
+}).loose()
+
+const layerCount = z.coerce.number().int().min(0).optional()
+export const MindCloneDnaLayersSchema = z.object({
+  L1_philosophies: layerCount,
+  L2_mental_models: layerCount,
+  L3_heuristics: layerCount,
+  L4_frameworks: layerCount,
+  L5_methodologies: layerCount,
+}).loose()
+
+const score = z.coerce.number().min(0).max(1).optional()
+export const MindCloneScoresSchema = z.object({
+  template_compliance: score,
+  source_coverage: score,
+  coherence: score,
+  completeness: score,
+}).loose()
+
+export const MindCloneManifestSchema = z.object({
+  manifest: z.object({
+    name: z.string().regex(KEBAB_CASE),
+    display_name: z.string().min(2).max(80),
+    version: z.string().regex(/^\d+\.\d+\.\d+$/),
+    category: z.string().regex(MIND_CLONE_CATEGORY).optional(),
+    tags: z.array(z.string().min(2).max(60)).optional(),
+    compiled_at: z.string().optional(),
+    compiled_by: z.string().optional(),
+    compilation_method: z.string().optional(),
+    source: z.string().optional(),
+  }).loose(),
+  routing: MindCloneRoutingSchema.optional(),
+  artifacts: z.union([
+    z.array(MindCloneArtifactSchema),
+    z.object({
+      required: z.object({
+        agent_md: z.object({ path: z.string() }).loose(),
+        soul_md: z.object({ path: z.string() }).loose(),
+        dna_config: z.object({ path: z.string() }).loose(),
+        dna_schema: z.object({ path: z.string() }).loose(),
+      }).loose(),
+      optional: z.record(z.string(), z.unknown()).optional(),
+    }).loose(),
+    // keyed map: { agent: "agent/AGENT.md" } or { agent: { path, status } }
+    z.record(z.string(), z.union([z.string(), z.object({ path: z.string() }).loose()])),
+  ]),
+  // Items are usually strings; a few clones write structured sources
+  // ({ name, type, ... }). Both are sources, neither is fabricated.
+  source_material: z.object({
+    primary: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
+    secondary: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
+  }).loose().optional(),
+  sources_detailed: z.union([
+    z.array(z.object({
+      name: z.string(),
+      type: z.string().optional(),
+      pages_read: z.number().int().min(0).optional(),
+      contribution: z.string().optional(),
+    }).loose()),
+    z.record(z.string(), z.unknown()),
+  ]).optional(),
+  scores: MindCloneScoresSchema.optional(),
+  validation_verdict: z.enum(MIND_CLONE_VALIDATION_VERDICTS).optional(),
+  validated_at: z.string().optional(),
+  validator: z.string().optional(),
+  caveat: z.string().optional(),
+  commercial_use_caveat: z.string().optional(),
+  dna_layers: MindCloneDnaLayersSchema.optional(),
+  warnings: z.array(z.string()).optional(),
+  broken_references: z.array(z.string()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  quality: z.record(z.string(), z.unknown()).optional(),
+  mind_clone: z.record(z.string(), z.unknown()).optional(),
+}).loose()
+
+export type MindCloneManifest = z.infer<typeof MindCloneManifestSchema>
 
 // ──────────────────────────────────────────────────────────────────────
 // Self-test

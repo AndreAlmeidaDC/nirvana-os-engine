@@ -10,6 +10,14 @@ npx @nirvana-os/cli
 
 The launcher fetches the latest engine, ensures Bun is present, and installs it. Nothing else to clone or configure.
 
+## Install as a skill
+
+```bash
+npx skills add gutomec/nirvana-os-engine -g
+```
+
+This installs the `nirvana` skill through [skills.sh](https://skills.sh) into every agent it detects (`-g` is user scope; without it the skill lands in the current project). The skill carries no engine: on first use, when `nrv` is missing, it explains what will change and runs its own `scripts/bootstrap.sh` (`bootstrap.ps1` on Windows), which ensures Bun, downloads the latest engine release and runs the same installer as the launcher above. Then say "use nirvana" in your agent. On Windows add `--copy` when symlinks are not enabled for your user. `npx skills update` refreshes the skill; `nrv update` refreshes the engine.
+
 ## Prerequisites
 
 - **Bun** ≥ 1.0 ([install](https://bun.sh)) — the runtime for everything. The launcher offers to install it if missing.
@@ -38,6 +46,8 @@ The launcher fetches the latest engine, ensures Bun is present, and installs it.
 The free engine ships no content, so there is no starter pack to copy. Curated packs install separately (see the README).
 
 **Idempotent.** Re-running is safe. Hooks you configured yourself are preserved; the Nirvana hooks are added once.
+
+**Settings.** `nrv config list` shows every operational switch with its effective value and where it comes from; `nrv config set <key> <value>` writes `~/.nirvana/config.yaml` (kept across `nrv update`) or, inside a project, `<project>/.nirvana/config.yaml`. An environment variable still wins over both. Reference: `docs/architecture/configuration.md`.
 
 ---
 
@@ -78,7 +88,7 @@ cd ~/projects/my-agentic-project
 claude        # or: agy, gemini, codex
 ```
 
-`nrv init` scaffolds `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.nirvana/`, and a `briefs/` folder. Any agent launched in this directory discovers the harness skill and routes briefs through it.
+`nrv init` scaffolds `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.env` and `.nirvana/` (with `squads/`, `businesses/`, `mind-clones/`). Any agent launched in this directory discovers the harness skill and routes briefs through it; the orchestrator writes its enriched briefs under `.nirvana/briefs/` as it goes.
 
 ---
 
@@ -104,6 +114,24 @@ To also wipe runtime data:
 rm -rf ~/.harness-logs/
 rm -rf ~/squads/ ~/businesses/    # this deletes your capability library
 ```
+
+---
+
+## Windows: the user PATH
+
+On Windows the installer adds `%USERPROFILE%\.local\bin` to the **user** PATH in the registry (`HKCU\Environment\Path`) and broadcasts the change, so `nrv` resolves in new terminals without a logoff. Two things keep that write from landing where it should not:
+
+- **`NIRVANA_SKIP_PATH_PERSIST=1`** skips the registry write and the broadcast (and the shell-profile append on macOS and Linux). The current process still gets `.local\bin` on its own PATH. The engine tests set it whenever they install into a temporary HOME.
+- **A temporary HOME is never persisted.** When `%USERPROFILE%\.local\bin` resolves under `%TEMP%`, `%TMP%`, `%LOCALAPPDATA%\Temp` or the process tmpdir, the installer says so and leaves the registry alone, flag or not.
+
+Engines up to 0.8.0 had neither, and running the test suite on Windows left `%TEMP%\nrv-*\home\.local\bin` entries on the real user PATH (issue #87). `nrv doctor` reports them. To remove them:
+
+```bash
+nrv install --repair-path          # lists the temporary nrv-* entries, writes nothing
+nrv install --repair-path --apply  # removes exactly those, keeps every other entry and its order
+```
+
+The repair rewrites the value with the kind it had (a `REG_EXPAND_SZ` stays unexpanded) and broadcasts `WM_SETTINGCHANGE`. Open a new terminal to see the clean PATH.
 
 ---
 

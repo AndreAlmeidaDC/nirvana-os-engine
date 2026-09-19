@@ -29,6 +29,18 @@
  *     MAX_ARGV_PROMPT_BYTES (agy, kimi, opencode) or pi's native @file
  *     attachment (pi).
  * Verification notes (per-CLI --help audits) live on each adapter below.
+ *
+ * HEADLESS AUTONOMY: a non-interactive child cannot answer an approval prompt,
+ * so every adapter whose CLI documents an approval-bypass flag passes it by
+ * default, in BOTH layers (per-CLI --help audits, 2026-08-26: claude
+ * --dangerously-skip-permissions, codex --dangerously-bypass-approvals-and-
+ * sandbox, gemini --approval-mode yolo, agy --dangerously-skip-permissions,
+ * grok --always-approve). NIRVANA_HEADLESS_SKIP_PERMISSIONS=0 turns the bypass
+ * off everywhere (headlessSkipPermissions): the light layer then omits the
+ * flag and runHeadless takes each runner's restricted path (the --safe path).
+ * CLIs whose flag could not be verified here (kimi, qwen, opencode) and pi,
+ * whose --approve is project-file trust rather than tool permission, stay as
+ * they are.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -37,7 +49,26 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { resolveSystemModel } from "./system-model.ts";
+import { EFFORT_LEVELS, isEffortLevel, resolvePinnedEffort, resolveSystemModel } from "./system-model.ts";
+import { resolveSetting } from "./settings.ts";
+import { childEnv } from "./orca.ts";
+import { childEnvFor, type ChildEnvMode } from "./child-env.ts";
+import { childDepth, currentDepth, currentRole, DEFAULT_MAX_DEPTH, DEPTH_ENV, mayDispatch, refusalMessage, roleMayDispatch, roleRefusalMessage, ROLE_ENV, type DispatchRole } from "./dispatch-depth.ts";
+import { runOrcaWorker } from "./orca-worker.ts";
+
+/** `execution.child_env`. The variable NIRVANA_CHILD_ENV wins over any file
+ *  (settings precedence), which is how a child that was itself filtered — it
+ *  carries the stamp — filters its own children the same way. */
+/** `execution.max_dispatch_depth`; 0 or less means unlimited. */
+function maxDispatchDepth(): number {
+  try { const v = Number(resolveSetting("execution.max_dispatch_depth").value); return Number.isFinite(v) ? v : DEFAULT_MAX_DEPTH; }
+  catch { return DEFAULT_MAX_DEPTH; }
+}
+
+function childEnvModeSetting(): ChildEnvMode {
+  try { return String(resolveSetting("execution.child_env").value) === "declared" ? "declared" : "inherit"; }
+  catch { return "inherit"; }
+}
 
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
@@ -45,9 +76,49 @@ const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
 // ── shared delivery helpers ───────────────────────────────────────────────
 
 /** Prompts above this byte count never travel as a single argv element.
+ *
  * Linux MAX_ARG_STRLEN is 128 KiB per argument; macOS shares ~256 KiB across
- * argv+env. 100 KB keeps clear of both with room for the other flags. */
-export const MAX_ARGV_PROMPT_BYTES = 100_000;
+ * argv+env. 100 KB keeps clear of both with room for the other flags.
+ *
+ * Windows is an order of magnitude tighter, and it has TWO limits rather than
+ * one: `CreateProcess` caps the whole command line at 32,767 UTF-16 chars, and
+ * anything routed through the command interpreter caps at 8,191. Which of the
+ * two applies is decided per CLI at spawn time by `resolveExecutable` — a `.cmd`
+ * shim whose target cannot be read keeps the `shell: true` route — so the guard
+ * has to assume the tighter one. The budget is the whole line, not the prompt,
+ * so the prompt gets 6 KB and the flags, the model name, every `--add-dir` and
+ * the interpreter's own path share the remaining ~2 KB. `driver-autonomy-flags`
+ * measured a real 6,251-char line on this route and called it "far under 8191";
+ * this keeps a prompt from being what pushes it over.
+ *
+ * A single POSIX-sized number here was not a theoretical gap: the argv adapters
+ * (agy, kimi, opencode, pi) would hand Windows a command line between 32 KB and
+ * 100 KB believing it safe, and the interpreter route would cut it at 8 KB.
+ *
+ * KNOWN TRADE-OFF, measured: AUTONOMOUS_DIRECTIVE is 2,873 bytes (5,942 until 0.13.9) and
+ * `withPreamble` merges it ahead of every prompt, so on Windows the argv branch
+ * is effectively unreachable for those four adapters — every dispatch takes the
+ * temp-file route. That is deliberate rather than accidental, because no number
+ * fixes it: the interpreter's whole budget is 8,191, so directive plus any real
+ * prompt cannot fit there regardless. The file channel is the lossless one —
+ * grok-cli prefers it unconditionally on every platform for exactly that reason.
+ * What it costs is a dependency on the child obeying "read this file", which
+ * argv does not have. Making the budget depend on which route `resolveExecutable`
+ * will actually take (32,767 direct, 8,191 under the interpreter) is the fix that
+ * would restore argv for the direct route; it needs the cli name here, which this
+ * helper does not currently receive. */
+export const MAX_ARGV_PROMPT_BYTES = process.platform === "win32" ? 6_000 : 100_000;
+
+/** The one switch for headless autonomy: the `execution.headless_skip_permissions`
+ * setting. Its variable at `0` (also `false`, `off`, `no`), or `false` in the
+ * project or global config, keeps every headless child on its CLI's own
+ * approval path; anything else, unset included, is the autonomous default. */
+export const HEADLESS_SKIP_PERMISSIONS_ENV = "NIRVANA_HEADLESS_SKIP_PERMISSIONS";
+
+/** True unless the setting (env > project > global config) disables the permission bypass. */
+export function headlessSkipPermissions(): boolean {
+  return resolveSetting("execution.headless_skip_permissions").value;
+}
 
 /** Max persona chars accepted by --append-system-prompt-style flags. */
 const PERSONA_MAX_CHARS = 8_000;
@@ -94,8 +165,8 @@ export function salientError(stderr: string, fallback: string, max = 500): strin
   return chosen.length <= max ? chosen : chosen.slice(0, max - 1) + "…";
 }
 
-function writePromptFile(prompt: string): string {
-  const f = path.join(os.tmpdir(), `nrv-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
+function writePromptFile(prompt: string, prefix = "nrv-prompt"): string {
+  const f = path.join(os.tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
   fs.writeFileSync(f, prompt, "utf8");
   return f;
 }
@@ -117,10 +188,83 @@ function removeTmpFiles(files: string[] | undefined): void {
   }
 }
 
-function whichSync(cli: string): string | null {
-  const r = spawnSync(process.platform === "win32" ? "where" : "command", ["-v", cli], { encoding: "utf8", env: process.env });
+/** Every prefix writePromptFile is ever called with (default "nrv-prompt",
+ * plus claudeDirectiveArgs' "nrv-directive"). One place, so the reaper below
+ * can never drift from what this module actually creates. */
+const TMP_FILE_PREFIXES = ["nrv-prompt-", "nrv-directive-"];
+
+/**
+ * Process-wide safety net for the one gap a `finally`/`settle()` cannot close:
+ * a process killed by an external signal while blocked inside spawnSync never
+ * runs its own cleanup. Verified on this machine (Bun 2026-08-29): a
+ * `process.on('SIGTERM', ...)` handler does not help either — the callback is
+ * deferred until the blocking spawnSync call itself returns, so it cannot fire
+ * while the process is stuck waiting on a hung child, which is exactly the
+ * case the supervisor's kill exists for. SIGKILL cannot be caught at all, by
+ * either mechanism.
+ *
+ * This is why every adapter's own try/finally stays as-is (correct for normal
+ * exit, error, and spawnSync's own timeout-to-CHILD) and the file it cannot
+ * reach is instead swept by a SEPARATE, later-running process that never
+ * shares the killed process's fate. Call this from that other process (the
+ * supervisor sweep), never from the same run that might leak — a self-reap
+ * would need the very JS execution the leak scenario denies it.
+ *
+ * `maxAgeMs` defaults to 24h: comfortably longer than any lease-driven kill
+ * or retry cycle (minutes), so it can never race a legitimately slow but
+ * still-live run's file, while reliably reclaiming anything orphaned by a
+ * kill.
+ */
+export function reapOrphanedPromptFiles(opts: { dir?: string; maxAgeMs?: number } = {}): string[] {
+  const dir = opts.dir ?? os.tmpdir();
+  const maxAgeMs = opts.maxAgeMs ?? 24 * 60 * 60_000;
+  const now = Date.now();
+  const removed: string[] = [];
+  let entries: string[];
+  try { entries = fs.readdirSync(dir); } catch { return removed; }
+  for (const name of entries) {
+    if (!TMP_FILE_PREFIXES.some((p) => name.startsWith(p))) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isFile() || now - st.mtimeMs < maxAgeMs) continue;
+      fs.rmSync(full, { force: true });
+      removed.push(full);
+    } catch { /* raced with its own creator/consumer — not our problem */ }
+  }
+  return removed;
+}
+
+/** The "where does this CLI live" probe, per platform. Windows `where` takes its options with a
+ * slash (`WHERE [/R dir] [/Q] ... pattern...`), so the `-v` this used to pass was read as a SECOND
+ * PATTERN, not a flag: the probe asked for a file named `-v` as well and answered about both. On
+ * POSIX the probe stays the `command -v` builtin, which is shell-only and therefore normally fails
+ * here — the manual PATH scan below is its real path. */
+export function whichProbe(cli: string, platform: NodeJS.Platform = process.platform): { command: string; args: string[] } {
+  return platform === "win32" ? { command: "where", args: [cli] } : { command: "command", args: ["-v", cli] };
+}
+
+/** The first real path in a probe's stdout. `where` ends every line with CRLF and prints ONE LINE
+ * PER MATCH, so splitting on "\n" alone left a trailing "\r" on the chosen line whenever there was
+ * more than one match. `/\.(cmd|bat)$/i` then failed on a path that plainly ends in `.cmd`, and
+ * resolveExecutable spawned it without a shell — the exact "probe says yes, invocation dies" split
+ * this module exists to prevent. */
+export function firstExecutablePath(stdout: string): string | null {
+  for (const line of (stdout || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+export function whichSync(cli: string): string | null {
+  const probe = whichProbe(cli);
+  const r = spawnSync(probe.command, probe.args, { encoding: "utf8", env: process.env });
   // bash builtin `command` is shell-only; fallback to PATH scan
-  if (r.status === 0 && r.stdout.trim()) return r.stdout.trim().split("\n")[0];
+  if (r.status === 0) {
+    const found = firstExecutablePath(r.stdout);
+    if (found) return found;
+  }
   // Manual PATH scan. The Windows extension list is not decoration: an agent CLI
   // installed by npm is `<name>.cmd`, never a bare file, so a scan that only
   // tried `.exe` reported "not installed" for a runtime sitting right there.
@@ -135,6 +279,192 @@ function whichSync(cli: string): string | null {
   return null;
 }
 
+// ── Windows: spawn what the shim names, not the shim ──────────────────────
+//
+// An agent CLI installed through npm is a `.cmd` on Windows, and every `.cmd`
+// had been started through `cmd.exe`, which ends the command line at the first
+// CR/LF of any argument, quoted or not (the parser's limit, not the quoting's).
+// That cost the claude runner both `--add-dir` grants and its permission flag,
+// and the eight other adapters carry the same shape.
+//
+// The shim itself is not the program. It is a five-line batch file whose only
+// job is to run `node <script> %*`. Reading it, taking the pair it names and
+// spawning THAT removes the interpreter from the chain entirely: the child
+// starts the same way a real `.exe` already does on this platform, with nothing
+// left to cut anything.
+//
+// Reading is deliberately literal-minded. A shim whose shape does not match
+// what these functions can name with certainty produces no candidate, and the
+// caller falls back to the `cmd.exe` path. Degrading is acceptable; guessing is
+// not, so every guard below refuses rather than assumes:
+//
+//   - positional arguments (`%1`, `%~2`) or `SHIFT`: the wrapper rearranges
+//     what it forwards, so `%*` no longer proves the arguments pass intact;
+//   - a `SET` of anything but the three variables npm/pnpm/yarn shims use, an
+//     environment the direct spawn would not reproduce;
+//   - a variable that survives expansion, since we cannot name what would run;
+//   - `%*` anywhere but as the last token, so arguments land somewhere we did
+//     not read;
+//   - an interpreter or script that is not on disk, or an interpreter that is
+//     itself a `.cmd`, which would only re-enter the trap.
+
+/** A shim is a few hundred bytes. Anything bigger is a batch program doing work
+ * of its own, and reading it as a launcher would be a guess. */
+const MAX_SHIM_BYTES = 16 * 1024;
+
+/** `%1`, `%~2`, `%0` — argument reshuffling. `%~dp0` and `%*` do not match. */
+const SHIM_POSITIONAL = /%~?[0-9]/;
+const SHIM_SHIFT = /^[\s@]*shift\b/im;
+const SHIM_SET = /^[\s@]*set\s+"?([A-Za-z_][A-Za-z0-9_]*)\s*=/gim;
+const SHIM_PROG_SET = /^[\s@]*set\s+(?:"_prog=([^"\r\n]*)"|_prog=([^\r\n]*))/gim;
+/** `dp0` and `_prog` are the shim's own two variables; `PATHEXT` is the tweak
+ * that keeps its `node` from resolving to a `.js`, which is program resolution
+ * we do ourselves below. Any other assignment is an environment we would drop. */
+const SHIM_SET_ALLOWED = new Set(["dp0", "_prog", "pathext"]);
+
+/** Split one command fragment into arguments the way the interpreter would:
+ * double quotes group, unquoted whitespace separates, `""` stays an argument. */
+function tokenizeCmdFragment(fragment: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let started = false;
+  let quoted = false;
+  for (const ch of fragment) {
+    if (ch === '"') { quoted = !quoted; started = true; continue; }
+    if (!quoted && /\s/.test(ch)) {
+      if (started) { tokens.push(current); current = ""; started = false; }
+      continue;
+    }
+    current += ch;
+    started = true;
+  }
+  if (started) tokens.push(current);
+  return tokens;
+}
+
+/** Index of the last `&` or `|` outside quotes. The modern npm shim hides its
+ * real invocation behind both:
+ * `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "…" %*`. */
+function lastCommandSeparator(line: string): number {
+  let quoted = false;
+  let at = -1;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { quoted = !quoted; continue; }
+    if (!quoted && (ch === "&" || ch === "|")) at = i;
+  }
+  return at;
+}
+
+/** Shims are written with `\`; this module has to compare against real paths.
+ * On Windows the swap is the identity (`path.sep` IS `\`), which is also what
+ * lets the win32 branch be exercised on a POSIX runner. Only tokens that carry
+ * a separator are touched, so a flag survives byte for byte. */
+function normalizeShimPath(value: string): string {
+  if (!/[\\/]/.test(value)) return value;
+  return path.normalize(path.sep === "/" ? value.replace(/\\/g, "/") : value);
+}
+
+/** Expand the three variables a shim uses, or null when anything else survives:
+ * an unexpanded `%VAR%` means we cannot name what the shim would run. */
+function expandShimToken(token: string, dp0: string, prog: string | null): string | null {
+  let out = token.replace(/%~dp0/gi, () => dp0).replace(/%dp0%/gi, () => dp0);
+  if (prog !== null) out = out.replace(/%_prog%/gi, () => prog);
+  if (out.includes("%")) return null;
+  return normalizeShimPath(out);
+}
+
+/**
+ * Every invocation a shim names, best first — nothing is checked against the
+ * filesystem here, which keeps this half testable as pure text.
+ *
+ * Order mirrors the shim's own `IF EXIST`: the interpreter sitting beside the
+ * shim (`%~dp0\node.exe`) is offered before the bare name it falls back to, in
+ * both the modern `_prog` form and the older two-branch one.
+ */
+export function parseCmdShim(text: string, shimPath: string): Array<{ program: string; args: string[] }> {
+  if (SHIM_POSITIONAL.test(text) || SHIM_SHIFT.test(text)) return [];
+  SHIM_SET.lastIndex = 0;
+  for (let m = SHIM_SET.exec(text); m; m = SHIM_SET.exec(text)) {
+    if (!SHIM_SET_ALLOWED.has(m[1].toLowerCase())) { SHIM_SET.lastIndex = 0; return []; }
+  }
+  const dp0 = path.dirname(shimPath) + path.sep;
+  const progs: string[] = [];
+  SHIM_PROG_SET.lastIndex = 0;
+  for (let m = SHIM_PROG_SET.exec(text); m; m = SHIM_PROG_SET.exec(text)) {
+    const raw = (m[1] ?? m[2] ?? "").trim();
+    const expanded = raw ? expandShimToken(raw, dp0, null) : null;
+    if (expanded) progs.push(expanded);
+  }
+
+  const candidates: Array<{ program: string; args: string[] }> = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.includes("%*")) continue;
+    const cut = lastCommandSeparator(line);
+    const tokens = tokenizeCmdFragment((cut >= 0 ? line.slice(cut + 1) : line).replace(/^[\s@]+/, ""));
+    // `%*` last and alone is the whole proof that the arguments pass through
+    // untouched. Anything else is a wrapper we did not read.
+    if (tokens.length < 2 || tokens[tokens.length - 1] !== "%*") continue;
+    if (tokens.slice(0, -1).some(t => t.includes("%*"))) continue;
+    const usesProg = /%_prog%/i.test(tokens[0]);
+    for (const prog of usesProg ? progs : [null]) {
+      const program = expandShimToken(tokens[0], dp0, prog);
+      if (!program) continue;
+      const args = tokens.slice(1, -1).map(t => expandShimToken(t, dp0, prog));
+      if (args.some(a => a === null)) continue;
+      candidates.push({ program, args: args as string[] });
+    }
+  }
+  return candidates;
+}
+
+function isFile(candidate: string): boolean {
+  try { return fs.statSync(candidate).isFile(); } catch { return false; }
+}
+
+/** A flag passes through untouched; anything carrying a separator is a path the
+ * shim expects to exist, and if it does not we did not read the shim right. */
+function shimArgPresent(arg: string): boolean {
+  return !/[\\/]/.test(arg) || isFile(arg);
+}
+
+/** The named interpreter as a real executable. A path is taken as given — this
+ * is the `%~dp0` case, where node sits beside the shim and need not be on PATH
+ * at all. A bare name is looked up on PATH, which is what the shim's own ELSE
+ * branch asks `cmd.exe` for. Another `.cmd` is refused: resolving one would
+ * only re-enter the trap this whole path exists to leave. */
+function resolveShimProgram(program: string): string | null {
+  const bases = /[\\/]/.test(program) || /^[A-Za-z]:/.test(program)
+    ? [program]
+    : (process.env.PATH || "").split(path.delimiter).filter(Boolean).map(dir => path.join(dir, program));
+  for (const base of bases) {
+    for (const full of [base, base + ".exe", base + ".com"]) {
+      if (/\.(cmd|bat)$/i.test(full)) continue;
+      if (isFile(full)) return full;
+    }
+  }
+  return null;
+}
+
+/** The interpreter and leading arguments a `.cmd`/`.bat` names, or null when its
+ * shape is not one we can read with certainty — in which case the caller keeps
+ * the `cmd.exe` path it has always used. */
+export function resolveShimTarget(shimPath: string): { program: string; args: string[] } | null {
+  let text: string;
+  try {
+    const stat = fs.statSync(shimPath);
+    if (!stat.isFile() || stat.size > MAX_SHIM_BYTES) return null;
+    text = fs.readFileSync(shimPath, "utf8");
+  } catch { return null; }
+  for (const candidate of parseCmdShim(text, shimPath)) {
+    const program = resolveShimProgram(candidate.program);
+    if (!program) continue;
+    if (!candidate.args.every(shimArgPresent)) continue;
+    return { program, args: candidate.args };
+  }
+  return null;
+}
+
 /**
  * How to actually START a CLI on this platform.
  *
@@ -144,15 +474,21 @@ function whichSync(cli: string): string | null {
  * yes and the invocation dies, which is the worst possible split. (Recent Node
  * makes it explicit, refusing to spawn a `.cmd` without a shell at all.)
  *
- * A batch file has to be started through the command interpreter, so `shell` is
- * required — and with a shell the arguments are re-parsed, which is why
- * `quoteForCmd` exists below. On POSIX this is the identity: same command, same
- * args, no shell, nothing to re-parse.
+ * A `.cmd` is not the program, though — it is a launcher naming one. When the
+ * shim can be read (`resolveShimTarget`), the interpreter and script it names
+ * are spawned directly and the command interpreter never enters the chain: no
+ * shell, nothing re-parsed, and no command line for `cmd.exe` to cut at a
+ * newline. A shim of an unrecognized shape keeps the old route — through the
+ * interpreter, with `quoteForCmd` on every argument.
+ *
+ * On POSIX this is the identity: same command, same args, no shell.
  */
 export function resolveExecutable(cli: string): { command: string; args: (a: string[]) => string[]; shell: boolean } {
   if (process.platform !== "win32") return { command: cli, args: a => a, shell: false };
   const resolved = whichSync(cli);
   if (resolved && /\.(cmd|bat)$/i.test(resolved)) {
+    const target = resolveShimTarget(resolved);
+    if (target) return { command: target.program, args: a => [...target.args, ...a], shell: false };
     return { command: quoteForCmd(resolved), args: a => a.map(quoteForCmd), shell: true };
   }
   // A real .exe (or nothing found — let the spawn report the honest ENOENT).
@@ -221,12 +557,15 @@ const RUNTIMES: RuntimeAdapter[] = [
     cli: "claude",
     // `claude -p` reads the prompt from STDIN when no positional is given
     // (same channel runClaudeCode uses) — argv stays small no matter the
-    // prompt size.
+    // prompt size. `claude --help` (audited 2026-08-26): "--dangerously-skip-
+    // permissions  Bypass all permission checks" — without it a headless
+    // child dies on the first tool that needs approval.
     buildCall(persona, userMsg) {
       // System model (what the user's session runs) propagated to the child —
       // without this, judge/gate/verify fell to the CLI default (sonnet)
       // instead of inheriting fable/opus. null → no --model (keeps the default).
       const args = ["-p", "--no-session-persistence", "--output-format", "json"];
+      if (headlessSkipPermissions()) args.push("--dangerously-skip-permissions");
       const model = resolveSystemModel("claude-code");
       if (model) args.push("--model", model);
       if (persona) args.push("--append-system-prompt", clampPersona(persona, "claude-code"));
@@ -269,9 +608,14 @@ const RUNTIMES: RuntimeAdapter[] = [
     cli: "codex",
     // `codex exec` with no positional PROMPT reads instructions from stdin
     // (verified via `codex exec --help`) — never pass the prompt via argv.
+    // Autonomy (`codex exec --help`, audited 2026-08-26): "--dangerously-
+    // bypass-approvals-and-sandbox  Skip all confirmation prompts and execute
+    // commands without sandboxing" — the same flag runCodex passes.
     buildCall(persona, userMsg) {
       const merged = persona ? `${persona}\n\n---\n\n${userMsg}` : userMsg;
-      return { args: ["exec"], input: merged };
+      const args = ["exec"];
+      if (headlessSkipPermissions()) args.push("--dangerously-bypass-approvals-and-sandbox");
+      return { args, input: merged };
     },
     parseStdout(stdout) { return stdout.trim(); },
     envHints: ["CODEX_HOME"],
@@ -282,12 +626,15 @@ const RUNTIMES: RuntimeAdapter[] = [
     // (audited 2026-08-06): -p/--print runs a single prompt non-interactively;
     // NO stdin channel and NO prompt-file flag documented, so large prompts
     // degrade to the temp-file bootstrap. --dangerously-skip-permissions for
-    // autonomous runs (without it agy halts waiting for approval).
+    // autonomous runs (without it agy halts waiting for approval; `agy --help`
+    // audited 2026-08-26: "Auto-approve all tool permission requests without
+    // prompting").
     name: "antigravity-cli",
     cli: "agy",
     buildCall(persona, userMsg) {
       const merged = persona ? `${persona}\n\n---\n\n${userMsg}` : userMsg;
-      return argvOrPromptFile(merged, (p) => ["-p", p, "--dangerously-skip-permissions"]);
+      const autonomy = headlessSkipPermissions() ? ["--dangerously-skip-permissions"] : [];
+      return argvOrPromptFile(merged, (p) => ["-p", p, ...autonomy]);
     },
     parseStdout(stdout) { return stdout.trim(); },
     envHints: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
@@ -298,9 +645,13 @@ const RUNTIMES: RuntimeAdapter[] = [
     // `gemini --help` (audited 2026-08-06): "-p ... Appended to input on
     // stdin (if any)" — stdin is a documented prompt channel. The prompt goes
     // via STDIN; `-p ""` keeps headless mode without duplicating content.
+    // Autonomy (`gemini --help`, audited 2026-08-26): "--approval-mode ...
+    // yolo (auto-approve all tools)" — the same flag runGemini passes.
     buildCall(persona, userMsg) {
       const merged = persona ? `${persona}\n\n---\n\n${userMsg}` : userMsg;
-      return { args: ["-p", ""], input: merged };
+      const args = ["-p", ""];
+      if (headlessSkipPermissions()) args.push("--approval-mode", "yolo");
+      return { args, input: merged };
     },
     parseStdout(stdout) { return stdout.trim(); },
     envHints: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
@@ -346,13 +697,17 @@ const RUNTIMES: RuntimeAdapter[] = [
   {
     // Grok Build CLI (`grok`, xAI). `grok --help` (audited 2026-08-06):
     // native `--prompt-file <PATH>` = "Single-turn prompt from a file" — the
-    // lossless channel for any prompt size.
+    // lossless channel for any prompt size. Autonomy (`grok --help`, audited
+    // 2026-08-26): "--always-approve  Auto-approve all tool executions" — the
+    // same flag runGrok passes.
     name: "grok-cli",
     cli: "grok",
     buildCall(persona, userMsg) {
       const merged = persona ? `${persona}\n\n---\n\n${userMsg}` : userMsg;
       const f = writePromptFile(merged);
-      return { args: ["--prompt-file", f], tmpFiles: [f] };
+      const args = ["--prompt-file", f];
+      if (headlessSkipPermissions()) args.push("--always-approve");
+      return { args, tmpFiles: [f] };
     },
     parseStdout(stdout) {
       try {
@@ -424,6 +779,14 @@ export function detectHost(opts: { preferred?: string } = {}): RuntimeAdapter | 
  * callHostAgent — dispatches a single LLM call through the host runtime.
  * Persona is the role's persona text (loaded from the agent .md). User
  * message is the actual task prompt.
+ *
+ * `timeoutMs` here is WALL CLOCK, and it is the one place in this file where
+ * that is not a defect but a limit: spawnSync blocks the event loop, so no
+ * timer can run and nothing can observe the child working. Say it plainly
+ * rather than let a caller assume the async contract. Work that may legitimately
+ * take a long time belongs in callHostAgentAsync (silence budget) or runHeadless
+ * (heartbeat sidecar); the default here is only large enough that the blocking
+ * path stops being the thing that kills a thinking model.
  */
 export function callHostAgent(persona: string, userMessage: string, opts: CallOpts = {}): HostCall | HostError {
   const host = opts.__testRuntime ?? detectHost({ preferred: opts.preferredHost });
@@ -436,9 +799,9 @@ export function callHostAgent(persona: string, userMessage: string, opts: CallOp
     const exec = resolveExecutable(host.cli);
     r = spawnSync(exec.command, exec.args(call.args), {
       encoding: "utf8",
-      timeout: opts.timeoutMs ?? 120_000,
+      timeout: opts.timeoutMs ?? DEFAULT_INACTIVITY_BUDGET_MS,
       maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env },
+      env: childEnv(),
       ...(exec.shell ? { shell: true } : {}),
       ...(call.input !== undefined ? { input: call.input } : {}),
     });
@@ -465,23 +828,58 @@ export function callHostAgent(persona: string, userMessage: string, opts: CallOp
  * run in parallel from the same process. Returns the same shape as
  * callHostAgent but as a Promise.
  *
- * Stall watchdog (opt-in): when `heartbeatMs > 0`, the driver tracks the
- * timestamp of the most recent stdout/stderr chunk. If no bytes arrive within
- * `heartbeatMs` (default 60_000), the driver classifies the call as stalled.
- * Behavior depends on `heartbeatMode`:
- *   - 'kill' (default): SIGTERM the child immediately, escalate to SIGKILL
- *     after 5s, resolve with `{ error: 'stall', stalled_after_ms, ... }`.
- *   - 'warn': resolve with stall signal but let the child keep running until
- *     timeout. Useful in tests or when caller wants to log without aborting.
+ * Two windows, one activity signal (`lastDataAt`, advanced by every
+ * stdout/stderr chunk):
+ *
+ *  - `timeoutMs` — the budget of SILENCE every call gets, default
+ *    DEFAULT_INACTIVITY_BUDGET_MS. Rearms on activity; resolves with
+ *    `{ error: 'inactivity_timeout', stalled_after_ms, ... }`.
+ *  - `heartbeatMs` — a TIGHTER opt-in window for callers whose adapter
+ *    streams. `heartbeatMode: 'kill'` (default) SIGTERMs and resolves with
+ *    `{ error: 'stall', ... }`; `'warn'` resolves early and lets the child run
+ *    on until the inactivity budget.
+ *
+ * `heartbeatMs` defaults to 0 — DISARMED — because most adapters here are not
+ * streaming: `claude -p --output-format json`, gemini, grok, kimi and
+ * antigravity all print one JSON object at the END of the call. For those,
+ * "no bytes yet" is not a stall signal, it is the normal shape of a call in
+ * progress, and the old 60 s default was a 60-second wall clock on an LLM
+ * wearing the name of an activity check. A caller that knows its child streams
+ * asks for the tighter window explicitly.
  *
  * The driver does not retry — that is the caller's job (see
- * `_shared/lib/host-agent-retry.js`). Audit events are emitted by callers,
- * not here, to keep the driver host-agnostic and free of cross-skill imports.
+ * `_shared/lib/host-agent-retry.js`). Cost telemetry is emitted by callers;
+ * the one event the driver emits itself is the kill (emitDriverAudit), because
+ * only the driver knows which rule fired.
  */
 export type HeartbeatMode = "kill" | "warn";
+
+/**
+ * Default budget of SILENCE for a light-layer call — 45 minutes.
+ *
+ * It replaced a 120 s WALL-CLOCK default, and both halves of that sentence
+ * were wrong. Measured on this machine's 557 Claude Code transcripts
+ * (123,318 gaps between two consecutive non-human entries, scoped to one
+ * sessionId and cut at compaction boundaries): p50 1.1 s, p95 28 s, p99 192 s.
+ * 1.8% of the pauses a model takes between two tool calls are longer than two
+ * minutes, 0.45% longer than ten, 0.089% longer than forty-five — and past an
+ * hour the count stops falling (90 → 77 → 71), which is the resumed-session
+ * floor rather than any real pause. 45 min is where the credible tail ends.
+ *
+ * It is a budget of silence, not of life: any byte on stdout/stderr rearms it,
+ * so a child that keeps working is never killed for working long. What it
+ * bounds is a child that has stopped saying anything at all.
+ */
+export const DEFAULT_INACTIVITY_BUDGET_MS = 45 * 60_000;
+
 export interface CallOpts {
+  /** Max ms of SILENCE before the child is killed (default
+   *  DEFAULT_INACTIVITY_BUDGET_MS). Rearmed by every stdout/stderr byte — this
+   *  is not a wall-clock lifetime. */
   timeoutMs?: number;
-  heartbeatMs?: number;            // 0 disables; default 60_000
+  /** Tighter opt-in stall window for callers whose adapter streams. Default 0
+   *  (disarmed) — see callHostAgentAsync's contract. */
+  heartbeatMs?: number;
   minBytesPerHeartbeat?: number;   // bytes counted toward "alive"; default 1
   heartbeatMode?: HeartbeatMode;   // default 'kill'
   /** Preferred runtime slug (e.g. from runtime-rules decideRuntime). Must
@@ -505,6 +903,32 @@ export interface CallOpts {
   __testRuntime?: any;
 }
 
+/** The audit module, or null when it cannot be loaded. Lazy for the same
+ *  reason emitCostAudit is: the driver must not depend on a sibling skill at
+ *  module init. */
+function loadAudit(): { emit?: (e: string, p: unknown, c?: unknown) => void } | null {
+  try { return require(path.join(SKILLS_ROOT, "harness", "lib", "audit.js")); }
+  catch { return null; }
+}
+
+/**
+ * A child the driver kills says WHY, in the audit, before it dies.
+ *
+ * Until this existed, a run killed by the global timeout reached its caller as
+ * `"<cli> exited null"` — the same message a crash produces, with nothing about
+ * the rule that fired or how long the child had been silent. Telemetry is
+ * fire-and-forget; the kill never waits on it.
+ */
+function emitDriverAudit(event: string, payload: Record<string, unknown>, opts: CallOpts): void {
+  const audit = loadAudit();
+  if (!audit?.emit) return;
+  try {
+    audit.emit(event, { caller_id: opts.caller_id || null, ...payload }, {
+      project_id: opts.project_id || process.env.NIRVANA_PROJECT_ID || null,
+    });
+  } catch { /* non-fatal */ }
+}
+
 /**
  * Fire-and-forget audit emission. Loaded lazily so the driver stays free of
  * cross-skill dependencies at module init.
@@ -514,10 +938,7 @@ function emitCostAudit(host: any, stdoutRaw: string, opts: CallOpts) {
   if (!host?.parseUsage) return;
   const usage = host.parseUsage(stdoutRaw);
   if (!usage) return;
-  let audit: any = null;
-  try {
-    audit = require(path.join(SKILLS_ROOT, "harness", "lib", "audit.js"));
-  } catch { return; }
+  const audit = loadAudit();
   if (!audit?.emit) return;
   try {
     audit.emit("cost_emission", {
@@ -541,14 +962,14 @@ export function callHostAgentAsync(persona: string, userMessage: string, opts: C
       resolve({ error: "no host agent CLI found on PATH (tried: " + RUNTIMES.map(r => r.cli).join(", ") + ")" });
       return;
     }
-    const heartbeatMs = opts.heartbeatMs ?? 60_000;
+    const heartbeatMs = opts.heartbeatMs ?? 0;
     const minBytes = opts.minBytesPerHeartbeat ?? 1;
     const mode: HeartbeatMode = opts.heartbeatMode ?? "kill";
 
     const call = adapterCall(host, persona || "", userMessage);
     const exec = resolveExecutable(host.cli);
     const child = spawn(exec.command, exec.args(call.args), {
-      env: { ...process.env },
+      env: childEnv(),
       ...(exec.shell ? { shell: true } : {}),
       stdio: [call.input !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -578,10 +999,8 @@ export function callHostAgentAsync(persona: string, userMessage: string, opts: C
     //   - keep.escalation: the SIGKILL escalation must outlive a stall-kill
     //     settle so a SIGTERM-ignoring child still dies; close clears it.
     //   - keep.timeout: in 'warn' mode the child keeps running after the
-    //     early resolve, so the global timeout stays armed; close clears it.
-    let globalTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      try { child.kill("SIGTERM"); } catch {}
-    }, opts.timeoutMs ?? 120_000);
+    //     early resolve, so the inactivity timer stays armed; close clears it.
+    let globalTimeout: ReturnType<typeof setTimeout> | null = null;
     let watchdog: ReturnType<typeof setInterval> | null = null;
     let killEscalation: ReturnType<typeof setTimeout> | null = null;
     let settled = false;
@@ -599,6 +1018,47 @@ export function callHostAgentAsync(persona: string, userMessage: string, opts: C
       settled = true;
       resolve(payload);
     };
+
+    // ── inactivity budget ──────────────────────────────────────────────────
+    // `timeoutMs` used to arm ONE setTimeout at spawn, so it fired on elapsed
+    // time and could not tell a model thinking from a dead socket. It now
+    // measures from the last byte: the timer rearms for whatever is left of the
+    // budget whenever the child has spoken since it was set, so a child that
+    // keeps writing outlives any elapsed time and only silence is fatal.
+    //
+    // It reads the same `lastDataAt` the stall watchdog reads — one activity
+    // signal, two windows, never two notions of "alive".
+    const inactivityBudgetMs = opts.timeoutMs ?? DEFAULT_INACTIVITY_BUDGET_MS;
+    const armInactivity = (ms: number) => {
+      globalTimeout = setTimeout(() => {
+        const silentMs = Date.now() - lastDataAt;
+        if (silentMs < inactivityBudgetMs) { armInactivity(inactivityBudgetMs - silentMs); return; }
+        globalTimeout = null;
+        stallSignaled = true;   // the watchdog must not fire a second verdict
+        emitDriverAudit("x_driver_child_killed", {
+          rule: "inactivity",
+          host: host.name,
+          budget_ms: inactivityBudgetMs,
+          silent_ms: silentMs,
+          bytes_received: bytesReceived,
+        }, opts);
+        try { child.kill("SIGTERM"); } catch {}
+        // Same escalation the stall path uses: a SIGTERM-ignoring child still
+        // dies, and `keep.escalation` lets that timer outlive this settle.
+        killEscalation = setTimeout(() => {
+          killEscalation = null;
+          try { child.kill("SIGKILL"); } catch {}
+        }, 5000);
+        settle({
+          error: "inactivity_timeout",
+          host: host.name,
+          exit_code: -1,
+          stalled_after_ms: silentMs,
+          bytes_received_before_stall: bytesReceived,
+        }, { escalation: true });
+      }, ms);
+    };
+    armInactivity(inactivityBudgetMs);
 
     if (heartbeatMs > 0) {
       const tickMs = Math.max(500, Math.floor(heartbeatMs / 2));
@@ -689,60 +1149,129 @@ export interface RunHeadlessOpts {
    * with exit 143). Callers that want a cap pass it explicitly (e.g. the fast
    * router sets 5 min; `nrv dispatch --timeout=<min>`). */
   timeoutMs?: number;
-  /** Bypass all permission checks (claude --dangerously-skip-permissions). */
+  /** Bypass all permission checks (claude --dangerously-skip-permissions and
+   * each runtime's equivalent). Default true; `false` is the restricted path
+   * (`nrv dispatch --safe`). NIRVANA_HEADLESS_SKIP_PERMISSIONS=0 forces
+   * `false` for every run (see headlessSkipPermissions). */
   yolo?: boolean;
+  /** Let this child open its own subagents (the runtime own Task/Agent tool).
+   *  Off by default: a dispatched worker produces the artifact, and the engine
+   *  is the only orchestrator. See the deny in the claude-code arg builder. */
+  allowSubagents?: boolean;
+  /** WHAT is being dispatched, so the role rule can be enforced: a business
+   *  employee may dispatch a squad, a squad may dispatch nothing. Absent means
+   *  the target is unknown, and then only the empty-allowance roles refuse. */
+  dispatchRole?: DispatchRole;
   /** Optional model override. Passed as `--model <id>` (or equivalent) to the
    * underlying CLI. Honors model hints from LLM_CASCADE entries. If unset,
    * each CLI uses its own configured default. */
   model?: string;
+  /** Optional effort override — `low | medium | high | xhigh | max`. Passed
+   * only to the CLIs that HAVE the concept: `claude --effort <level>` and
+   * codex's own `model_reasoning_effort` config key, overridden per run with
+   * `-c`. Unset (the default) passes nothing, so each CLI uses the effort its
+   * user configured: measured on this machine, `~/.codex/config.toml` carries
+   * `model_reasoning_effort = "xhigh"`, which is exactly the value a dispatch
+   * must not overwrite with a guess. A runtime with no effort flag warns once
+   * and runs without it rather than failing. */
+  effort?: string;
   /** Optional provider id for CLIs that support multi-provider config
    * (codex `--provider <id>` referencing [model_providers.<id>] in
    * ~/.codex/config.toml; qwen-code modelProviders[].id; pi's native
    * `--provider` — anthropic/openai/google/openrouter/ollama/…). Ignored by
    * CLIs that don't have this concept. */
   providerHint?: string;
+  /** Do not persist the session (codex `--ephemeral`). Off by default: the
+   * review loop and `nrv revise` resume sessions, and an ephemeral run leaves
+   * nothing to resume. A caller that will never come back opts in. */
+  ephemeral?: boolean;
+  /** JSON Schema file the final message must conform to (codex
+   * `--output-schema`). Runtimes without the flag ignore it. */
+  outputSchema?: string;
+  /** Image files attached to the prompt (codex `-i`). */
+  images?: string[];
+  /** Web search for this run (codex `-c web_search=…`). */
+  webSearch?: "live" | "indexed" | "cached" | "disabled";
   /** Dispatch-ledger heartbeat (routing-360 Phase 4). When present the run is
-   * SUPERVISED: a detached sidecar renews the run's lease while the child
-   * shows activity, and the global timeout DEFAULTS to 45 min (the old NONE
-   * default let a hung child run forever unobserved — pass timeoutMs
-   * explicitly for long book/PDF workloads). */
+   * SUPERVISED: a detached sidecar renews the run's lease while the child shows
+   * activity, and the wall clock falls back to LEDGER_DEFAULT_TIMEOUT_MS — a
+   * backstop above any real run, not a hang detector. What ends a hung run is
+   * the lease expiring DEFAULT_LEASE_SEC after the last sign of life. */
   ledger?: LedgerHeartbeatOpts;
-  /** Max ms without observed activity before the heartbeat STOPS renewing the
-   * lease (default 5 min). Only meaningful together with opts.ledger. */
+  /** Max ms without observed activity before the sidecar RECORDS the gap
+   * (`x_ledger_stall_observed`, the supervisor.stall_threshold_ms setting,
+   * 5 min). This is an early warning and kills nothing: the lease is what
+   * decides. Only meaningful together with opts.ledger. */
   stallBudgetMs?: number;
+  /** Human label for a host that shows one terminal per run (Orca names the
+   * worker tab with it): `business/employee`, `squad <slug>`, `agent-x`.
+   * Absent, the host labels the run by runtime. */
+  label?: string;
 }
 
 export interface LedgerHeartbeatOpts {
   /** Ledger run id (run-ledger.ts openRun). */
   runId: string;
   /** Directory watched for activity (the run's output dir). Activity = newest
-   * mtime under it advanced — activity-based, not existence-based. */
+   * mtime under it advanced — activity-based, not existence-based. Every file
+   * the sweep finds is also NAMED in an `artifact_touched` audit event, which
+   * is what the Glance reads to say where a run is. */
   watchDir?: string;
+  /** Ceiling on those `artifact_touched` events for this child; 0 reports none.
+   * Default: the supervisor.touch_events_max setting. */
+  touchEventsMax?: number;
   /** Ledger DB path override (tests). Default: resolveLedgerDbPath(). */
   dbPath?: string;
   /** Heartbeat check interval in ms (default 15s; tests shrink it). */
   intervalMs?: number;
-  /** Seconds each renewal extends the lease from now (default 600). */
+  /** Seconds each renewal extends the lease from now (default
+   * DEFAULT_LEASE_SEC). This is the window that decides a run is dead. */
   leaseSec?: number;
 }
 
 /**
- * Default wall-clock timeout for LEDGERED runs: 24h — a BACKSTOP, not the
- * hang detector. Real work legitimately runs for hours (a book, a season of
- * video, a large migration), and killing it on the clock destroys finished
- * work for no reason.
+ * Wall-clock backstop for LEDGERED runs: 7 days.
  *
- * What actually catches a hang is the activity-based heartbeat: the sidecar
- * renews the lease only while stdout/stderr bytes or output-dir mtimes
- * advance, and stops after `stallBudgetMs` (default 5 min) of silence. The
- * lease then expires and the supervisor sweeps the run — minutes after the
- * process really stalled, regardless of how long it was allowed to live. The
- * wall-clock ceiling exists only for the pathological case where a child
- * keeps emitting output forever without converging.
+ * The ceiling survives, and it moved. It survives because the activity signal
+ * cannot catch one failure by construction — a child that keeps emitting
+ * output forever without converging is indistinguishable from a child that is
+ * working, so something has to bound it. It moved because 24h was not above
+ * the work: this machine's ledger holds 371 runs, whose longest is 25.5h and
+ * whose longest DELIVERED one is 4.9h (p50 21min, p90 62min, p99 5.7h). A
+ * ceiling below the observed maximum is not a backstop, it is a second hang
+ * detector — a worse one, that kills finished work at the clock.
+ *
+ * 7 days sits ~7x above anything this system has produced, which is the whole
+ * point: it can never be the rule that ends real work, and a runaway is still
+ * noticed within a week instead of never.
+ *
+ * What actually catches a hang is the heartbeat sidecar: it renews the lease
+ * only while stdout/stderr bytes or output-dir mtimes advance, and stops when
+ * they do not. The lease then expires and the supervisor sweeps the run,
+ * DEFAULT_LEASE_SEC after the last sign of life, regardless of how long the
+ * run was allowed to live.
  *
  * Unledgered calls keep the historical no-timeout behavior (see timeoutMs).
  */
-export const LEDGER_DEFAULT_TIMEOUT_MS = 24 * 60 * 60_000;
+export const LEDGER_DEFAULT_TIMEOUT_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * How long a ledgered run stays leased after its last observed activity — the
+ * window that actually decides whether a run is alive, and therefore the one
+ * the measurement has to size.
+ *
+ * It was 600s. Ten minutes of silence is inside the normal behaviour of a
+ * working agent: of the 123,318 intra-turn gaps measured across this machine's
+ * transcripts, 0.45% exceed ten minutes, and the code that supervises the
+ * AGENTIC path already says so in its own comment ("a squad legitimately
+ * thinks for ten minutes between writes", AGENTIC_LEASE_SEC = 1800). The
+ * scripted path was left on the tighter window, so a long-thinking child had
+ * its lease expire while it worked and the supervisor read it as orphaned.
+ *
+ * Now the same 45 minutes the light layer tolerates: one number for "how long
+ * silence is allowed to mean nothing", whichever layer is asking.
+ */
+export const DEFAULT_LEASE_SEC = DEFAULT_INACTIVITY_BUDGET_MS / 1000;
 
 /** Effective timeout for a run: explicit timeoutMs always wins; a ledgered
  * run without one gets LEDGER_DEFAULT_TIMEOUT_MS; otherwise none. Exported
@@ -759,15 +1288,54 @@ export interface RunHeadlessResult {
   result: string;
   /** Native USD figure reported by the CLI itself. null = not reported. */
   costUsd: number | null;
+  /** The CLI's own result subtype when its output format carries one (claude-code:
+   * `success`, `error_max_turns`, `error_max_budget_usd`, `error_during_execution`).
+   * A caller that set `maxBudgetUsd` reads `error_max_budget_usd` here to tell a
+   * spent cap from any other failure. Absent on runtimes without the field. */
+  resultSubtype?: string;
   /** True when the CLI's output format carries NO native USD figure for this
    * run — "cost unknown", explicitly distinct from a reported $0. Downstream
    * (spend-tracker / cost-estimator) may still ESTIMATE from token counts;
    * this flag only states the CLI did not say. */
   costUnavailable?: boolean;
+  /** Token usage as the CLI itself reported it (codex `turn.completed.usage`).
+   * `cachedInputTokens` is the cached SUBSET of `inputTokens`, as OpenAI counts
+   * it; the cost estimator prices the two parts differently. */
+  usage?: { inputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+  /** Non-fatal notices the run produced: a CLI item of type `error` that did not
+   * fail the turn (codex: skills budget, an MCP server that did not start), or a
+   * grant this runtime's CLI has no flag for. Delivered, not swallowed. */
+  warnings?: string[];
   exitCode: number;
   stderr: string;
   durationMs: number;
   error?: string;
+}
+
+/**
+ * The flag each CLI takes to grant extra directories, or null when it has none.
+ * Nirvana hands every run the project dir, the outputs root and the business or
+ * squad dir on top of cwd; under a sandbox those grants are what lets a seat
+ * read its playbooks and write its deliverables. A runtime without a flag gets
+ * a warning on the result, never silence. Audited on the installed CLIs,
+ * 2026-09-05 (claude, codex 0.153, gemini, agy); qwen-code is a gemini-cli
+ * fork and takes the same flag, with a retry without it for older builds.
+ */
+export const RUNTIME_DIR_GRANT_FLAG: Record<Runtime, string | null> = {
+  "claude-code": "--add-dir",
+  codex: "--add-dir",
+  "gemini-cli": "--include-directories",
+  "antigravity-cli": "--add-dir",
+  "qwen-code": "--include-directories",
+  "kimi-cli": null,
+  "grok-cli": null,
+  pi: null,
+  opencode: null,
+};
+
+function noDirGrantWarning(runtime: Runtime, dirs: string[] | undefined): { warnings: string[] } | {} {
+  if (!dirs?.length) return {};
+  return { warnings: [`${runtime} has no directory-grant flag; not granted by the CLI: ${dirs.join(", ")}`] };
 }
 
 /** Conservative allowlist used only when the caller asks for safe mode
@@ -784,8 +1352,54 @@ export const DEFAULT_ALLOWED_TOOLS = ["Write", "Edit", "Read", "Glob", "Grep", "
 // the child's output to capture files (read back after exit for result
 // parsing).
 
+/** The effort to pass to THIS runtime, or null.
+ *
+ * Two CLIs have the concept: `claude --effort <level>` and codex's
+ * `model_reasoning_effort` config key. For every other runtime an effort the
+ * caller asked for cannot be honoured, and that is said once rather than
+ * silently dropped — the alternative would be a brief that says "use xhigh"
+ * appearing to have been obeyed. */
+const EFFORT_CAPABLE = new Set<string>(["claude-code", "codex"]);
+const effortWarned = new Set<string>();
+
+/** The requested effort a runtime cannot take, announced once. */
+function warnEffortUnsupported(opts: { effort?: string }, runtime: string): void {
+  const raw = (opts.effort ?? "").trim().toLowerCase() || resolvePinnedEffort() || "";
+  if (!raw || !isEffortLevel(raw) || EFFORT_CAPABLE.has(runtime)) return;
+  if (effortWarned.has(runtime)) return;
+  effortWarned.add(runtime);
+  console.error(`[effort] ${runtime} has no effort setting — the requested '${raw}' is not passed; the CLI runs at its own default.`);
+}
+
+function effortFor(opts: { effort?: string }, runtime: string): string | null {
+  const raw = (opts.effort ?? "").trim().toLowerCase() || resolvePinnedEffort() || "";
+  if (!raw) return null;
+  if (!isEffortLevel(raw)) {
+    if (!effortWarned.has(`bad:${raw}`)) {
+      effortWarned.add(`bad:${raw}`);
+      console.error(`[effort] '${raw}' is not one of ${EFFORT_LEVELS.join(" | ")} — passing no effort.`);
+    }
+    return null;
+  }
+  return EFFORT_CAPABLE.has(runtime) ? raw : null;   // the warn fires in dispatchToRunner
+}
+
 interface ManagedSpawnCtx { outFile: string; errFile: string }
 let managedCtx: ManagedSpawnCtx | null = null;
+
+/** The runtime the child being spawned IS. A CLI exports its session markers to
+ * everything it starts, so a codex child launched from a Claude Code session
+ * inherits `CLAUDECODE=1` and any `nrv` it runs would read the session as
+ * claude-code — the work would climb back to the vendor the user is not in.
+ * Stamping the target's own name closes that: `NIRVANA_HOST_RUNTIME` is the
+ * explicit override `detectCurrentHost` checks before any vendor marker, so a
+ * dispatched child answers with itself, on every OS and for the runtimes whose
+ * markers we could not measure. */
+let spawnAsRuntime: string | null = null;
+/** The role stamped on the next child. Same idiom and same safety as
+ *  spawnAsRuntime above: set by runHeadless immediately around a SYNCHRONOUS
+ *  spawn, saved and restored, so it cannot leak across calls. */
+let spawnAsRole: string | null = null;
 
 /** All runners spawn their child through this. Pass-through to spawnSync when
  * unledgered (zero behavior change); with an active ledger context, stdout/
@@ -801,7 +1415,26 @@ function driverSpawnSync(cmd: string, args: string[], options: SpawnSyncOptions 
   const exec = resolveExecutable(cmd);
   cmd = exec.command;
   args = exec.args(args);
-  options = { env: { ...process.env }, ...(exec.shell ? { shell: true } : {}), ...options };
+  // childEnv(): the live process.env minus Orca's pane identity, so a child the
+  // engine spawns inside an Orca terminal is not reported to Orca as that
+  // pane's agent (see _shared/lib/orca.js). Outside Orca it is process.env.
+  // childEnvFor(): in `declared` mode (execution.child_env, or NIRVANA_CHILD_ENV
+  // stamped by a parent that already filtered) the child sees only the base the
+  // OS needs, the engine's scope, the credentials of the runtime being spawned
+  // and the variables the installed squads declare — never the operator's
+  // whole environment.
+  const baseEnv = childEnvFor(childEnv(), { mode: childEnvModeSetting(), runtime: spawnAsRuntime ?? null });
+  // The child knows how deep it is, so ITS own dispatches count from here. The
+  // NIRVANA_ prefix survives the declared-mode allowlist, so the counter cannot
+  // be dropped by a filtered spawn.
+  baseEnv[DEPTH_ENV] = String(childDepth());
+  // And WHAT it is, so its own dispatches answer to the role rule.
+  if (spawnAsRole) baseEnv[ROLE_ENV] = spawnAsRole;
+  options = {
+    env: spawnAsRuntime ? { ...baseEnv, NIRVANA_HOST_RUNTIME: spawnAsRuntime } : baseEnv,
+    ...(exec.shell ? { shell: true } : {}),
+    ...options,
+  };
   if (!managedCtx) return spawnSync(cmd, args, options) as SpawnSyncReturns<string>;
   // "w" truncates between attempts (some runners retry without a flag); the
   // sidecar treats ANY size change as activity, so truncation is safe.
@@ -842,11 +1475,14 @@ function runWithLedgerHeartbeat(opts: RunHeadlessOpts, runner: (o: RunHeadlessOp
     "--run-id", led.runId,
     "--out", outFile, "--err", errFile, "--done", doneFile,
     "--interval", String(led.intervalMs ?? 15_000),
-    "--stall", String(opts.stallBudgetMs ?? 5 * 60_000),
-    "--lease", String(led.leaseSec ?? 600),
+    "--stall", String(opts.stallBudgetMs ?? resolveSetting("supervisor.stall_threshold_ms").value),
+    "--lease", String(led.leaseSec ?? DEFAULT_LEASE_SEC),
     "--parent", String(process.pid),
   ];
-  if (led.watchDir) sidecarArgs.push("--watch", led.watchDir);
+  if (led.watchDir) {
+    sidecarArgs.push("--watch", led.watchDir);
+    sidecarArgs.push("--touch-max", String(led.touchEventsMax ?? resolveSetting("supervisor.touch_events_max").value));
+  }
   if (led.dbPath) sidecarArgs.push("--db", led.dbPath);
 
   let sidecarPid: number | null = null;
@@ -913,12 +1549,12 @@ function runClaudeCode(opts: RunHeadlessOpts): RunHeadlessResult {
   const args: string[] = ["-p", "--output-format", "json"];
 
   if (opts.sessionId) args.push("--resume", opts.sessionId);
-  if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
-  // Model: caller's explicit value > system model (what the user's session
-  // runs) > CLI default. Without this, the child `claude -p` falls to the
-  // default (sonnet) instead of inheriting the interactive session's fable/opus.
+  // Model and effort: the caller's explicit value, else the user's pin, else
+  // NOTHING — a bare `claude` uses what the user configured in their claude.
   const ccModel = opts.model ?? resolveSystemModel("claude-code");
   if (ccModel) args.push("--model", ccModel);
+  const ccEffort = effortFor(opts, "claude-code");
+  if (ccEffort) args.push("--effort", ccEffort);
 
   // Trust by default. EXPLICIT caller settings (allowedTools / permissionMode)
   // always take precedence — so focused text-only calls like the brief-proxy or
@@ -944,16 +1580,47 @@ function runClaudeCode(opts: RunHeadlessOpts): RunHeadlessResult {
     args.push("--dangerously-skip-permissions");
   }
 
+  // A dispatched worker does not open its own agents. This is the leg of the
+  // recursion the engine cannot otherwise see: a depth counter only counts
+  // ENGINE dispatches, while the runtime's own subagent tool multiplies inside
+  // one child and never passes through here. Reported from a live run — two
+  // dispatches became fifteen agents, "each opening its own subagents, and
+  // those opened more".
+  //
+  // Denying is the right shape rather than narrowing --allowedTools: a worker
+  // legitimately needs the broad tool set to produce an artifact, and
+  // enumerating it would go stale on the next CLI release. `claude --help`
+  // (audited 2026-09-18) documents `--disallowedTools`, which applies as a deny
+  // list on top of the trust flags. Both spellings are passed because the tool
+  // was renamed across versions; a name the CLI does not know is inert.
+  //
+  // A caller that genuinely orchestrates — not a worker — opts back in with
+  // `allowSubagents: true`.
+  if (!opts.allowSubagents) args.push("--disallowedTools", "Task", "Agent");
+
   if (typeof opts.maxBudgetUsd === "number") args.push("--max-budget-usd", String(opts.maxBudgetUsd));
   for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
 
-  const r = driverSpawnSync("claude", args, {
-    cwd: opts.cwd,
-    input: opts.prompt,
-    encoding: "utf8",
-    ...(typeof opts.timeoutMs === "number" ? { timeout: opts.timeoutMs } : {}),
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  // The directive goes LAST, and under a shell it does not go through argv at all
+  // (claudeDirectiveArgs). Defence in depth: the file delivery is the cure, and last
+  // position means that even a runtime whose CLI lacks the file flag can only ever lose
+  // the tail of the directive — never an `--add-dir` grant or the permission mode, which
+  // is what a 6251-character command line silently dropped before this.
+  const directive = claudeDirectiveArgs(opts.appendSystemPrompt ?? "", resolveExecutable("claude").shell);
+  args.push(...directive.args);
+
+  let r!: SpawnSyncReturns<string>;
+  try {
+    r = driverSpawnSync("claude", args, {
+      cwd: opts.cwd,
+      input: opts.prompt,
+      encoding: "utf8",
+      ...(typeof opts.timeoutMs === "number" ? { timeout: opts.timeoutMs } : {}),
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } finally {
+    removeTmpFiles(directive.tmpFiles);
+  }
 
   const durationMs = Date.now() - started;
   const exitCode = r.status ?? (r.signal ? 124 : 1);
@@ -965,12 +1632,14 @@ function runClaudeCode(opts: RunHeadlessOpts): RunHeadlessResult {
   let sessionId: string | null = null;
   let result = "";
   let costUsd: number | null = null;
+  let resultSubtype: string | undefined;
   let isError = exitCode !== 0;
   try {
     const parsed = JSON.parse(stdout.trim());
     sessionId = parsed.session_id ?? null;
     result = typeof parsed.result === "string" ? parsed.result : JSON.stringify(parsed.result ?? "");
     costUsd = typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : null;
+    if (typeof parsed.subtype === "string") resultSubtype = parsed.subtype;
     if (typeof parsed.is_error === "boolean") isError = isError || parsed.is_error;
   } catch {
     // Non-JSON stdout (e.g. early crash). Keep raw for diagnostics.
@@ -984,10 +1653,18 @@ function runClaudeCode(opts: RunHeadlessOpts): RunHeadlessResult {
     result,
     costUsd,
     ...(costUsd === null ? { costUnavailable: true } : {}),
+    ...(resultSubtype !== undefined ? { resultSubtype } : {}),
     exitCode,
     stderr,
     durationMs,
-    error: isError ? salientError(stderr, "runtime returned an error verdict") : undefined,
+    // On an error verdict the claude CLI puts the cause in `result` and leaves
+    // stderr empty — so a caller reading `error` saw only the generic fallback
+    // while the real cause sat unread in the result field. When result is empty
+    // too (a budget or turn cap stops the run before any text), the subtype is
+    // the only thing that says why: `error_max_budget_usd` beats a bare verdict.
+    error: isError
+      ? salientError(stderr || (result === '""' ? "" : result), `runtime returned an error verdict${resultSubtype && resultSubtype !== "success" ? ` (${resultSubtype})` : ""}`)
+      : undefined,
   };
 }
 
@@ -997,13 +1674,24 @@ function withPreamble(opts: RunHeadlessOpts): string {
   return opts.appendSystemPrompt ? `${opts.appendSystemPrompt}\n\n---\n\n${opts.prompt}` : opts.prompt;
 }
 
-// Codex CLI (codex exec). Writes deliverables under cwd via the workspace-write
-// sandbox. Resume is a subcommand (`codex exec resume <id>`). Session id is
-// scraped best-effort from the --json event stream; if it can't be captured,
-// the run still completes but `nrv revise` for that project won't resume.
-// Prompt via STDIN (verified `codex exec --help`: no positional → stdin).
-// Cost: codex reports TOKEN COUNTS in turn.completed events, never a USD
-// figure → costUnavailable (the cost-estimator prices the tokens downstream).
+// Codex CLI (codex exec). Flags audited against codex 0.153.4 (`codex exec
+// --help`, 2026-09-05). Resume is a subcommand (`codex exec resume <id>`). The
+// session id comes from `thread.started.thread_id` in the --json stream; if it
+// cannot be captured the run still completes but `nrv revise` will not resume.
+// Prompt via STDIN (no positional → stdin). Cost: codex reports TOKEN COUNTS in
+// `turn.completed.usage`, never USD → costUnavailable, and the usage is handed
+// back whole so the cost-estimator prices cached input at the cached rate.
+//
+// Autonomy: trust (default) is `--dangerously-bypass-approvals-and-sandbox`.
+// --safe is `--approve-for-me`, which by itself means the workspace-write
+// sandbox (its own help says so, and 0.153.4 rejects it combined with `-s`:
+// "cannot be used with '--approve-for-me'", found by running it). The sandbox
+// stays, and every approval a human would answer goes to Codex's own reviewer
+// agent instead of blocking a run nobody is watching. `-s workspace-write`
+// alone used to be the safe path, and it stalled at the first escalation
+// because `exec` inherits `approval_policy` from the user's config.
+function isOpenAiModelId(m: string): boolean { return /^(gpt-|o[1-9]|codex)/i.test(m); }
+
 function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
   const started = Date.now();
   const lastMsg = path.join(os.tmpdir(), `codex-last-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
@@ -1011,20 +1699,63 @@ function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
     ? ["exec", "resume", opts.sessionId]
     : ["exec"];
   const args = [...base, "--json", "--skip-git-repo-check", "-C", opts.cwd, "-o", lastMsg];
+  // Only an OpenAI id reaches `--model`. resolveSystemModel returns the
+  // session's Claude alias when NIRVANA_MODEL is set — that is its contract —
+  // and `--model opus` is a hard error here, so anything that is not an OpenAI
+  // id is dropped and codex keeps its configured default.
   const cxModel = opts.model ?? resolveSystemModel("codex");
-  if (cxModel) args.push("--model", cxModel);
-  if (opts.providerHint) args.push("--provider", opts.providerHint);
-  // Trust by default; --safe (opts.yolo===false) → workspace-write sandbox.
-  if (opts.yolo === false) args.push("-s", "workspace-write");
+  if (cxModel && isOpenAiModelId(cxModel)) args.push("--model", cxModel);
+  // Effort is a config key here, not a flag: `-c model_reasoning_effort=...`
+  // overrides ~/.codex/config.toml for this run only. Passing nothing leaves
+  // the user's own value in force.
+  const cxEffort = effortFor(opts, "codex");
+  if (cxEffort) args.push("-c", `model_reasoning_effort=${JSON.stringify(cxEffort)}`);
+  // `--provider` no longer exists on `codex exec` ("unexpected argument" on
+  // 0.153); the provider is a config key, overridable per run with -c.
+  if (opts.providerHint) args.push("-c", `model_provider=${JSON.stringify(opts.providerHint)}`);
+  // Grants: under workspace-write only cwd is writable; the project dir, the
+  // outputs root and the business/squad dir come through --add-dir.
+  for (const d of opts.addDirs ?? []) args.push("--add-dir", d);
+  if (opts.ephemeral && !opts.sessionId) args.push("--ephemeral");
+  if (opts.outputSchema) args.push("--output-schema", opts.outputSchema);
+  for (const img of opts.images ?? []) args.push("-i", img);
+  if (opts.webSearch) args.push("-c", `web_search=${JSON.stringify(opts.webSearch)}`);
+  if (opts.yolo === false) args.push("--approve-for-me");
   else args.push("--dangerously-bypass-approvals-and-sandbox");
 
-  const r = driverSpawnSync("codex", args, {
+  const spawnOpts = {
     cwd: opts.cwd,
     input: withPreamble(opts),
-    encoding: "utf8",
+    encoding: "utf8" as const,
     ...(typeof opts.timeoutMs === "number" ? { timeout: opts.timeoutMs } : {}),
     maxBuffer: 64 * 1024 * 1024,
-  });
+  };
+  const warnings: string[] = [];
+  // Flags audited on 0.153.4 are not all on the Codex a client runs:
+  // --approve-for-me arrived in 0.147 (2026-08-07), --add-dir and --ephemeral
+  // later than the adapter's previous audit. clap answers an unknown flag with
+  // exit 2 and "error: unexpected argument '<flag>' found" before anything
+  // runs. Rather than turning every dispatch on an older Codex into that
+  // error, the optional flags are dropped one at a time as Codex names them,
+  // each drop recorded as a warning, and the run proceeds with what that
+  // version has. --approve-for-me falls back to the pre-0.147 restricted path.
+  const takesValue = new Set(["--add-dir", "-c", "--output-schema", "-i", "--model"]);
+  const droppable = new Set(["--add-dir", "--approve-for-me", "--ephemeral", "--output-schema", "-i", "-c", "--model"]);
+  let r = driverSpawnSync("codex", args, spawnOpts);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const m = (r.status ?? 1) !== 0 ? (r.stderr || "").match(/unexpected argument '([^']+)'/) : null;
+    const flag = m?.[1];
+    if (!flag || !droppable.has(flag) || !args.includes(flag)) break;
+    const next: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === flag) { if (takesValue.has(flag)) i++; continue; }
+      next.push(args[i]);
+    }
+    if (flag === "--approve-for-me") next.push("-s", "workspace-write");
+    warnings.push(`codex: this version does not know ${flag}; retried without it${flag === "--approve-for-me" ? " (restricted path is -s workspace-write, which stalls on the first approval)" : flag === "--add-dir" ? " (extra directories were not granted)" : ""}`);
+    args.length = 0; args.push(...next);
+    r = driverSpawnSync("codex", args, spawnOpts);
+  }
 
   const durationMs = Date.now() - started;
   const exitCode = r.status ?? (r.signal ? 124 : 1);
@@ -1032,6 +1763,7 @@ function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
 
   let sessionId: string | null = opts.sessionId ?? null;
   let streamError: string | null = null;
+  let usage: RunHeadlessResult["usage"];
   for (const line of (r.stdout || "").split("\n")) {
     const t = line.trim();
     if (!t.startsWith("{")) continue;
@@ -1040,7 +1772,8 @@ function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
       sessionId = j.session_id || j.thread_id || j.conversation_id || j?.session?.id || j?.msg?.session_id || sessionId;
       // Failure contract: exit 0 does not mean the turn succeeded. Terminal
       // `error` events / `turn.failed` mark failure; a LATER turn.completed
-      // (codex-internal retry) clears it.
+      // (codex-internal retry) clears it. An `item` of type `error` is a
+      // notice, not a failure — the turn goes on to completion after it.
       const evType = j.type ?? j?.msg?.type;
       if (evType === "error") {
         streamError = envelopeErrorMessage(j.message ?? j?.msg?.message ?? j) || "codex stream error event";
@@ -1048,6 +1781,18 @@ function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
         streamError = envelopeErrorMessage(j.error ?? j?.msg?.error) || "codex turn failed";
       } else if (evType === "turn.completed") {
         streamError = null;
+        const u = j.usage;
+        if (u && typeof u === "object") {
+          usage = {
+            inputTokens: Number(u.input_tokens) || 0,
+            cachedInputTokens: Number(u.cached_input_tokens) || 0,
+            cacheWriteInputTokens: Number(u.cache_write_input_tokens) || 0,
+            outputTokens: Number(u.output_tokens) || 0,
+            reasoningOutputTokens: Number(u.reasoning_output_tokens) || 0,
+          };
+        }
+      } else if (evType === "item.completed" && j.item?.type === "error" && j.item?.message) {
+        warnings.push(String(j.item.message));
       }
     } catch { /* not a json line */ }
   }
@@ -1066,6 +1811,8 @@ function runCodex(opts: RunHeadlessOpts): RunHeadlessResult {
   return {
     ok, runtime: "codex", sessionId, result,
     costUsd: null, costUnavailable: true, exitCode, stderr, durationMs,
+    ...(usage ? { usage } : {}),
+    ...(warnings.length ? { warnings } : {}),
     error: ok ? undefined : (streamError || salientError(stderr, "codex exec failed")),
   };
 }
@@ -1083,6 +1830,9 @@ function runGemini(opts: RunHeadlessOpts): RunHeadlessResult {
   else args.push("--session-id", sid);
   const gmModel = opts.model ?? resolveSystemModel("gemini-cli");
   if (gmModel) args.push("--model", gmModel);
+  // Workspace grants (`gemini --help`, audited 2026-09-05: "--include-directories
+  // Additional directories to include in the workspace", repeatable).
+  for (const d of opts.addDirs ?? []) args.push("--include-directories", d);
   // Trust by default (--yolo); --safe (opts.yolo===false) → auto_edit.
   args.push("--approval-mode", opts.yolo === false ? "auto_edit" : "yolo");
 
@@ -1288,6 +2038,7 @@ function runKimi(opts: RunHeadlessOpts): RunHeadlessResult {
   const ok = exitCode === 0 && streamError === null;
   return {
     ok, runtime: "kimi-cli", sessionId, result,
+    ...noDirGrantWarning("kimi-cli", opts.addDirs),
     costUsd, ...(costUsd === null ? { costUnavailable: true } : {}),
     exitCode, stderr, durationMs,
     error: ok ? undefined : (streamError || salientError(stderr, "kimi failed")),
@@ -1376,6 +2127,7 @@ function runGrok(opts: RunHeadlessOpts): RunHeadlessResult {
   const ok = exitCode === 0 && envelopeError === null;
   return {
     ok, runtime: "grok-cli", sessionId, result,
+    ...noDirGrantWarning("grok-cli", opts.addDirs),
     costUsd, ...(costUsd === null ? { costUnavailable: true } : {}),
     exitCode, stderr, durationMs,
     error: ok ? undefined : (envelopeError || salientError(stderr, "grok failed")),
@@ -1495,6 +2247,7 @@ function runPi(opts: RunHeadlessOpts): RunHeadlessResult {
 
   return {
     ok, runtime: "pi", sessionId, result,
+    ...noDirGrantWarning("pi", opts.addDirs),
     costUsd, ...(costUsd === null ? { costUnavailable: true } : {}),
     exitCode, stderr, durationMs,
     error: ok ? undefined : (streamError || salientError(stderr, "pi failed")),
@@ -1508,9 +2261,12 @@ function runPi(opts: RunHeadlessOpts): RunHeadlessResult {
 // resume). No native USD figure → costUnavailable.
 function runQwen(opts: RunHeadlessOpts): RunHeadlessResult {
   const started = Date.now();
-  const args = ["-p", ""];
+  let args = ["-p", ""];
   const qwModel = opts.model ?? resolveSystemModel("qwen-code");
   if (qwModel) args.push("--model", qwModel);
+  // qwen-code is a gemini-cli fork and takes the same workspace-grant flag; a
+  // build that does not know it is retried without it below.
+  for (const d of opts.addDirs ?? []) args.push("--include-directories", d);
   if (opts.yolo !== false) args.push("--approval-mode", "yolo");
 
   const spawnOpts = {
@@ -1521,6 +2277,10 @@ function runQwen(opts: RunHeadlessOpts): RunHeadlessResult {
     maxBuffer: 64 * 1024 * 1024,
   };
   let r = driverSpawnSync("qwen", args, spawnOpts);
+  if ((r.status ?? 1) !== 0 && /include[- ]directories/i.test(r.stderr || "")) {
+    args = args.filter((a, i, arr) => a !== "--include-directories" && arr[i - 1] !== "--include-directories");
+    r = driverSpawnSync("qwen", args, spawnOpts);
+  }
   if ((r.status ?? 1) !== 0 && /approval[- ]mode|unknown|unrecognized|invalid (option|flag|argument)/i.test(r.stderr || "")) {
     const i = args.indexOf("--approval-mode");
     if (i >= 0) r = driverSpawnSync("qwen", [...args.slice(0, i), ...args.slice(i + 2)], spawnOpts);
@@ -1573,6 +2333,7 @@ function runOpencode(opts: RunHeadlessOpts): RunHeadlessResult {
 
   return {
     ok: exitCode === 0, runtime: "opencode", sessionId: null,
+    ...noDirGrantWarning("opencode", opts.addDirs),
     result: (r.stdout || "").trim(),
     costUsd: null, costUnavailable: true, exitCode, stderr, durationMs,
     error: exitCode === 0 ? undefined : salientError(stderr, "opencode failed"),
@@ -1590,6 +2351,34 @@ const BUDGET_CAPABLE: ReadonlySet<Runtime> = new Set<Runtime>(["claude-code"]);
 const _warnedUncappable = new Set<string>();
 
 export function runHeadless(opts: RunHeadlessOpts): RunHeadlessResult {
+  // WHO may dispatch WHAT. The owner's rule: a business employee may use a
+  // squad to build its deliverable; a squad executes and never dispatches.
+  // Checked before the depth ceiling because it is the sharper of the two — a
+  // squad dispatched straight from the maestro sits at depth 1 with room
+  // underneath, and depth alone would let it open another squad.
+  if (!roleMayDispatch(opts.dispatchRole ?? null)) {
+    const error = roleRefusalMessage(opts.dispatchRole ?? null);
+    console.error(`[driver] ${error}`);
+    try { loadAudit()?.emit?.("x_dispatch_role_refused", { role: currentRole(), target: opts.dispatchRole ?? null, runtime: opts.runtime }); }
+    catch { /* audit is never the reason a refusal fails to happen */ }
+    return { ok: false, runtime: opts.runtime, sessionId: null, result: "", costUsd: null, exitCode: null, stderr: error, durationMs: 0, error };
+  }
+  // Agents dispatching agents, bounded. The ceiling is read here because this
+  // is the one funnel every dispatch of every runtime passes through, and a
+  // refusal has to look like a failed run so callers already handle it.
+  const maxDepth = maxDispatchDepth();
+  if (!mayDispatch(maxDepth)) {
+    const error = refusalMessage(maxDepth);
+    console.error(`[driver] ${error}`);
+    // Fire and forget through the driver own lazy accessor: a refusal must
+    // happen whether or not the sibling skill can be loaded.
+    try { loadAudit()?.emit?.("x_dispatch_depth_refused", { depth: currentDepth(), max_depth: maxDepth, runtime: opts.runtime }); }
+    catch { /* audit is never the reason a refusal fails to happen */ }
+    return { ok: false, runtime: opts.runtime, sessionId: null, result: "", costUsd: null, exitCode: null, stderr: error, durationMs: 0, error };
+  }
+  // The operator's switch outranks the caller: with the bypass disabled every
+  // runner takes its restricted path, the same one `--safe` selects.
+  if (!headlessSkipPermissions() && opts.yolo !== false) opts = { ...opts, yolo: false };
   // A budget cap the runtime cannot enforce is worse than no cap: the caller
   // believes the run is bounded. The contract calls the cap HARD, so say
   // plainly when it is not being applied. The caller-side accumulator
@@ -1606,13 +2395,35 @@ export function runHeadless(opts: RunHeadlessOpts): RunHeadlessResult {
       );
     }
   }
-  // Ledgered runs get the heartbeat sidecar + the 45-min default timeout;
+  // Ledgered runs get the heartbeat sidecar + the 7-day wall-clock backstop;
   // unledgered calls are byte-for-byte the historical behavior.
   if (opts.ledger?.runId) return runWithLedgerHeartbeat(opts, dispatchToRunner);
   return dispatchToRunner(opts);
 }
 
 function dispatchToRunner(opts: RunHeadlessOpts): RunHeadlessResult {
+  // Said once per runtime, here rather than in each adapter: only claude and
+  // codex have an effort setting, and a brief that asked for one on any other
+  // runtime must not look as though it was obeyed.
+  warnEffortUnsupported(opts, opts.runtime);
+  const previousSpawnAs = spawnAsRuntime;
+  const previousSpawnRole = spawnAsRole;
+  spawnAsRuntime = opts.runtime;
+  spawnAsRole = opts.dispatchRole ?? null;
+  try {
+    return dispatchToRunnerInner(opts);
+  } finally {
+    spawnAsRuntime = previousSpawnAs;
+    spawnAsRole = previousSpawnRole;
+  }
+}
+
+function dispatchToRunnerInner(opts: RunHeadlessOpts): RunHeadlessResult {
+  // Inside Orca (host.orca, host.orca_workers) the dispatch runs as a visible
+  // worker terminal; null means the transport does not apply or could not
+  // start, and the headless child below runs exactly as everywhere else.
+  const viaOrca = runOrcaWorker(opts);
+  if (viaOrca) return viaOrca;
   switch (opts.runtime) {
     case "claude-code":
       return runClaudeCode(opts);
@@ -1681,6 +2492,26 @@ export function runtimeAvailable(runtime: Runtime): boolean {
   return r.status === 0;
 }
 
+/**
+ * How the multi-line system directive reaches `claude`, per start path.
+ *
+ * When a `.cmd`/`.bat` runtime cannot be read as a launcher, it is still started through the
+ * command interpreter (resolveExecutable), and cmd.exe ends the command line at the first
+ * CR/LF of an argument however it is quoted: quoteForCmd cannot help, because the limit is
+ * the parser and not the escaping. The directive is the one argument here that spans lines,
+ * so under a shell it travels as `--append-system-prompt-file <temp file>` and the command
+ * line stays single-line. Without a shell it stays inline, exactly as before.
+ *
+ * resolveExecutable now spawns the pair a readable shim names, so the shell branch is the
+ * exception rather than the rule. This stays as the defense for whatever falls into it.
+ */
+export function claudeDirectiveArgs(directive: string, shell: boolean): { args: string[]; tmpFiles?: string[] } {
+  if (!directive) return { args: [] };
+  if (!shell) return { args: ["--append-system-prompt", directive] };
+  const file = writePromptFile(directive, "nrv-directive");
+  return { args: ["--append-system-prompt-file", file], tmpFiles: [file] };
+}
+
 /** TEST-ONLY seams. Not part of the public driver contract. */
 export const __testables = {
   RUNTIMES,
@@ -1688,6 +2519,7 @@ export const __testables = {
   argvOrPromptFile,
   promptFileBootstrap,
   envelopeErrorMessage,
+  TMP_FILE_PREFIXES,
 };
 
 if (import.meta.main) {

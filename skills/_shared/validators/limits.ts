@@ -13,6 +13,10 @@
  * Backward-compatible: with no .yaml and no env vars, the DEFAULTS are
  * identical to the original hard-coded limits.
  *
+ * NIRVANA_LIMITS_DEFAULTS_ONLY=1 skips the three override layers entirely and
+ * answers with DEFAULTS. A process writing a distributable artifact sets it —
+ * see DEFAULTS_ONLY_ENV below.
+ *
  * All configuration goes through SAFETY_BOUNDS: absurd values are
  * clamped to the safe floor/ceiling, with a warning on stderr.
  *
@@ -22,6 +26,7 @@
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+import { findProjectRoot } from '../lib/project-root.js'
 
 // ──────────────────────────────────────────────────────────────────────
 // DEFAULTS — the system's historical values (backward-compatible)
@@ -38,6 +43,10 @@ export const DEFAULTS: Record<string, number | null> = {
   business_example_briefs_item_max: 1000,
   business_keywords_max: 100,
   business_capabilities_max: 100,
+  // Business Protocol 2.0 §6.9: routing fences. Same ceiling the squad-side
+  // metadata contract uses — a fence list longer than this is a taxonomy, and a
+  // taxonomy does not fire.
+  business_not_for_max: 40,
 
   // employee frontmatter
   employee_description_max: null, // None = no ceiling (historical)
@@ -52,6 +61,16 @@ export const DEFAULTS: Record<string, number | null> = {
 
   // squad.yaml
   squad_capabilities_max: 50,
+
+  // workflow document (Squad Protocol v6) — PAYLOAD SIZE
+  // Prose body of a Markdown workflow, in words: a ceiling, never a rejection
+  // (the lint warns under either protocol). 2500 words is ~6x the largest body
+  // the library holds today.
+  workflow_body_words_max: 2500,
+  // Target for the bytes of agent + task documents a squad prompt carries.
+  // Every referenced document ships in full regardless — this is a soft
+  // ceiling flagged in a trailing note when crossed, never a cut (squad-exec.ts).
+  squad_prompt_components_bytes_max: 65536,
 
   // mind-clone DNA frontmatter
   dna_max_turns_max: 1000,
@@ -82,6 +101,7 @@ const SAFETY_BOUNDS: Record<string, [number | null, number | null]> = {
   business_example_briefs_item_max: [200, 2000],
   business_keywords_max: [15, 300],
   business_capabilities_max: [20, 500],
+  business_not_for_max: [5, 200],
 
   employee_description_max: [200, 8000],
   employee_max_turns_max: [50, 1000],
@@ -93,6 +113,9 @@ const SAFETY_BOUNDS: Record<string, [number | null, number | null]> = {
   capability_keywords_max: [10, 200],
 
   squad_capabilities_max: [10, 200],
+
+  workflow_body_words_max: [200, 20_000],
+  squad_prompt_components_bytes_max: [8_192, 1_048_576],
 
   dna_max_turns_max: [40, 1000],
 
@@ -111,6 +134,27 @@ const SAFETY_BOUNDS: Record<string, [number | null, number | null]> = {
 const USER_CONFIG = path.join(os.homedir(), '.claude', 'nirvana-limits.yaml')
 const PROJECT_CONFIG_NAME = '.nirvana-limits.yaml'
 const ENV_PREFIX = 'NIRVANA_LIMIT_'
+
+/**
+ * Opt out of the whole cascade and answer with DEFAULTS.
+ *
+ * A process that writes a DISTRIBUTABLE artifact sets this. The cascade is a
+ * local operator affordance: it lets one machine accept a longer capability
+ * description than the protocol declares. A generated JSON Schema is the
+ * opposite — every consumer must read the same numbers, so the only source it
+ * may embed is DEFAULTS, which is committed and identical everywhere.
+ *
+ * Set it BEFORE the first import of this module: LIMITS is a singleton
+ * evaluated at module load, and validators.ts freezes those numbers into the
+ * Zod objects on the same tick. See scripts/gen-json-schemas.ts.
+ */
+export const DEFAULTS_ONLY_ENV = 'NIRVANA_LIMITS_DEFAULTS_ONLY'
+
+function defaultsOnly(): boolean {
+  const v = process.env[DEFAULTS_ONLY_ENV]
+  if (v === undefined) return false
+  return !['', '0', 'false', 'no', 'off'].includes(v.trim().toLowerCase())
+}
 
 function log(msg: string): void {
   process.stderr.write(`[nirvana-limits] ${msg}\n`)
@@ -155,20 +199,15 @@ function loadConfigFile(p: string): Record<string, number | null | boolean | str
   }
 }
 
+// Delegates the climb to project-root.js (the one implementation shared with
+// paths.js, scope.ts, log-paths.ts, handoff.js, wiki-lint.js, cascade.ts and
+// output-resolver.js): this used to climb with no HOME exclusion at all and
+// no canonicalization, unbounded (`while (true)`, stopped only by
+// `parent === dir`) — the same shape that let a stray marker above the real
+// project be picked up on a Windows runner whose temp dir resolves inside HOME.
 function findProjectConfig(): string | null {
-  let dir = process.cwd()
-  while (true) {
-    const candidate = path.join(dir, PROJECT_CONFIG_NAME)
-    try {
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate
-    } catch {
-      /* ignore */
-    }
-    const parent = path.dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return null
+  const dir = findProjectRoot(process.cwd(), { markers: [PROJECT_CONFIG_NAME] })
+  return dir ? path.join(dir, PROJECT_CONFIG_NAME) : null
 }
 
 function coerceToDefaultType(value: unknown, dft: number | null): number | null {
@@ -199,8 +238,13 @@ export function loadLimits(): Record<string, number | null> {
   const sources: Record<string, string> = {}
   for (const k of Object.keys(limits)) sources[k] = 'default'
 
+  // A distributable artifact reads DEFAULTS and nothing else. Safety bounds
+  // below still run: DEFAULTS sit inside them by construction, and one exit
+  // path keeps the two modes from drifting apart.
+  const pinned = defaultsOnly()
+
   // 1. User-level
-  const userCfg = loadConfigFile(USER_CONFIG)
+  const userCfg = pinned ? {} : loadConfigFile(USER_CONFIG)
   for (const [k, v] of Object.entries(userCfg)) {
     if (k in limits) {
       limits[k] = coerceToDefaultType(v, DEFAULTS[k])
@@ -211,7 +255,7 @@ export function loadLimits(): Record<string, number | null> {
   }
 
   // 2. Project-level (overrides user)
-  const projectPath = findProjectConfig()
+  const projectPath = pinned ? null : findProjectConfig()
   if (projectPath) {
     const projectCfg = loadConfigFile(projectPath)
     for (const [k, v] of Object.entries(projectCfg)) {
@@ -227,7 +271,7 @@ export function loadLimits(): Record<string, number | null> {
   // 3. Env vars (highest precedence)
   for (const k of Object.keys(limits)) {
     const envKey = ENV_PREFIX + k.toUpperCase()
-    if (process.env[envKey] !== undefined) {
+    if (!pinned && process.env[envKey] !== undefined) {
       const coerced = coerceScalar(process.env[envKey]!)
       limits[k] = coerceToDefaultType(coerced, DEFAULTS[k])
       sources[k] = `env:${envKey}`

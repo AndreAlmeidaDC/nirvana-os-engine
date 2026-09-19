@@ -261,13 +261,19 @@ Every adapter provides two files:
 1. **`adapters/{runtime_id}.md`** — human-readable documentation.
 2. **`adapters/{runtime_id}.yaml`** — machine-readable manifest.
 
-The manifest declares which features the adapter supports and how Core concepts map to runtime primitives. The manifest is validated against `schemas/adapter-schema.json`.
+The manifest declares which features the adapter supports and how Core concepts map to runtime primitives. The manifest is validated against `schemas/adapter-schema.json`. (That mirror was removed in v6; the loader `skills/squads/lib/adapter-loader.js` is the validator — see `references/05-schemas.md`.)
 
 See [§18 Runtime Compatibility](#18-runtime-compatibility) for the full adapter contract.
 
 ### 4.5 How a Squad Chooses a Runtime
 
 A squad declares `runtime_requirements` in its manifest:
+
+The optional `policy` field defaults to `declared`, preserving existing manifests.
+Under `declared`, `minimum` must contain at least one runtime. Under `active`, the
+host runtime is selected without allowlist membership; a registered adapter or an
+explicit bridge must prove required features. `incompatible` remains a hard denial,
+and the engine never installs, starts, or switches runtimes.
 
 ```yaml
 runtime_requirements:

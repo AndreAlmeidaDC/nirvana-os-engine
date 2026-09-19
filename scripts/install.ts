@@ -24,7 +24,8 @@ import { createRequire } from "node:module";
 // Shared with the uninstaller — see skills/_shared/lib/runtime-dirs.ts for why.
 // Resolves both from the repo and from an extracted release tarball: the
 // tarball ships scripts/install.ts next to the full skills/ tree.
-import { RUNTIME_TARGETS, SKILLS, COPY_MARKER } from "../skills/_shared/lib/runtime-dirs.ts";
+import { RUNTIME_TARGETS, SKILLS, RETIRED_SKILLS, RUNTIME_ENTRIES, ENGINE_INTERNAL_SKILLS, LEGACY_RUNTIME_SKILL_DIRS, COPY_MARKER } from "../skills/_shared/lib/runtime-dirs.ts";
+import { classifyRuntimeEntry, depsLinkFor, ensureDepsLink, findParkedBackup, foreignProvider, materializeRuntimeSkillCopy, parkedBackupPath, pruneDepsLinkInside } from "../skills/_shared/lib/runtime-install.ts";
 import { RUN_STATE_EXCLUDES } from "../skills/_shared/lib/run-state.ts";
 import {
   collectManagedUpdatePlan,
@@ -45,9 +46,15 @@ const HOME = homedir();
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = resolve(SCRIPT_DIR, "..");
 const LOCAL_BIN = join(HOME, ".local/bin");
-const SQUADS_DIR = join(HOME, "squads");
-const BUSINESSES_DIR = join(HOME, "businesses");
-const DNA_DIR = join(BUSINESSES_DIR, "_library/dna");
+// Content roots follow the environment — the same four variables paths.js and
+// the pack overlay (install-content.ts) honour. Fixed homedir() joins here meant
+// a machine with NIRVANA_HOME or SQUADS_DIR set got empty directories created in
+// the default place while every reader looked elsewhere. The engine's own home
+// (~/.nirvana, ~/.local/bin) stays on homedir(): it is not content.
+const CONTENT_HOME = process.env.NIRVANA_HOME ?? HOME;
+const SQUADS_DIR = process.env.SQUADS_DIR ?? join(CONTENT_HOME, "squads");
+const BUSINESSES_DIR = process.env.BUSINESSES_DIR ?? join(CONTENT_HOME, "businesses");
+const DNA_DIR = process.env.DNA_LIBRARY ?? join(BUSINESSES_DIR, "_library/dna");
 // Starter content no longer lives in this repo (the engine is content-free).
 // It is resolved from the private packs repo: NIRVANA_PACKS_DIR (default
 // ~/nirvana-packs), content root <packs>/starter-pack.
@@ -345,6 +352,15 @@ function copySkills(): void {
       console.log(`  ✓ ${f}`);
     }
   }
+  // A skill this engine shipped under an earlier name. The loop above touches
+  // only the current list, so without this the old tree would sit beside the
+  // new one forever (and stay linked into every runtime — see linkRuntimes).
+  for (const old of RETIRED_SKILLS) {
+    const dead = join(NIRVANA_SKILLS, old);
+    if (!existsSync(dead)) continue;
+    rmSync(dead, { recursive: true, force: true });
+    console.log(`  ✓ removed retired skill '${old}'`);
+  }
 }
 
 function isSymlink(p: string): boolean {
@@ -388,14 +404,17 @@ function installDeps(): void {
     } catch { /* best-effort */ }
   };
   linkDeps(join(NIRVANA_SKILLS, "node_modules"));
-  for (const s of SKILLS) linkDeps(join(NIRVANA_SKILLS, s, "node_modules"));
+  // Never INSIDE a skill: runtimes that symlink skills expose the target tree to
+  // their skill scanners, and Codex's follows symlinks into the whole store
+  // (see runtime-install.ts). Resolution walks up to the link above instead.
+  for (const s of SKILLS) pruneDepsLinkInside(join(NIRVANA_SKILLS, s));
 }
 
 // Point every installed runtime at the ONE shared skills tree. Symlinks are
 // used where they truly work (Mac/Linux). On WINDOWS — and for CODEX, which
 // do not resolve skill symlinks reliably — we COPY the tree (without
-// node_modules; execution keeps resolving from ~/.nirvana/skills via
-// paths.CLAUDE_SKILLS_DIR). A pre-existing REAL user dir is preserved
+// node_modules; the runtime gets ONE deps link beside its skills dir, see
+// runtime-install.ts). A pre-existing REAL user dir is preserved
 // (backup .pre-nirvana.bak), never destroyed; our own previous copies carry a
 // marker and are regenerated idempotently (without accumulating backups).
 
@@ -405,8 +424,10 @@ function installDeps(): void {
  * that skill alone.
  *
  * We NEVER destroy a directory we did not create. When a real user directory
- * is found it is renamed to `<name>.pre-nirvana.bak` once. If a backup from an
- * earlier install is already there and ANOTHER foreign directory has appeared
+ * is found it is parked once under ~/.nirvana/backups/runtime-skills/ — outside
+ * the skills root, because a `<name>.pre-nirvana.bak` beside it was a second
+ * copy of the skill for every runtime that scans recursively. If a backup from
+ * an earlier install is already there and ANOTHER foreign directory has appeared
  * meanwhile, we skip that entry with a loud warning instead of deleting it:
  * a numbered backup chain (.bak.2, .bak.3, …) would silently pile up copies
  * nobody asked for, and overwriting the first backup would destroy the
@@ -417,9 +438,11 @@ function cleanRuntimeEntry(linkPath: string): boolean {
   if (isSymlink(linkPath)) { rmSync(linkPath, { force: true }); return true; }
   if (!existsSync(linkPath)) return true;
   if (existsSync(join(linkPath, COPY_MARKER))) { rmSync(linkPath, { recursive: true, force: true }); return true; } // our copy
-  const bak = `${linkPath}.pre-nirvana.bak`;
-  if (!existsSync(bak)) {
-    renameSync(linkPath, bak);   // real user dir → backup once
+  const existing = findParkedBackup(linkPath);
+  const bak = existing ?? parkedBackupPath(linkPath);
+  if (!existing) {
+    mkdirSync(dirname(bak), { recursive: true });
+    renameSync(linkPath, bak);   // real user dir → parked once, outside the skills root
     console.log(`  ⓘ ${linkPath} already existed and is not Nirvana's — kept at ${bak}`);
     return true;
   }
@@ -430,16 +453,10 @@ function cleanRuntimeEntry(linkPath: string): boolean {
 
 function copyRuntimeSkill(target: string, linkPath: string): boolean {
   try {
-    // dereference:false + filter: does not drag node_modules into the copy (heavy).
-    cpSync(target, linkPath, { recursive: true, dereference: false, filter: (s) => basename(s) !== "node_modules" });
-    // deps: junction node_modules → shared deps, so that scripts invoked
-    // from the copied dir (e.g. `bun ~/.claude/skills/<s>/scripts/x.ts`) also
-    // resolve `require('yaml')`/`import 'zod'`. A junction is transparent to the resolver.
-    try {
-      const nm = join(linkPath, "node_modules");
-      if (existsSync(NIRVANA_DEPS) && !existsSync(nm)) symlinkSync(NIRVANA_DEPS, nm, IS_WINDOWS ? "junction" : undefined);
-    } catch { /* best-effort — canonical execution via ~/.nirvana still resolves */ }
-    try { writeFileSync(join(linkPath, COPY_MARKER), "Copy of ~/.nirvana/skills regenerated by `nrv install`. Edit the source, not this.\n"); } catch {}
+    // No node_modules inside the copy — the runtime's deps link lives one level
+    // above its skills dir (ensureDepsLink in linkRuntimes), where scripts still
+    // resolve `import 'yaml'` by walking up and no skill scanner ever looks.
+    materializeRuntimeSkillCopy(target, linkPath);
     return true;
   } catch (e) {
     // Says WHY: a mute "fail" forces the user to debug blindly.
@@ -504,7 +521,21 @@ function linkRuntimes(): void {
     for (const t of wired) console.log(`        ${t.name} → ${t.skillsDir}`);
     return;
   }
-  console.log("[4/4] Linking runtimes → shared skills tree ...");
+  console.log("[4/4] Linking runtimes → the nirvana entry (the engine stays in ~/.nirvana/skills) ...");
+  // A directory an earlier engine wired and no runtime reads: our entries come
+  // out (ours only: symlink to the engine tree, live or dangling, or a copy
+  // with COPY_MARKER), a parked backup goes back, and anything else stays.
+  for (const legacy of LEGACY_RUNTIME_SKILL_DIRS) {
+    if (!existsSync(legacy.skillsDir)) continue;
+    for (const s of [...SKILLS, ...RETIRED_SKILLS]) {
+      const p = join(legacy.skillsDir, s);
+      if (classifyRuntimeEntry(p, [NIRVANA_SKILLS]) !== "ours") continue;
+      rmSync(p, { recursive: true, force: true });
+      const bak = findParkedBackup(p);
+      if (bak) { try { renameSync(bak, p); } catch { /* best-effort */ } }
+      console.log(`  ✓ ${legacy.runtime}: unlinked '${s}' from ${legacy.skillsDir} (a directory that runtime never read)${bak ? " (restored pre-Nirvana backup)" : ""}`);
+    }
+  }
   let linked = 0;
   for (const t of RUNTIME_TARGETS) {
     const rtDir = t.skillsDir;
@@ -528,11 +559,43 @@ function linkRuntimes(): void {
     // EEXIST tolerated: on Windows Bun may throw it even with recursive:true.
     try { mkdirSync(rtDir, { recursive: true }); }
     catch (e) { if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e; }
+    // Entries this engine no longer puts in a runtime dir: a name it stopped
+    // shipping (RETIRED_SKILLS) and the engine-internal trees that engines up
+    // to 0.13.9 linked beside the door (harness, squads, businesses, _shared).
+    // Removed only when ours: our symlink (live or DANGLING — copySkills just
+    // replaced the target, so existsSync would lie here) or a copy carrying
+    // COPY_MARKER. A foreign directory that happens to share the name is never
+    // touched; a backup parked by an earlier install is restored.
+    for (const old of [...RETIRED_SKILLS, ...ENGINE_INTERNAL_SKILLS]) {
+      const p = join(rtDir, old);
+      if (classifyRuntimeEntry(p, [NIRVANA_SKILLS]) !== "ours") {
+        if (existsSync(p) && RETIRED_SKILLS.includes(old)) console.log(`  ⓘ ${p} is not Nirvana's — left untouched`);
+        continue;
+      }
+      rmSync(p, { recursive: true, force: true });
+      const verb = RETIRED_SKILLS.includes(old) ? "retired" : "unlinked (engine-internal, reached through nirvana)";
+      const bak = findParkedBackup(p);
+      if (bak) {
+        try { renameSync(bak, p); } catch { /* best-effort */ }
+        console.log(`  ✓ ${verb} '${old}' (restored pre-Nirvana backup)`);
+      } else {
+        console.log(`  ✓ ${verb} '${old}'`);
+      }
+    }
     let mode = "symlink";
-    for (const s of SKILLS) {
+    for (const s of RUNTIME_ENTRIES) {
       const linkPath = join(rtDir, s);
       const target = join(NIRVANA_SKILLS, s);
       if (!existsSync(target)) continue;
+      // The same skill placed here by another installer — skills.sh puts a real
+      // dir in .agents/skills and RELATIVE symlinks to it in the other agent dirs.
+      // Parking it as <s>.pre-nirvana.bak would dangle those links and leave a
+      // .bak that `nrv doctor` then advises deleting (skills-litter.ts). Same
+      // skill, same name: leave it, and say who provides it.
+      if (foreignProvider(linkPath, s, NIRVANA_SKILLS)) {
+        console.log(`  ⓘ ${linkPath}: '${s}' provided by another installer (skills.sh), kept`);
+        continue;
+      }
       try {
         const materialize = (): void => {
           if (!cleanRuntimeEntry(linkPath)) { mode = "partial — conflitos pulados"; return; }
@@ -558,6 +621,15 @@ function linkRuntimes(): void {
           }
         } else materialize();
       } catch (e) { console.log(`  ! could not materialize ${linkPath}: ${(e as Error).message}`); mode = "fail"; }
+    }
+    // Stale layout: a `node_modules` link at the skills root or inside a skill
+    // (what earlier installs wrote) is what Codex's scanner walks into. Remove
+    // ours; a real directory is left for `nrv deps status` to report.
+    pruneDepsLinkInside(rtDir);
+    for (const s of RUNTIME_ENTRIES) pruneDepsLinkInside(join(rtDir, s));
+    if (mode.startsWith("copy")) {
+      const deps = ensureDepsLink(depsLinkFor(rtDir), NIRVANA_DEPS, IS_WINDOWS);
+      if (deps === "kept-real-dir") console.log(`  ⓘ ${depsLinkFor(rtDir)} is a real directory, not our link — left alone; scripts in the copied skills resolve through it`);
     }
     linked++;
     console.log(`  ✓ ${t.name}: ${rtDir} (${mode})`);
@@ -614,7 +686,18 @@ function windowsLauncherNrv(): string {
     'if not exist "%BUN%" (',
     "  where /q bun",
     "  if errorlevel 1 (",
-    "    echo nrv requires Bun. Install: https://bun.sh",
+    // The same answer bin/nrv gives on POSIX, in the dialect of the shell that
+    // prints it. A bare "Install: https://bun.sh" made the buyer go look up a
+    // command this launcher already knows, and it named no fallback for the
+    // machine where the PowerShell one-liner is blocked by execution policy.
+    // Inside a parenthesized block cmd.exe needs `^|` and `^(` escaped or the
+    // block ends early — the .cmd wrappers under skills/ escape them the same way.
+    "    echo nrv requires Bun. Nirvana-OS runs on it.",
+    "    echo   Install it, then run nrv again:",
+    '    echo     powershell -c "irm bun.sh/install.ps1 ^| iex"',
+    "    echo   If the execution policy blocks that, install it with winget:",
+    "    echo     winget install Oven-sh.Bun",
+    "    echo   Already installed? Open a new terminal so the PATH picks it up.",
     "    exit /b 1",
     "  )",
     '  set "BUN=bun"',
@@ -1056,7 +1139,13 @@ function buildRegistries(): void {
   if (FLAG_NO_INDEX) { console.log("      Indexing deferred (--no-index)."); return; }
   if (!existsSync(nrvBin)) return;
   console.log("      Re-indexing registries...");
-  const r = spawnSync(nrvBin, ["index"], { stdio: "inherit", shell: IS_WINDOWS });
+  // From HOME, never from the caller's cwd: registries anchor to <project>/.nirvana/
+  // whenever a project marker sits above cwd (paths.js), so an install started
+  // inside a project — the default skills.sh scope — would index only that
+  // project and leave the global registry missing (`nrv doctor` FAIL elsewhere).
+  const env = { ...process.env };
+  delete env.NIRVANA_PROJECT_ROOT;
+  const r = spawnSync(nrvBin, ["index"], { stdio: "inherit", shell: IS_WINDOWS, cwd: HOME, env });
   if (r.status !== 0) console.log("      ⚠ nrv index reported issues. Run manually to verify.");
 }
 

@@ -3,7 +3,7 @@
  * validate-squad.ts — Squad Protocol Engine v5 validator (pure Bun port).
  *
  * Replaces validate-squad.sh. Branches by manifest protocol:
- *   protocol: 5.0  → capability-validator.js (Pydantic via _shared/validators)
+ *   protocol: 5.0 / 6.0 → capability-validator.js (Zod via _shared/validators)
  *   protocol: 4.0  → legacy B1-B8 + A-block checks in TS
  *
  * Usage:
@@ -68,9 +68,9 @@ console.log(`Protocol: ${protocol || "unknown"}`);
 console.log("================================");
 
 // ─────────────────────────────────────────────────────────────────────
-// Branch: protocol 5.0 → capability-validator.js
+// Branch: protocol 5.0 / 6.0 → capability-validator.js
 // ─────────────────────────────────────────────────────────────────────
-if (protocol === "5.0") {
+if (protocol === "5.0" || protocol === "6.0") {
   const capValidator = path.join(paths.CLAUDE_SKILLS_DIR, "squads", "lib", "capability-validator.js");
   if (!fs.existsSync(capValidator)) {
     console.error(`[FAIL] capability-validator.js missing at ${capValidator}`);
@@ -91,10 +91,11 @@ if (protocol === "5.0") {
 
   const errs: string[] = result.errors || [];
   const warns: string[] = result.warnings || [];
+  const label = protocol === "6.0" ? "v6" : "v5";
   if (errs.length === 0) {
-    console.log("[PASS] v5 manifest valid");
+    console.log(`[PASS] ${label} manifest valid`);
   } else {
-    console.log(`[FAIL] v5 manifest has ${errs.length} error(s):`);
+    console.log(`[FAIL] ${label} manifest has ${errs.length} error(s):`);
     errs.forEach((e, i) => console.log(`  ${i + 1}. ${e}`));
   }
   if (warns.length > 0) {
@@ -127,11 +128,12 @@ if (protocol === "5.0") {
   if (REPORT) {
     console.log("");
     console.log("── Fix guidance ─────────────────────────────");
-    console.log("  schema:    ~/.nirvana/skills/_shared/schemas/capability.schema.json");
-    console.log("  validator: python3 ~/.nirvana/skills/_shared/validators/validators.py test");
+    console.log("  schema:    ~/.nirvana/skills/_shared/schemas/capability.schema.json   (generated)");
+    console.log("  validator: bun ~/.nirvana/skills/_shared/validators/validators.ts test   (the one that runs)");
     console.log("  template:  ~/.nirvana/skills/squads/templates/capability-block.tmpl");
     console.log("  catalog:   ~/.nirvana/skills/_shared/catalogs/CAPABILITY_CATALOG_V1.yaml");
     console.log("  reference: ~/.nirvana/skills/squads/references/12-v5-capabilities.md");
+    console.log("  gate:      nrv validate squad <slug|path> [--fix]");
   }
 
   process.exit(result.valid ? EXIT.OK : EXIT.FAILURES);

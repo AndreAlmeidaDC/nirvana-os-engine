@@ -107,21 +107,32 @@ SelfScoreCriterionId = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_
 
 
 class Runtime(str, Enum):
+    """Mantenha em sincronia com `Runtime` em validators.ts: os nove runtimes
+    que o driver executa, mais os dois hosts declaráveis que não são alvos de
+    execução (`cursor`, `openclaw`) e o nome curto `antigravity`."""
+
     claude_code = "claude-code"
     codex = "codex"
-    gemini_cli = "gemini-cli"
-    cursor = "cursor"
-    antigravity = "antigravity"
     antigravity_cli = "antigravity-cli"  # canonical name used across squads/businesses (gemini-cli successor)
-    openclaw = "openclaw"
-    opencode = "opencode"
+    antigravity = "antigravity"
+    gemini_cli = "gemini-cli"
     pi = "pi"
+    kimi_cli = "kimi-cli"
+    grok_cli = "grok-cli"
+    qwen_code = "qwen-code"
+    opencode = "opencode"
+    cursor = "cursor"
+    openclaw = "openclaw"
 
 
 class Model(str, Enum):
+    """Mantenha em sincronia com `Model` em validators.ts. `fable` faltava
+    enquanto o resolvedor de alias do engine já o reconhecia."""
+
     haiku = "haiku"
     sonnet = "sonnet"
     opus = "opus"
+    fable = "fable"
     inherit = "inherit"
 
 
@@ -204,7 +215,10 @@ class Capability(StrictModel):
     not_for: Optional[list[Annotated[str, StringConstraints(min_length=5)]]] = None
     fidelity: Optional[CapabilityFidelity] = None
     score_boost: float = Field(default=1.0, ge=0, le=2)
-    model_hint: Model = Model.sonnet
+    # `inherit`, matching validators.ts and the generated JSON Schema. The twin
+    # defaulted to `sonnet` and the same capability therefore validated to two
+    # different values depending on which language read it (issue #252).
+    model_hint: Model = Model.inherit
     estimated_cost_usd: Optional[float] = Field(default=None, ge=0)
     parallel_safe: bool = False
     writes_paths: Optional[list[str]] = None
@@ -218,9 +232,16 @@ class RuntimeRequirementMin(BaseModel):
 
 
 class RuntimeRequirements(StrictModel):
-    minimum: Annotated[list[RuntimeRequirementMin], Field(min_length=1)]
+    policy: Literal["declared", "active"] = "active"
+    minimum: Optional[Annotated[list[RuntimeRequirementMin], Field(min_length=1)]] = None
     compatible: Optional[list[Any]] = None
     incompatible: Optional[list[Any]] = None
+
+    @model_validator(mode="after")
+    def _require_minimum_for_declared(self) -> "RuntimeRequirements":
+        if self.policy == "declared" and not self.minimum:
+            raise ValueError("runtime_requirements.minimum is required when policy is declared")
+        return self
 
 
 class SquadComponents(StrictModel):
@@ -340,7 +361,9 @@ class EmployeeFrontmatter(StrictModel):
     # (galinha-squads gen) load without a forced rewrite. New employees should
     # still declare both explicitly; the defaults are a safe floor, not a license
     # to skip accountability.
-    maxTurns: int = Field(default=400, ge=1, le=LIMITS["employee_max_turns_max"])
+    # 15 por decisão do dono (12/09/2026) — mantenha em sincronia com
+    # validators.ts. Uma cadeira que não terminou em quinze turnos está em loop.
+    maxTurns: int = Field(default=15, ge=1, le=LIMITS["employee_max_turns_max"])
     reports_to: Optional[KebabHyphenStr] = None
     manages: Optional[list[KebabHyphenStr]] = None
     tools: Optional[list[str]] = None
@@ -363,7 +386,10 @@ class EmployeeFrontmatter(StrictModel):
     escalation_triggers: Optional[list[EscalationTrigger]] = None
     # ── Fields from earlier business generations (galinha-squads), officialized
     # 2026-05-21 so rich legacy employees validate without rewrite ──
-    effort: Optional[Literal["low", "medium", "high"]] = None
+    # Cinco níveis, como em validators.ts: os que `claude --effort` aceita e a
+    # faixa que o codex toma em `model_reasoning_effort`. Ausente = o despacho
+    # não especifica effort nenhum e o CLI usa o padrão do usuário.
+    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
     authority_level: Optional[Literal["tier-1", "tier-2", "tier-3"]] = None
     assigned_mind_clones: Optional[list[str]] = None
     mind_clones_used: Optional[list[str]] = None
@@ -1310,7 +1336,7 @@ def test_capability_minimal_valid() -> None:
     cap = Capability.model_validate(_VALID_CAPABILITY)
     assert cap.id == "media.video.analyze"
     assert cap.score_boost == 1.0
-    assert cap.model_hint == Model.sonnet
+    assert cap.model_hint == Model.inherit
 
 
 def test_capability_id_must_be_dotted_min_3_segments() -> None:
@@ -1813,6 +1839,26 @@ def test_registry_businesses_minimal_valid() -> None:
     )
     assert "nexus-council" in reg.businesses
     assert reg.businesses["nexus-council"].employee_count == 9
+
+
+def test_runtime_requirements_active_allows_omitting_minimum() -> None:
+    requirements = RuntimeRequirements.model_validate({"policy": "active", "incompatible": []})
+    assert requirements.policy == "active"
+    assert requirements.minimum is None
+
+
+def test_runtime_requirements_declared_requires_minimum() -> None:
+    import pytest
+
+    with pytest.raises(Exception):
+        RuntimeRequirements.model_validate({"policy": "declared"})
+
+    # Nothing declared, or a minimum without a policy: the run follows the session.
+    assert RuntimeRequirements.model_validate({}).policy == "active"
+    requirements = RuntimeRequirements.model_validate(
+        {"minimum": [{"runtime": "codex"}]}
+    )
+    assert requirements.policy == "active"
 
 
 def test_registry_businesses_rejects_bad_legacy_uuid() -> None:

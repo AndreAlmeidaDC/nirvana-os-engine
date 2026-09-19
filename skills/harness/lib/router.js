@@ -32,15 +32,16 @@ const nrvPaths = require('../../_shared/lib/paths.js');
 const contextBudget = require('./context-budget');
 
 // Lazy-loaded host-agent-driver (used only by Stage -2 amplifier when WEAK).
+// host-agent-driver.js already delegates to the canonical .ts under Bun and
+// falls back to its own inline legacy implementation otherwise (see that
+// file's header) — requiring the .ts directly from here duplicated that
+// fallback AND was itself a `.js` requiring a `.ts`, which can throw
+// `TypeError: require() async module` under Bun on Windows.
 let _hostDriver = null;
 function getHostDriver() {
   if (_hostDriver) return _hostDriver;
-  try {
-    _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.ts'));
-  } catch {
-    try { _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.js')); }
-    catch { _hostDriver = null; }
-  }
+  try { _hostDriver = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'host-agent-driver.js')); }
+  catch { _hostDriver = null; }
   return _hostDriver;
 }
 
@@ -130,6 +131,245 @@ function stage1IntentClassify(brief, ctx) {
   return { intent, domains, verbs, confidence };
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Business auto_route patterns -> indexable literals
+// ─────────────────────────────────────────────────────────────────────
+// A business `auto_route.pattern` is written as an activation REGEX. The
+// document that has to retrieve it is a bag of words. Handing the regex
+// source to the tokenizer looks like it works — the tokenizer already drops
+// punctuation — and it does not, in three ways measured over the 686 routes
+// of the live library:
+//
+//   `seguran[çc]a`  -> ["seguran","cc"]   a brief says "seguranca"; neither is it
+//   `\bLCP\b`       -> ["blcp"]           the guard glues onto the acronym
+//   `.{0,24}?`      -> ["0","24"]         a gap width becomes vocabulary
+//
+// The first is the one that matters: PT-BR routes spell every accented word
+// as a character class, so the class sits INSIDE the word and splits it. 101
+// of the 400 regex-shaped routes carry at least one such wound.
+//
+// So we read the pattern as a regex and emit the literal phrases it can match.
+// The tokenizer then folds `segurança` and `seguranca` onto the same token,
+// which is why expanding `[çc]` into both spellings costs one token, not two:
+// the class exists because the author wanted both, and folding makes them one.
+//
+// Scope of the parser: alternation, groups (`(...)`, `(?:...)`), character
+// classes, escapes, and quantifiers. Measured on the live library: zero
+// lookarounds, zero backreferences, zero named groups, one negated class, two
+// ranges — all four of those degrade to a separator rather than a guess.
+const ROUTE_LITERAL_VARIANT_CAP = 24;
+
+// `\s` is a separator; `\b` `\w` `\d` and friends carry no literal at all.
+// Both become a space: the tokenizer splits there, and a phrase that loses a
+// boundary loses nothing a bag of words was going to use.
+const REGEX_CLASS_ESCAPES = new Set(['s', 'S', 'w', 'W', 'd', 'D', 'b', 'B', 'A', 'Z', 'z', 'n', 't', 'r', 'f', 'v']);
+// Members that a character class uses as glue rather than as a letter.
+const CLASS_SEPARATOR_MEMBERS = new Set([' ', '-', '_', '/', '\\s', '\\/', '\\-', '\\.']);
+
+/**
+ * Literal phrases a business auto_route pattern can match.
+ *
+ * @param {string} pattern raw `auto_routes[].pattern`
+ * @param {{multiply?: boolean}} [opts] `multiply` crosses a group's branches
+ *   with the prefix that precedes them (`security (review|audit)` ->
+ *   "security review", "security audit") instead of listing them side by side.
+ *   Default ON — see the measurement in routePatternIndexText.
+ * @returns {string[]} deduped, non-empty literal phrases
+ */
+function extractRoutePatternLiterals(pattern, opts) {
+  // `type:` is a routing-kind prefix, not vocabulary, and 139 live patterns
+  // carry it in FRONT of an alternation (`type:conciliacao_bancaria|...`) —
+  // half regex, half the old shape. Strip it once, here, for both halves.
+  const src = String(pattern == null ? '' : pattern).replace(/^\(\?i\)/, '').replace(/^type:/, '');
+  const multiply = !opts || opts.multiply !== false;
+  let i = 0;
+
+  const cross = (a, b) => {
+    const out = [];
+    for (const x of a) for (const y of b) out.push(x + y);
+    return out;
+  };
+
+  const isWordChar = (ch) => !!ch && /[\p{L}\p{N}]/u.test(ch);
+
+  /** The next literal character after any quantifier attached to the atom. */
+  function peekAfterQuantifier() {
+    let j = i;
+    if (src[j] === '{') {
+      const close = src.indexOf('}', j);
+      if (close !== -1 && /^\{\d*,?\d*\}$/.test(src.slice(j, close + 1))) j = close + 1;
+    }
+    while (src[j] === '?' || src[j] === '*' || src[j] === '+') j++;
+    return src[j];
+  }
+
+  function parseClass() {
+    i++; // consume '['
+    const start = i;
+    let negated = false;
+    if (src[i] === '^') { negated = true; i++; }
+    const members = [];
+    while (i < src.length && src[i] !== ']') {
+      if (src[i] === '\\' && i + 1 < src.length) { members.push(src.slice(i, i + 2)); i += 2; continue; }
+      members.push(src[i]); i++;
+    }
+    if (src[i] === ']') i++;
+    const body = src.slice(start, i - 1);
+    // A range (`[a-d]`, `[1-4]`) enumerates without naming; a negation names
+    // what it excludes. Neither is a keyword, so both become a boundary.
+    if (negated || /[^\\]-[^\]]/.test(body)) return [' '];
+    const letters = members.filter((m) => !CLASS_SEPARATOR_MEMBERS.has(m));
+    // `[- ]`, `[\s-]`, `[\/ ]` — glue holding two words apart.
+    if (letters.length === 0) return [' '];
+    // A class inside a word is an accent variant: emit each spelling, let the
+    // tokenizer fold them. Always multiplies with its prefix, `multiply` or
+    // not: `seguran` and `a` are not two keywords, they are one word cut open.
+    return letters.map((m) => (m.length === 2 ? m[1] : m));
+  }
+
+  // `inline: true` means the atom lives INSIDE a word and always crosses with
+  // the prefix — a single character, or a class standing in for one letter.
+  // Only a group's branches are ever laid side by side, and only when
+  // `multiply` is off.
+  function parseAtom(depth) {
+    const c = src[i];
+    if (c === '(') {
+      i++;
+      if (src[i] === '?') {
+        // `(?:` groups for real; any other `(?…` (flags, lookaround) has no
+        // literal of its own. The live library has neither, and a wrong guess
+        // about one would be indexed forever.
+        if (src[i + 1] === ':') i += 2;
+        else { skipGroup(); return { variants: [' '], inline: true }; }
+      }
+      const inner = depth < 8 ? parseAlt(depth + 1) : [' '];
+      if (src[i] === ')') i++;
+      return { variants: inner, inline: inner.length <= 1 };
+    }
+    if (c === '[') return { variants: parseClass(), inline: true };
+    if (c === '\\') {
+      const e = src[i + 1];
+      i += 2;
+      if (e === undefined) return { variants: [' '], inline: true };
+      return { variants: [REGEX_CLASS_ESCAPES.has(e) ? ' ' : e], inline: true };
+    }
+    if (c === '.') {
+      // `.` between two word characters is a JOINER, not a gap: the author
+      // writes `stress.?test` to accept "stress test", "stress-test" and
+      // "stresstest" in one atom. A space only buys the first. A hyphen buys
+      // all three, because the tokenizer already emits the joined form and the
+      // parts for a hyphenated word ("stress-test" -> stresstest, stress,
+      // test). Found by measurement: on "Stress-test our 2027 product
+      // roadmap", the route that literally spells `stress-test` was ranking
+      // ABOVE the one that spells `stress.?test` and means the same thing.
+      // Everywhere else — `.{0,24}` gaps, `display . video 360` — it stays a
+      // separator.
+      i++;
+      return { variants: [isWordChar(src[i - 2]) && isWordChar(peekAfterQuantifier()) ? '-' : ' '], inline: true };
+    }
+    if (c === '^' || c === '$') { i++; return { variants: [' '], inline: true }; }
+    i++;
+    // `_` and `:` join words the tokenizer will not split: `efd_icms_ipi` is
+    // ONE token, and no brief writes it. The old `[-_:]` scrub is why 159
+    // patterns had matchable vocabulary at all — keep that, drop the `-`,
+    // which the tokenizer already repairs into both the joined and the split
+    // forms (`e-?book` -> "ebook" AND "book").
+    return { variants: [c === '_' || c === ':' ? ' ' : c], inline: true };
+  }
+
+  function skipGroup() {
+    let open = 1;
+    while (i < src.length && open > 0) {
+      if (src[i] === '\\') { i += 2; continue; }
+      if (src[i] === '(') open++;
+      else if (src[i] === ')') open--;
+      i++;
+    }
+  }
+
+  // A quantifier repeats the atom we just read. Bag of words does not count,
+  // so every quantifier is consumed and the atom is kept exactly once —
+  // including `?`, whose optional letter is kept (`rights?` -> "rights",
+  // `e-?book` -> "e-book", which the tokenizer already repairs to "ebook").
+  function skipQuantifier() {
+    if (src[i] === '{') {
+      const close = src.indexOf('}', i);
+      if (close !== -1 && /^\{\d*,?\d*\}$/.test(src.slice(i, close + 1))) i = close + 1;
+    }
+    while (src[i] === '?' || src[i] === '*' || src[i] === '+') i++;
+  }
+
+  function parseSeq(depth) {
+    const done = [];
+    let variants = [''];
+    while (i < src.length && src[i] !== '|' && src[i] !== ')') {
+      const atom = parseAtom(depth);
+      skipQuantifier();
+      // The cap is not cosmetic: a route with five two-branch groups is 32
+      // phrases, and the library has patterns with nine groups.
+      if (atom.inline || (multiply && variants.length * atom.variants.length <= ROUTE_LITERAL_VARIANT_CAP)) {
+        variants = cross(variants, atom.variants);
+      } else {
+        done.push(...variants);
+        variants = atom.variants.slice();
+      }
+    }
+    return done.concat(variants);
+  }
+
+  function parseAlt(depth) {
+    const branches = parseSeq(depth).slice();
+    while (i < src.length && src[i] === '|') {
+      i++;
+      branches.push(...parseSeq(depth));
+    }
+    return branches;
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const v of parseAlt(0)) {
+    const s = v.replace(/\s+/g, ' ').trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * The text a business auto_route is indexed under.
+ *
+ * A pattern with no regex metacharacter keeps the `type:X-Y_Z` treatment it
+ * has always had (286 of the 686 live routes are that shape) — the extractor
+ * would give the same tokens plus a glued `metaadscampaign`, which is doc
+ * length nobody queries.
+ *
+ * MEASURED, on the criterion brief plus the first `example_brief` of each of
+ * the twelve Genesis businesses, reading the best rank of any route of the
+ * expected business (lower is better; the whole live corpus in the index):
+ *
+ *   alternation flat, prefix not multiplied ... 4 cases in the top 4, 10 in the top 10
+ *   alternation MULTIPLIED with its prefix ... 5 cases in the top 4, 10 in the top 10
+ *
+ * Multiplied wins two cases and loses none. voicecraft's TTS route goes rank
+ * 7 -> 2 and tracking-360's rank 12 -> 10: both patterns are built from
+ * `ger(ar|e|ando) (o |um |este )?(áudio|voz)`-shaped groups, where the prefix
+ * is the word that carries the meaning and the branches are inflections. Flat
+ * indexes `ger` once and the inflections once each; multiplied repeats the
+ * prefix per branch, which is the term frequency the brief actually queries.
+ * The cost is +9.8% tokens over the 686 route documents, and only 7 of them
+ * have a DISTINCT token set that differs at all — the rest differ only in
+ * term frequency, which is exactly the axis being bought.
+ */
+function routePatternIndexText(pattern) {
+  const raw = String(pattern == null ? '' : pattern);
+  if (!/[(\[\\|?*+{^$.]/.test(raw)) {
+    return raw.replace(/^type:/, '').replace(/[-_:]/g, ' ').trim();
+  }
+  return extractRoutePatternLiterals(raw).join(' ');
+}
+
 /**
  * Build matchable documents from the squads + businesses registries.
  *
@@ -169,6 +409,19 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
           exampleBriefs, exampleBriefs,
           produces,
         ].filter(Boolean).join(' ');
+        // Execution fields the registry now carries (PR4). They ride in `meta`
+        // and never in `text`: budget.js estimates from `estimated_cost_usd`
+        // (via stage4BudgetCheck, which reads target.meta), the DAG planner and
+        // the race detector schedule from `parallel_safe` / `writes_paths`, and
+        // the runtime picks a model from `model_hint`. Spread, so a capability
+        // that declares none of them produces the meta it produced before —
+        // scoring reads none of these keys either way.
+        const execMeta = {};
+        if (typeof p.estimated_cost_usd === 'number') execMeta.estimated_cost_usd = p.estimated_cost_usd;
+        if (typeof p.parallel_safe === 'boolean') execMeta.parallel_safe = p.parallel_safe;
+        if (Array.isArray(p.writes_paths) && p.writes_paths.length > 0) execMeta.writes_paths = p.writes_paths;
+        if (typeof p.model_hint === 'string') execMeta.model_hint = p.model_hint;
+
         docs.push({
           id: `squad_capability:${p.squad}:${capId}`,
           text,
@@ -183,6 +436,7 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
             score_boost: typeof p.score_boost === 'number' ? p.score_boost : 1.0,
             invoke: p.invoke || null,
             examples: p.examples || [],
+            ...execMeta,
           },
         });
 
@@ -215,6 +469,7 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
               score_boost: typeof p.score_boost === 'number' ? p.score_boost : 1.0,
               invoke: p.invoke || null,
               examples: p.examples || [],
+              ...execMeta,
             },
           });
         }
@@ -354,6 +609,12 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
           description: b.description || '',
           domains: b.domains || [],
           capabilities: b.capabilities || [],
+          // Business Protocol 2.0 §6.9. The not_for penalty in applyAdjustments
+          // reads meta.not_for and has since routing-360 Phase 2; a business
+          // never had one to read, because the registry dropped the field.
+          // Deliberately NOT part of `text`: a fence is an exclusion signal,
+          // and indexing it would make the brief it excludes match better.
+          not_for: b.not_for || [],
           operation_mode: b.operation_mode || null,
           authority_level: b.authority_level || null,
           manifest_path: b.manifest_path || null,
@@ -374,11 +635,25 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
       const businessDomains = Array.isArray(businessEntry.domains) ? businessEntry.domains.join(' ') : '';
       for (const route of routes) {
         if (!route || typeof route.pattern !== 'string' || typeof route.route_to !== 'string') continue;
-        // Extract keywords from pattern. Patterns are typically `type:X-Y_Z`.
-        // Strip `type:` prefix and split on `[-_:]` to get matchable tokens.
-        const patternClean = route.pattern.replace(/^type:/, '').replace(/[-_:]/g, ' ').trim();
+        // The literals the activation regex can match — see
+        // routePatternIndexText. Before it, this line read the regex source
+        // itself, and the route was unreachable by any brief written in words.
+        const patternClean = routePatternIndexText(route.pattern);
         // Boost matchability: include slug, employee, and pattern keywords twice
         // so BM25 favors brief→pattern matches over generic descriptions.
+        //
+        // ×2 is measured, and ×3 and beyond were REJECTED. Sweeping the weight
+        // on the live corpus against the PT-BR criterion brief (the quoted
+        // brief is data, not prose: i18n-user-facing)
+        // "preciso de uma revisão de segurança no meu monorepo":
+        // ×1 puts sf-security-engineer at rank 32, ×2 at 25,
+        // ×3 at 24, and ×4, ×6 and ×8 all at 24-23. The term frequency
+        // saturates — BM25's k1 caps what repetition buys — while the document
+        // length keeps growing, so past ×2 the weight only lifts routes that
+        // ALREADY matched, and on that brief the one it lifted was sf-cto
+        // (rank 9 -> 2 at ×6), which matches "monorepo" and is the wrong
+        // employee for a security review. Raising the weight to promote the
+        // wrong route is tuning to the test.
         const text = [
           patternClean, patternClean,
           route.route_to.replace(/-/g, ' '),
@@ -404,6 +679,12 @@ function buildMatchDocs(squadsRegistry, businessesRegistry) {
   }
 
   return docs;
+}
+
+/** Prepare one immutable sparse corpus for batch callers using one registry snapshot. */
+function prepareMatchIndex(registries) {
+  const docs = buildMatchDocs(registries && registries.squads, registries && registries.businesses);
+  return Object.freeze({ docs, index: docs.length ? bm25.buildIndex(docs) : null });
 }
 
 /**
@@ -626,7 +907,7 @@ function stage2Match(intent, registries, opts) {
 
   const idx = bm25.buildIndex(docs);
   const queryStr = brief + ' ' + ((intent && intent.domains) || []).join(' ') + ' ' + ((intent && intent.verbs) || []).join(' ');
-  const raw = bm25.query(idx, queryStr, { topK: (opts && opts.topK) || 10 });
+  const raw = bm25.query(idx, queryStr, { topK: (opts && opts.topK) || STAGE2_TOPK });
 
   const adjusted = applyAdjustments(raw, intent && intent.intent, brief);
   return adjusted.map((r) => ({
@@ -655,11 +936,12 @@ async function stage2MatchHybrid(intent, registries, opts) {
   // amplified tokens — the Stage 3 coverage gate would go blind. The census
   // measurement base (real ≥3 matched, out-of-domain ≤2) is the raw brief.
   const coverageBrief = (opts && opts.coverageBrief) || brief;
-  const topK = (opts && opts.topK) || 10;
-  const docs = buildMatchDocs(registries.squads, registries.businesses);
+  const topK = (opts && opts.topK) || STAGE2_TOPK;
+  const prepared = opts && opts.preparedMatchIndex;
+  const docs = prepared ? prepared.docs : buildMatchDocs(registries.squads, registries.businesses);
   if (docs.length === 0) return [];
 
-  const idx = bm25.buildIndex(docs);
+  const idx = prepared ? prepared.index : bm25.buildIndex(docs);
   const queryStr = brief + ' ' + ((intent && intent.domains) || []).join(' ') + ' ' + ((intent && intent.verbs) || []).join(' ');
   const bm25Full = bm25.query(idx, queryStr, { topK: docs.length });
 
@@ -748,6 +1030,82 @@ async function stage2MatchHybrid(intent, registries, opts) {
  * stage3Decide and the Stage 3.5 dense-fallback dedupe: two candidates with
  * one destination are one suggestion, not an ambiguity.
  */
+/**
+ * How many candidates a Stage 3 decision EXPOSES. Not a scoring parameter: the
+ * signal is decided before this list is built, so widening it cannot turn a
+ * NO_MATCH into a HIGH.
+ *
+ * It was 3, and 3 was measured to be the dominant loss of the whole router.
+ * On the 35 real briefs harvested from the audit log (2026-09-17, installed
+ * 0.13.13): the right destination is the exposed top-1 in 0.171 of them, sits
+ * in the first 3 distinct destinations in 0.371, and in the first 15 in 0.686.
+ * The retriever finds the answer four times more often than the decision let
+ * anyone see it. Nothing downstream reads this list as membership — the
+ * self-retrieval gate compares `rank <= maxRank`, the business verifier asks
+ * for `hit === 0`, and eval-routing measures position 1 and the first 3 — so
+ * the depth is free to the gates and only makes their diagnostics honest
+ * (a miss past rank 3 used to report rank "unknown").
+ */
+const EXPOSED_ALTERNATIVES_MAX = 15;
+
+/**
+ * How many scored slots Stage 2 retrieves. Slots are per capability, so this is
+ * not a count of destinations: 30 slots yielded 17.6 distinct destinations on
+ * the real briefs, which is what fills a 15-destination exposure.
+ *
+ * It was 10, and 10 starved the exposure the moment the cap came off. Swept
+ * offline on the 35 real briefs harvested from the audit log (amplifier off, so
+ * the numbers reproduce), measuring whether the right destination lands inside
+ * the exposed window:
+ *
+ *   topK    distinct    in window    business    squad    ms/35 briefs
+ *     10         6.3        0.571       0.474    0.688          11055
+ *     20        12.0        0.657       0.632    0.688          12330
+ *     30        17.6        0.714       0.632    0.813          12333
+ *     40        23.1        0.686       0.632    0.750          12707
+ *     60        33.8        0.686       0.632    0.750          12656
+ *    120        62.4        0.686       0.632    0.750          13170
+ *
+ * 30 is the peak, and past it recall FALLS: more slots crowd more destinations
+ * into the first 15 and push the right one out of the window. The weak axis
+ * gains most (business 0.474 -> 0.632). Cost is about 37ms per brief, all of it
+ * BM25 sort, with no network.
+ *
+ * Deeper retrieval cannot move the winner: topK keeps the highest scorers, so
+ * everything it adds scores below what was already there, which also leaves the
+ * Stage 3 ambiguity cluster (a window around the top) untouched.
+ */
+const STAGE2_TOPK = 30;
+
+/**
+ * The exposed list for a decision that asks the caller to CHOOSE: one entry per
+ * destination, in score order, up to EXPOSED_ALTERNATIVES_MAX of them.
+ *
+ * Deduping by destination is the point here and not elsewhere. A brief that
+ * cannot be decided needs variety of destinations to pick from, and slots are
+ * per capability, so the same squad used to occupy several of the three
+ * (measured on the real briefs: 4.34 slots collapsed to 2.06 destinations, so
+ * a "top 3" was a choice between two). Inside a single-destination HIGH
+ * cluster the opposite is true — sibling capabilities of one squad are
+ * legitimately distinct candidates — which is why those paths stay positional.
+ * Candidates with no resolvable destination are kept, never deduped.
+ */
+function exposeAlternatives(matches, opts) {
+  const limit = (opts && typeof opts.limit === 'number') ? opts.limit : EXPOSED_ALTERNATIVES_MAX;
+  const out = [];
+  const seen = new Set();
+  for (const m of (Array.isArray(matches) ? matches : [])) {
+    const destination = resolveDestination(m);
+    if (destination) {
+      if (seen.has(destination)) continue;
+      seen.add(destination);
+    }
+    out.push(m);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 function resolveDestination(m) {
   const meta = (m && (m.meta || (m.doc && m.doc.meta))) || {};
   if (meta.type === 'business_route') return String(meta.route_to || '').split('::')[0] || null;
@@ -850,14 +1208,14 @@ function stage3Decide(matches, opts) {
       return {
         signal: 'NO_MATCH',
         reason: `coverage: vencedor casa ${cov.matched} de ${cov.total} tokens de conteúdo do brief`,
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         thresholds: thr,
       };
     }
     if (cov.matched === 2 && cov.total >= 4 && frac <= 0.5) {
       return {
         signal: 'AMBIGUOUS',
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         reason: `coverage: vencedor casa só 2 de ${cov.total} tokens de conteúdo — confirmação necessária`,
         thresholds: thr,
       };
@@ -873,7 +1231,7 @@ function stage3Decide(matches, opts) {
     if (cov.matched <= 1 && cov.total === 2) {
       return {
         signal: 'AMBIGUOUS',
-        alternatives: matches.slice(0, 3),
+        alternatives: exposeAlternatives(matches),
         reason: `coverage: vencedor casa ${cov.matched} de 2 tokens de conteúdo — confirmação necessária`,
         thresholds: thr,
       };
@@ -886,7 +1244,7 @@ function stage3Decide(matches, opts) {
     return {
       signal: 'HIGH',
       target: top,
-      alternatives: matches.slice(1, 3),
+      alternatives: matches.slice(1, EXPOSED_ALTERNATIVES_MAX),
       reason: `top=${top.normalized.toFixed(3)} ge ${thr.match_high_threshold} & lead=${lead.toFixed(3)} ge ${thr.match_high_lead}`,
       thresholds: thr,
     };
@@ -915,7 +1273,7 @@ function stage3Decide(matches, opts) {
       return {
         signal: 'HIGH',
         target: top,
-        alternatives: cluster.slice(1, 3),
+        alternatives: cluster.slice(1, EXPOSED_ALTERNATIVES_MAX),
         reason: `${cluster.length} candidatos, destino único ${[...destinos][0]}`,
         thresholds: thr,
       };
@@ -935,7 +1293,7 @@ function stage3Decide(matches, opts) {
     // Single match between ambiguous and high. Prefer to surface as AMBIGUOUS so user confirms.
     return {
       signal: 'AMBIGUOUS',
-      alternatives: [top, ...matches.slice(1, 3)],
+      alternatives: [top, ...matches.slice(1, EXPOSED_ALTERNATIVES_MAX)],
       reason: `top ${top.normalized.toFixed(3)} below high threshold ${thr.match_high_threshold} — confirm`,
       thresholds: thr,
     };
@@ -944,7 +1302,7 @@ function stage3Decide(matches, opts) {
   return {
     signal: 'NO_MATCH',
     reason: `top score ${top.normalized.toFixed(3)} below ambiguous threshold ${thr.match_ambiguous_threshold}`,
-    alternatives: matches.slice(0, 3),
+    alternatives: exposeAlternatives(matches),
     thresholds: thr,
   };
 }
@@ -995,18 +1353,37 @@ const BODY_DOC_MAX_NORMALIZED = Number(process.env.NIRVANA_BODY_DOC_MAX) || 0.85
 const DENSE_FALLBACK_MIN_COSINE = 0.55;
 
 /** Effective mode of the fallback slot: 'off' | 'fallback'.
- *  context.denseMode is the test hook; env > config otherwise. */
-function denseFallbackMode(context) {
+ *  context.denseMode is the test hook; the routing.dense setting otherwise.
+ * @returns {Promise<'off'|'fallback'>}
+ */
+/**
+ * The system routing mode, read through its single source of truth
+ * (_shared/lib/routing-mode.ts: --mode > routing.mode > env > project > global
+ * > agentic). Dynamic import for the same reason denseFallbackMode gives below;
+ * failure resolves to agentic, which changes nothing.
+ */
+async function routingMode(context) {
+  if (context && typeof context.mode === 'string' && context.mode) return context.mode;
+  try {
+    const m = await import(path.join(__dirname, '..', '..', '_shared', 'lib', 'routing-mode.ts'));
+    return m.resolveRoutingMode();
+  } catch {
+    return 'agentic';
+  }
+}
+
+async function denseFallbackMode(context) {
   if (context && (context.denseMode === 'off' || context.denseMode === 'fallback')) {
     return context.denseMode;
   }
-  const env = process.env.NIRVANA_ROUTER_DENSE;
-  if (env === '1') return 'fallback';
-  if (env === '0') return 'off';
   try {
-    // harness-config.ts owns the config precedence; requiring .ts works under
-    // Bun (same pattern as host-agent-driver.ts). Failure → off, never a crash.
-    const cfg = require(path.join(__dirname, 'harness-config.ts'));
+    // harness-config.ts resolves the setting (env > project > global > engine
+    // default). Dynamic import(), not require(): a `.js` requiring a `.ts`
+    // can throw `TypeError: require() async module` under Bun on Windows
+    // (see budget.js's loadSettings() for the same pattern), while
+    // Bun's dynamic import() is always safe for an ESM module regardless of
+    // platform. Failure → off, never a crash. The one caller already awaits.
+    const cfg = await import(path.join(__dirname, 'harness-config.ts'));
     return cfg.denseRoutingMode();
   } catch {
     return 'off';
@@ -1023,11 +1400,12 @@ function denseFallbackMode(context) {
  * async (brief, [{id, text}]) → [{id, score}] | null).
  */
 async function denseNoMatchFallback(brief, registries, context) {
-  if (denseFallbackMode(context) !== 'fallback') return null;
+  if (await denseFallbackMode(context) !== 'fallback') return null;
   let rank = context && typeof context.denseRank === 'function' ? context.denseRank : null;
   if (!rank) {
     try {
-      const denseIndex = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'dense-index.ts'));
+      // Dynamic import(), not require() — see denseFallbackMode above for why.
+      const denseIndex = await import(path.join(__dirname, '..', '..', '_shared', 'lib', 'dense-index.ts'));
       rank = denseIndex.denseRank;
     } catch { return null; } // dense machinery absent → clean no-op
   }
@@ -1082,9 +1460,13 @@ async function denseNoMatchFallback(brief, registries, context) {
 /**
  * Stage 4 — Budget pre-flight. Delegates to lib/budget.js.
  *
+ * Async because budget.js resolves settings.ts via dynamic import() (a
+ * synchronous `require()` of that `.ts` crashes on Windows — see budget.js's
+ * own header). Every call site here is already inside `route()`.
+ *
  * @param {object} target match meta from Stage 3 (or null)
  * @param {object} ctx optional cap overrides
- * @returns {{ok: boolean, estimated_usd: number, max_cost_usd: number, breakdown: object}}
+ * @returns {Promise<{ok: boolean, estimated_usd: number, max_cost_usd: number, breakdown: object}>}
  */
 function stage4BudgetCheck(target, ctx) {
   const t = target || {};
@@ -1144,6 +1526,14 @@ function stage5Invoke(target, brief, ctx) {
     invoke: meta.invoke || null,
     fidelity_status: meta.fidelity_status || null,
     operation_mode: meta.operation_mode || null,
+    // Declared execution facts, carried so the adapter that dispatches this
+    // plan can act on them: cost for the budget pre-flight, parallel_safe and
+    // writes_paths for scheduling, model_hint for the runtime. `null` when the
+    // capability declared nothing — the same convention as the fields above.
+    estimated_cost_usd: typeof meta.estimated_cost_usd === 'number' ? meta.estimated_cost_usd : null,
+    parallel_safe: typeof meta.parallel_safe === 'boolean' ? meta.parallel_safe : null,
+    writes_paths: Array.isArray(meta.writes_paths) ? meta.writes_paths : null,
+    model_hint: meta.model_hint || null,
     adapter_hint: ctx && ctx.runtime ? ctx.runtime : 'claude-code',
     loader,
     inherit_context: true,
@@ -1742,10 +2132,30 @@ async function route(brief, ctx) {
   // Stage -2 — Brief strength classifier (zero LLM)
   const strengthReport = classifyBriefStrength(brief);
 
+  // The amplifier is an LLM call at both of its trigger points (Stage -1.5 on a
+  // WEAK brief, and the Stage 2.7 coverage bridge). There is no deterministic
+  // arm: builtin and maestro name the PERSONA, not an offline path. So the mode
+  // decides whether it may run at all.
+  //
+  // The fast mode is the one a caller picks to get a reproducible answer for
+  // free, and it was neither. Measured 2026-09-18 on the live corpus: ten real
+  // briefs routed twice inside one process, same registries, returned different
+  // signals (one brief flipped HIGH to AMBIGUOUS between consecutive passes);
+  // with the amplifier off the two passes were identical. It also spent tokens
+  // on every WEAK brief, which is why verify/kinds/business.ts and the bridge
+  // tests already disable it by hand.
+  //
+  // An explicit context.amplify still wins in both directions. The mode is the
+  // default, never an override.
+  const routingModeName = await routingMode(context);
+  const amplifyAllowed = typeof context.amplify === 'boolean'
+    ? context.amplify
+    : routingModeName !== 'fast';
+
   // Stage -1.5 — Optional amplification when WEAK (or --force-amplify)
-  // Disabled by --no-amplify (context.amplify === false).
+  // Disabled by --no-amplify (context.amplify === false) and by the fast mode.
   const shouldAmplify =
-    context.amplify !== false &&
+    amplifyAllowed &&
     (context.forceAmplify === true || strengthReport.strength === 'WEAK');
   if (shouldAmplify) {
     const amp = await amplifierFn(brief, {
@@ -1773,7 +2183,9 @@ async function route(brief, ctx) {
       amplifier_used: 'skipped',
       reason: context.amplify === false
         ? 'amplify_disabled'
-        : `strength=${strengthReport.strength}_above_threshold`,
+        : !amplifyAllowed
+          ? `amplify_disabled_by_mode_${routingModeName}`
+          : `strength=${strengthReport.strength}_above_threshold`,
       original_brief: originalBrief,
       strength: strengthReport,
     };
@@ -1818,7 +2230,7 @@ async function route(brief, ctx) {
           stage_explicit_mention: { matched: true, slug: mention.slug, type: mention.type },
           stage2: { skipped: true, reason: 'explicit_target_mention_short_circuit' },
           stage3: decision,
-          stage4: stage4BudgetCheck(targetMatch, context.budget),
+          stage4: await stage4BudgetCheck(targetMatch, context.budget),
           stage5: stage5Invoke(targetMatch, brief, context),
           context_budget: contextBudget.estimateContextBudget(),
           warnings: registries.warnings || [],
@@ -1852,7 +2264,7 @@ async function route(brief, ctx) {
         stage_minus_1: { matched: true, signals: metaMatch.meta.stage_minus_1_signals },
         stage2: { skipped: true, reason: 'stage_minus_1_meta_orchestrator_short_circuit' },
         stage3: decision,
-        stage4: stage4BudgetCheck(metaMatch, context.budget),
+        stage4: await stage4BudgetCheck(metaMatch, context.budget),
         stage5: stage5Invoke(metaMatch, brief, context),
         context_budget: contextBudget.estimateContextBudget(),
         warnings: registries.warnings || [],
@@ -1885,7 +2297,10 @@ async function route(brief, ctx) {
       });
 
   // Stage 2 — Capability matching (BM25 + denso opcional + business_route, RRF)
-  let matches = await stage2MatchHybrid(intent, registries, { brief, topK: 10, businessRouteRanked, coverageBrief: originalBrief });
+  let matches = await stage2MatchHybrid(intent, registries, {
+    brief, topK: STAGE2_TOPK, businessRouteRanked, coverageBrief: originalBrief,
+    preparedMatchIndex: context.preparedMatchIndex,
+  });
 
   // Stage 2.7 — Amplification bridge (routing-360 Phase 3.3, the inversion fix).
   //
@@ -1920,7 +2335,7 @@ async function route(brief, ctx) {
       : loadKeywordAliases(registries);
     if (aliasMap) {
       const docsById = new Map(
-        buildMatchDocs(registries.squads, registries.businesses).map((d) => [d.id, d]),
+        (context.preparedMatchIndex?.docs || buildMatchDocs(registries.squads, registries.businesses)).map((d) => [d.id, d]),
       );
       const briefToks = bm25.tokenize(originalBrief);
       const aliasCov = matches.map((m) => {
@@ -1936,7 +2351,7 @@ async function route(brief, ctx) {
     // ('skipped' = strength gate did not fire; 'failed' means a run was already
     // attempted and re-trying would double the failure, so it is excluded).
     if (!bridge.alias_adopted &&
-        context.amplify !== false &&
+        amplifyAllowed &&
         amplification && amplification.amplifier_used === 'skipped') {
       const amp = await amplifierFn(originalBrief, {
         preferAmplifier: context.preferAmplifier,
@@ -1964,7 +2379,8 @@ async function route(brief, ctx) {
           ? []
           : businessRouteCoverageRanked(brief, registries.businesses, { threshold: context.stage0Threshold });
         matches = await stage2MatchHybrid(intent, registries, {
-          brief, topK: 10, businessRouteRanked: rerankedRoutes, coverageBrief: originalBrief,
+          brief, topK: STAGE2_TOPK, businessRouteRanked: rerankedRoutes, coverageBrief: originalBrief,
+          preparedMatchIndex: context.preparedMatchIndex,
         });
         // Post-amplify guard (a) — drift-to-zero (routing-360 Phase 4).
         // "Amplification is a lens, not a replacement": each candidate's
@@ -2028,11 +2444,11 @@ async function route(brief, ctx) {
   let budgetCheck = null;
   let invocationPlan = null;
   if (decision.signal === 'HIGH' && decision.target) {
-    budgetCheck = stage4BudgetCheck(decision.target, context.budget);
+    budgetCheck = await stage4BudgetCheck(decision.target, context.budget);
     invocationPlan = stage5Invoke(decision.target, brief, context);
   } else if (decision.signal === 'AMBIGUOUS' && decision.alternatives && decision.alternatives.length > 0) {
     // Use the leading alternative for a tentative budget estimate
-    budgetCheck = stage4BudgetCheck(decision.alternatives[0], context.budget);
+    budgetCheck = await stage4BudgetCheck(decision.alternatives[0], context.budget);
   }
 
   return {
@@ -2065,9 +2481,15 @@ module.exports = {
   stage4BudgetCheck,
   stage5Invoke,
   buildMatchDocs,
+  extractRoutePatternLiterals,
+  routePatternIndexText,
+  prepareMatchIndex,
   buildAliasMap,
   loadKeywordAliases,
   resolveDestination,
+  exposeAlternatives,
+  STAGE2_TOPK,
+  EXPOSED_ALTERNATIVES_MAX,
   DEFAULT_THRESHOLDS,
   DENSE_FALLBACK_MIN_COSINE,
   STAGE0_KEYWORD_THRESHOLD,
@@ -2127,8 +2549,27 @@ if (require.main === module) {
       process.exit(4);
     }
     try {
-      // Audit: brief received (always written when CLI is invoked)
-      try { audit.emit('brief_received', { brief, command: cmd }); } catch {}
+      // Audit: brief received (always written when CLI is invoked).
+      //
+      // This was the ONLY brief_received carrying the brief text, and the only
+      // one with no trace — so buildRuns filed it under "no-trace" and no run
+      // card ever saw it. It also sent the WHOLE brief, unbounded, into a file
+      // appended thousands of times a day. Both halves fixed: a bounded excerpt
+      // (brief-excerpt.ts) with the true length beside it, and the trace when
+      // the CLI runs inside a dispatch. `nrv find` typed by hand is a lookup and
+      // not a run, so it still carries no trace — an invented one would put a
+      // phantom card in the cockpit.
+      try {
+        // brief-excerpt.js, not the .ts: a `.js` requiring a `.ts` sibling can
+        // throw `TypeError: require() async module` under Bun on Windows (see
+        // that file's own header) — the .js is the canonical CJS implementation.
+        const { briefExcerpt } = require(path.join(__dirname, '..', '..', '_shared', 'lib', 'brief-excerpt.js'));
+        const traceId = process.env.NIRVANA_TRACE_ID || null;
+        audit.emit('brief_received', {
+          ...(traceId ? { trace_id: traceId } : {}),
+          brief_excerpt: briefExcerpt(brief), brief_chars: brief.length, command: cmd,
+        });
+      } catch {}
       const result = await route(brief, {
         prefer,
         amplify: !noAmplify,

@@ -11,17 +11,19 @@
  *   - Gemini-CLI    → ~/.gemini/settings.json       (BeforeTool + AfterTool + SessionStart)
  *   - Antigravity   → ~/.antigravity/settings.json  (BeforeTool + AfterTool + SessionStart)
  *
- * Codex is NOT wired here: it has no granular settings.json hook mechanism
- * (PreToolUse/BeforeTool, etc.) — its config is ~/.codex/config.toml and audit
- * comes from session transcripts + the ~/.harness-logs jsonl fallback. Other
- * future agents (Cursor, …) plug in by adding entries to AGENTS_TO_INSTALL.
+ *   - Codex         → ~/.codex/hooks.json           (PreToolUse + PostToolUse, matcher Bash|apply_patch)
+ *                     plus the trust record in ~/.codex/config.toml that lets a
+ *                     headless `codex exec` run them (see _shared/lib/codex-hooks.ts)
+ *
+ * Other future agents (Cursor, …) plug in by adding entries to AGENTS_TO_INSTALL.
  *
  * Usage:
- *   nrv install            # install / repair hooks + verify toolchain
- *   nrv install --dry      # show what would change, don't write
- *   nrv install --uninstall  # remove our hooks (keeps user's other settings)
- *   nrv install --check    # report installation status, exit 0/1
- *   nrv install -h         # this message
+ *   nrv setup              # install / repair hooks + verify toolchain
+ *   nrv setup --dry        # show what would change, don't write
+ *   nrv setup --uninstall  # remove our hooks (keeps user's other settings)
+ *   nrv setup --check      # report installation status, exit 0/1
+ *   nrv setup --repair-path [--apply]  # Windows: drop temporary nrv-* entries from the user PATH
+ *   nrv setup -h           # this message
  */
 
 import * as fs from "node:fs";
@@ -30,11 +32,16 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseArgs, EXIT, log } from "../lib/bun-helpers.ts";
+import {
+  SKIP_PATH_PERSIST_ENV, skipPathPersist, isUnderTempRoot, broadcastEnvironmentChange,
+  readUserPath, writeUserPath, removeTempNrvEntries, removeEntriesUnderRoot, tempRoots, expandEnv, joinPath,
+} from "../lib/windows-user-path.ts";
 
 // ─── Marker that identifies hooks added by this script ────────────────
 // Any hook whose command contains one of these tokens is "ours" and is
 // safe to overwrite/remove. Keeps user-added hooks untouched.
 const NIRVANA_TOKENS = ["audit-emit-from-hook.ts", "gemini-session-start.ts"];
+import { codexConfigPath, codexHookHash, codexHookTrustEntries, codexHooksPath, readCodexHookState, removeCodexHookTrust, upsertCodexHookTrust } from "../lib/codex-hooks.ts";
 
 // Shared skills tree (Option B): prefer ~/.nirvana/skills so the audit-hook
 // command paths written into each runtime's settings.json survive removal of
@@ -43,11 +50,6 @@ const SKILLS_DIR = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
 const HOOK_SCRIPT = path.join(SKILLS_DIR, "_shared", "scripts", "audit-emit-from-hook.ts");
 const SESSION_START_SCRIPT = path.join(SKILLS_DIR, "_shared", "scripts", "gemini-session-start.ts");
-// stderr suppression that's valid on the shell each runtime uses to run hooks:
-// cmd.exe wants `2>nul` and has no `|| true`; POSIX shells want the bash form.
-// Hook paths are ALWAYS quoted below so a space in the username (C:\Users\John Doe)
-// doesn't truncate argv.
-const HOOK_SUPPRESS = process.platform === "win32" ? "2>nul" : "2>/dev/null || true";
 
 interface HookSpec {
   matcher?: string;
@@ -70,7 +72,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-pre",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" pre claude-code ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" pre claude-code`,
           async: true,
           timeout: 5,
         }],
@@ -80,7 +82,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-post",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" post claude-code ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" post claude-code`,
           async: true,
           timeout: 5,
         }],
@@ -96,7 +98,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-pre",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" pre gemini-cli ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" pre gemini-cli`,
           timeout: 5000,
         }],
       }],
@@ -105,7 +107,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-post",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" post gemini-cli ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" post gemini-cli`,
           timeout: 5000,
         }],
       }],
@@ -113,9 +115,29 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-session-start",
           type: "command",
-          command: `bun "${SESSION_START_SCRIPT}" ${HOOK_SUPPRESS}`,
+          command: `bun "${SESSION_START_SCRIPT}"`,
           timeout: 5000,
         }],
+      }],
+    },
+  },
+  {
+    // Codex reads hooks.json with the same shape Claude's settings.json `hooks`
+    // block has; the payload it sends (`tool_name` "Bash" / "apply_patch",
+    // `tool_input`, `tool_response`, `session_id`, `cwd`) is what the bridge
+    // already parses. No `name` field: Codex ignores unknown handler keys
+    // today, and the bridge token is what identifies ours anyway. Trust is
+    // recorded separately (codexTrust below) — without it exec skips the hook.
+    name: "Codex",
+    settingsPath: codexHooksPath(),
+    groups: {
+      PreToolUse: [{
+        matcher: "Bash|apply_patch",
+        hooks: [{ type: "command", command: `bun "${HOOK_SCRIPT}" pre codex`, async: true, timeout: 5 }],
+      }],
+      PostToolUse: [{
+        matcher: "Bash|apply_patch",
+        hooks: [{ type: "command", command: `bun "${HOOK_SCRIPT}" post codex`, async: true, timeout: 5 }],
       }],
     },
   },
@@ -131,7 +153,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-pre",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" pre antigravity-cli ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" pre antigravity-cli`,
           timeout: 5000,
         }],
       }],
@@ -140,7 +162,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-audit-post",
           type: "command",
-          command: `bun "${HOOK_SCRIPT}" post antigravity-cli ${HOOK_SUPPRESS}`,
+          command: `bun "${HOOK_SCRIPT}" post antigravity-cli`,
           timeout: 5000,
         }],
       }],
@@ -148,7 +170,7 @@ const AGENTS_TO_INSTALL: AgentInstallSpec[] = [
         hooks: [{
           name: "nirvana-session-start",
           type: "command",
-          command: `bun "${SESSION_START_SCRIPT}" ${HOOK_SUPPRESS}`,
+          command: `bun "${SESSION_START_SCRIPT}"`,
           timeout: 5000,
         }],
       }],
@@ -237,8 +259,30 @@ function wireLocalBinOnPath(dry: boolean): string[] {
   const notes: string[] = [];
   const home = os.homedir();
   const localBin = path.join(home, ".local", "bin");
+  // Issue #87: the persistence target is the REAL user's — the registry hive on
+  // Windows, the shell rc files elsewhere — even when HOME/USERPROFILE point at
+  // a fake home, so a test that ran this with a temporary HOME left that path on
+  // the real user PATH for good. Two guards, both stated in the output:
+  // NIRVANA_SKIP_PATH_PERSIST=1 (every fake-home test sets it), and on Windows,
+  // where the hive is shared, a localBin under a temporary directory is never
+  // persisted, flag or not. The current process still gets it on its own PATH.
+  const skipReason = skipPathPersist() ? `${SKIP_PATH_PERSIST_ENV}=1`
+    : process.platform === "win32" && isUnderTempRoot(localBin) ? `${localBin} is under a temporary directory`
+    : null;
   if (process.platform === "win32") {
-    if (dry) { notes.push(`would add ${localBin} to the user PATH (Windows)`); return notes; }
+    if (dry) {
+      notes.push(skipReason ? `would not persist ${localBin} to the user PATH (${skipReason})` : `would add ${localBin} to the user PATH (Windows)`);
+      return notes;
+    }
+    // Make the CURRENT install process see it, so the post-install `nrv index`
+    // (this same run) resolves the launcher without a restart.
+    if (!(process.env.PATH || "").split(";").some(p => p.trim().replace(/\\+$/, "").toLowerCase() === localBin.toLowerCase())) {
+      process.env.PATH = `${localBin};${process.env.PATH || ""}`;
+    }
+    if (skipReason) {
+      notes.push(`not persisting ${localBin} to the user PATH (${skipReason}) — this process only; registry untouched, no WM_SETTINGCHANGE broadcast.`);
+      return notes;
+    }
     // 1) PERSIST to the USER PATH via the registry ([Environment]::SetEnvironmentVariable
     //    'User') — NOT setx, which truncates PATH at 1024 chars. Idempotent.
     const persistPs =
@@ -252,23 +296,10 @@ function wireLocalBinOnPath(dry: boolean): string[] {
       persisted = r.stdout || "";
     } catch { /* fall through to the manual-add note below */ }
 
-    // Make the CURRENT install process see it too, so the post-install `nrv index`
-    // (this same run) resolves the launcher without a restart.
-    if (!(process.env.PATH || "").split(";").some(p => p.trim().replace(/\\+$/, "").toLowerCase() === localBin.toLowerCase())) {
-      process.env.PATH = `${localBin};${process.env.PATH || ""}`;
-    }
-
-    // 2) BEST-EFFORT broadcast WM_SETTINGCHANGE (0x1A) to HWND_BROADCAST so an
-    //    already-running Explorer reloads its environment block — terminals opened
-    //    afterwards inherit the new PATH WITHOUT a logoff/restart. Isolated in its
-    //    own process+try so a failure here can NEVER undo the persistence above.
-    if (/added/.test(persisted)) {
-      const bcastPs =
-        "$s='[DllImport(\"user32.dll\")] public static extern int SendMessageTimeout(IntPtr h,int m,IntPtr w,string l,int f,int t,out IntPtr r);'; " +
-        "Add-Type -MemberDefinition $s -Name W -Namespace N | Out-Null; " +
-        "$r=[IntPtr]::Zero; [void][N.W]::SendMessageTimeout([IntPtr]0xffff,0x1A,[IntPtr]::Zero,'Environment',2,5000,[ref]$r)";
-      try { spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", bcastPs], { encoding: "utf8", timeout: 8000 }); } catch { /* best-effort */ }
-    }
+    // 2) BEST-EFFORT broadcast so terminals opened afterwards inherit the new
+    //    PATH WITHOUT a logoff/restart. Its own process and try, so a failure
+    //    here can NEVER undo the persistence above.
+    if (/added/.test(persisted)) broadcastEnvironmentChange();
 
     if (/added/.test(persisted)) {
       notes.push(`added ${localBin} to the user PATH (Windows) — new terminals work immediately (no restart).`);
@@ -277,12 +308,23 @@ function wireLocalBinOnPath(dry: boolean): string[] {
     else notes.push(`não consegui ajustar o PATH automaticamente — adicione "%USERPROFILE%\\.local\\bin" ao PATH do usuário.`);
     return notes;
   }
+  if (skipReason) {
+    notes.push(`${dry ? "would not persist" : "not persisting"} ~/.local/bin to a shell profile (${skipReason}).`);
+    return notes;
+  }
   const marker = "# nirvana-os: nrv on PATH";
   const shell = process.env.SHELL || "";
   const targets: string[] = [];
   if (shell.includes("zsh")) targets.push(path.join(home, ".zshrc"));
   else if (shell.includes("bash")) { targets.push(path.join(home, ".bashrc")); targets.push(path.join(home, ".bash_profile")); }
   else if (shell.includes("fish")) targets.push(path.join(home, ".config", "fish", "config.fish"));
+  else if (!shell) {
+    // No SHELL at all (some sandboxes and agent harnesses): ~/.profile alone
+    // would leave every macOS zsh user without nrv, since zsh never reads it.
+    // The block is idempotent, so covering the two common shells costs nothing.
+    targets.push(path.join(home, ".zshrc"));
+    targets.push(path.join(home, ".bashrc"));
+  }
   if (!shell.includes("fish")) targets.push(path.join(home, ".profile")); // login-shell fallback
   for (const t of targets) {
     try {
@@ -296,6 +338,70 @@ function wireLocalBinOnPath(dry: boolean): string[] {
     } catch (e) { notes.push(`could not update ${t.replace(home, "~")}: ${(e as Error).message}`); }
   }
   if (notes.some(n => /added|would add/.test(n))) notes.push("→ abra um NOVO terminal (ou `source` o profile) para o `nrv` funcionar.");
+  return notes;
+}
+
+// ─── Reverse of wireLocalBinOnPath ─────────────────────────────────────
+// The install side above edits shell rc files and the Windows user PATH; this
+// undoes exactly that, and only that. A shell rc file is never truncated: the
+// marker block is removed by finding the EXACT bytes the installer appended
+// (`\n${marker}\n${pathLine}\n`) and cutting only that substring, wherever it
+// sits — everything else in the file, byte for byte, stays put. If the marker
+// line is present but the following line does not match what we wrote (a
+// human edited between them, or hand-removed just the PATH line), we say so
+// and leave the file alone rather than guess where our block ended.
+function unwireLocalBinFromPath(dry: boolean): string[] {
+  const notes: string[] = [];
+  const home = os.homedir();
+  const localBin = path.join(home, ".local", "bin");
+  const marker = "# nirvana-os: nrv on PATH";
+
+  if (process.platform === "win32") {
+    const reg = readUserPath();
+    if (!reg) { notes.push("could not read the user PATH from the registry — nothing to remove there."); return notes; }
+    const { after, removed } = removeEntriesUnderRoot(reg.value, localBin);
+    if (removed.length === 0) { notes.push(`${localBin} not on the user PATH — nothing to remove.`); return notes; }
+    if (dry) { notes.push(`would remove ${localBin} from the user PATH (Windows registry) — ${removed.length} entr${removed.length === 1 ? "y" : "ies"}.`); return notes; }
+    if (!writeUserPath({ value: joinPath(after), kind: reg.kind })) {
+      notes.push(`could not write the user PATH — ${localBin} left in place; remove it by hand via System Properties > Environment Variables.`);
+      return notes;
+    }
+    broadcastEnvironmentChange();
+    notes.push(`removed ${localBin} from the user PATH (Windows registry).`);
+    return notes;
+  }
+
+  const candidates = [
+    { file: path.join(home, ".zshrc"), pathLine: 'export PATH="$HOME/.local/bin:$PATH"' },
+    { file: path.join(home, ".bashrc"), pathLine: 'export PATH="$HOME/.local/bin:$PATH"' },
+    { file: path.join(home, ".bash_profile"), pathLine: 'export PATH="$HOME/.local/bin:$PATH"' },
+    { file: path.join(home, ".profile"), pathLine: 'export PATH="$HOME/.local/bin:$PATH"' },
+    { file: path.join(home, ".config", "fish", "config.fish"), pathLine: "set -gx PATH $HOME/.local/bin $PATH" },
+  ];
+  for (const { file, pathLine } of candidates) {
+    if (!fs.existsSync(file)) continue;
+    let cur: string;
+    try { cur = fs.readFileSync(file, "utf8"); } catch (e) { notes.push(`could not read ${file.replace(home, "~")}: ${(e as Error).message}`); continue; }
+    if (!cur.includes(marker)) continue; // nothing of ours in this file
+    const block = `\n${marker}\n${pathLine}\n`;
+    if (!cur.includes(block)) {
+      notes.push(`marker found in ${file.replace(home, "~")} but the line after it does not match what we wrote — leaving it untouched. Remove by hand if it is ours.`);
+      continue;
+    }
+    const rest = cur.replace(block, "");
+    if (dry) {
+      notes.push(rest === "" ? `would remove ${file.replace(home, "~")} (empty once our block is gone — we created it)` : `would remove the PATH block from ${file.replace(home, "~")}`);
+      continue;
+    }
+    try {
+      // The block was the only content: the file did not exist before install
+      // wrote it (appendFileSync creates on demand), so removing it entirely
+      // — rather than leaving a 0-byte file — is what actually restores the
+      // pre-install state.
+      if (rest === "") { fs.rmSync(file); notes.push(`removed ${file.replace(home, "~")} (was created solely by us)`); }
+      else { fs.writeFileSync(file, rest, "utf8"); notes.push(`removed the PATH block from ${file.replace(home, "~")}`); }
+    } catch (e) { notes.push(`could not update ${file.replace(home, "~")}: ${(e as Error).message}`); }
+  }
   return notes;
 }
 
@@ -336,27 +442,32 @@ function installDependencies(repoRoot: string, dry: boolean): { ok: boolean; not
     notes.push("no root package.json — skipping npm");
   }
 
-  // 2) Symlink each skill's node_modules → repo-root node_modules, so the
-  //    scripts' require('../node_modules/X') resolves. Done in BOTH places the
-  //    skills can run from:
-  //      - the source repo (<repo>/skills/*)        — running scripts directly
-  //      - the deployment   (~/.nirvana/skills/*)    — where Claude Code loads them
-  //    The deployment is the one that actually matters at runtime (the scripts
-  //    use paths.CLAUDE_SKILLS_DIR = ~/.nirvana/skills). Both kept in sync.
-  const linkInto = (dir: string, label: string) => {
-    if (!fs.existsSync(rootNodeModules) || !fs.existsSync(dir)) return;
+  // 2) NO node_modules inside a skill. Both trees resolve their imports by
+  //    walking UP: <repo>/skills/<s>/scripts → <repo>/node_modules, and
+  //    ~/.nirvana/skills/<s>/scripts → ~/.nirvana/node_modules (the store is
+  //    the parent's). This step used to link a node_modules into every skill
+  //    so `require('../node_modules/X')` would work — and Codex's skill scanner,
+  //    which follows symlinks and stops at 20,000 entries per root, walked
+  //    through those links into the whole store on every run. The main
+  //    installer had stopped writing them; this one kept putting them back on
+  //    every `nrv init` (which runs it for the audit hooks). Same defect in two
+  //    emitters, fixed in one and surviving in the other: the second copy is
+  //    what a measurement of the first cannot see. Now both prune.
+  const pruneInside = (dir: string, label: string) => {
+    if (!fs.existsSync(dir)) return;
     let n = 0;
     for (const skill of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!skill.isDirectory() && !skill.isSymbolicLink()) continue;
-      const target = path.join(dir, skill.name, "node_modules");
-      if (fs.existsSync(target)) continue;
-      if (dry) { notes.push(`would link ${label}/${skill.name}/node_modules`); continue; }
-      try { fs.symlinkSync(rootNodeModules, target, process.platform === "win32" ? "junction" : "dir"); n++; } catch { /* best-effort */ }
+      const nm = path.join(dir, skill.name, "node_modules");
+      let st: fs.Stats; try { st = fs.lstatSync(nm); } catch { continue; }
+      if (!st.isSymbolicLink()) continue; // a real tree is not ours to delete
+      if (dry) { notes.push(`would remove ${label}/${skill.name}/node_modules (link)`); continue; }
+      try { fs.rmSync(nm, { force: true }); n++; } catch { /* best-effort */ }
     }
-    if (!dry && n > 0) notes.push(`${label}: linked node_modules in ${n} skills`);
+    if (!dry && n > 0) notes.push(`${label}: removed node_modules link from ${n} skill(s)`);
   };
-  linkInto(skillsDir, "repo");
-  linkInto(SKILLS_DIR, "deployment");  // shared skills tree (~/.nirvana/skills)
+  pruneInside(skillsDir, "repo");
+  pruneInside(SKILLS_DIR, "deployment");  // shared skills tree (~/.nirvana/skills)
 
   // 3) pip install Python deps (pydantic v2 + pyyaml) — ONLY if Python is
   //    present. The canonical validators run on Bun (validators.ts); the Python
@@ -387,18 +498,125 @@ function installDependencies(repoRoot: string, dry: boolean): { ok: boolean; not
   return { ok, notes };
 }
 
+// ─── Windows user PATH repair (issue #87) ─────────────────────────────
+// Engines up to 0.8.0 persisted %USERPROFILE%\.local\bin to the user PATH even
+// when USERPROFILE was a test's temporary HOME, and deleting that HOME never
+// removed the entry. Reports what would go by default; --apply rewrites the
+// value with exactly those entries dropped — everything else verbatim, in its
+// order, with the value kind it had — then broadcasts WM_SETTINGCHANGE so new
+// terminals see it.
+function repairUserPath(apply: boolean): number {
+  console.log("Windows user PATH repair (HKCU\\Environment\\Path)\n");
+  if (process.platform !== "win32") {
+    console.log("  only Windows keeps the user PATH in the registry — nothing to repair here.");
+    return EXIT.OK;
+  }
+  const reg = readUserPath();
+  if (!reg) {
+    console.log("  no user PATH value in HKCU\\Environment (or it could not be read) — nothing to repair.");
+    return EXIT.OK;
+  }
+  const { before, after, removed } = removeTempNrvEntries(reg.value, tempRoots());
+  const show = (entries: string[]) => entries.forEach((e, i) => {
+    const mark = removed.includes(e) ? `   ← temporary nrv entry${fs.existsSync(expandEnv(e)) ? "" : " (missing on disk)"}` : "";
+    console.log(`    ${String(i + 1).padStart(2)}. ${e === "" ? "(empty)" : e}${mark}`);
+  });
+  console.log(`  before (${before.length} entries):`);
+  show(before);
+  if (removed.length === 0) {
+    console.log("\n  no temporary nrv entries — nothing to remove.");
+    return EXIT.OK;
+  }
+  console.log(`\n  after (${after.length} entries):`);
+  show(after);
+  if (!apply) {
+    console.log(`\n(dry run — ${removed.length} entr${removed.length === 1 ? "y" : "ies"} would be removed, nothing written. Re-run with --apply to remove them.)`);
+    return EXIT.OK;
+  }
+  if (!writeUserPath({ value: joinPath(after), kind: reg.kind })) {
+    console.log("\n✗ could not write HKCU\\Environment\\Path — nothing changed.");
+    return EXIT.FAILURES;
+  }
+  broadcastEnvironmentChange();
+  console.log(`\n✓ removed ${removed.length} entr${removed.length === 1 ? "y" : "ies"}; user PATH rewritten (${reg.kind}) and WM_SETTINGCHANGE broadcast — new terminals see the clean PATH.`);
+  return EXIT.OK;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────
+/**
+ * Codex skips a hook nobody reviewed, silently. Record trust for OUR handlers
+ * in ~/.codex/config.toml the way the TUI would (same key, same hash), remove
+ * it on uninstall, report it on --check. Never touches another hook's record.
+ */
+function codexTrust(mode: "install" | "uninstall" | "check"): string[] {
+  const notes: string[] = [];
+  const hooksFile = codexHooksPath();
+  const configFile = codexConfigPath();
+  let entries;
+  try { entries = codexHookTrustEntries(hooksFile, configFile, NIRVANA_TOKENS[0]); } catch (e) { return [`⚠ could not read ${hooksFile}: ${(e as Error).message}`]; }
+  if (mode === "uninstall") {
+    // The hooks are already gone from hooks.json by now; the keys to drop are
+    // whatever OUR records were. Read them by prefix + our known events.
+    const keys = [...readCodexTrustKeysForOurs(configFile, hooksFile)];
+    if (keys.length && removeCodexHookTrust(configFile, keys)) notes.push(`✓ trust records removed from ${configFile} (${keys.length})`);
+    return notes;
+  }
+  if (entries.length === 0) return notes;
+  const untrusted = entries.filter((e) => !e.trusted);
+  if (mode === "check") {
+    notes.push(untrusted.length ? `⚠ ${untrusted.length}/${entries.length} Codex hook(s) not trusted in ${configFile} — run: nrv setup` : `✓ Codex hooks trusted (${entries.length})`);
+    return notes;
+  }
+  if (untrusted.length === 0) return notes;
+  let backedUp = false;
+  for (const e of untrusted) {
+    if (!backedUp) { backup(configFile); backedUp = true; }
+    upsertCodexHookTrust(configFile, e.key, e.hash);
+  }
+  notes.push(`✓ trust recorded in ${configFile} for ${untrusted.length} hook(s) — a headless \`codex exec\` runs them without a review prompt`);
+  return notes;
+}
+
+/** Keys of trust records that belong to our hooks: same file, our events, and a hash we would compute. */
+function readCodexTrustKeysForOurs(configFile: string, hooksFile: string): Set<string> {
+  // Ours are the ones whose hash matches a handler WE would install at that
+  // position. Recompute from the spec so a user's own Bash hook in the same
+  // file, trusted by hand, is never removed. Keys come back unescaped from the
+  // lib, so a Windows path compares as a plain string here.
+  const out = new Set<string>();
+  const spec = AGENTS_TO_INSTALL.find((a) => a.name === "Codex");
+  const ourHashes = new Set<string>();
+  if (spec) {
+    for (const [event, groups] of Object.entries(spec.groups)) {
+      for (const g of groups) for (const h of g.hooks) {
+        try { ourHashes.add(codexHookHash(event, g.matcher, h as any)); } catch { /* skip */ }
+      }
+    }
+  }
+  for (const [key, state] of readCodexHookState(configFile)) {
+    if (key.startsWith(`${hooksFile}:`) && state.trusted_hash && ourHashes.has(state.trusted_hash)) out.add(key);
+  }
+  return out;
+}
+
 function main() {
   const { flags } = parseArgs();
   if (flags.h || flags.help) {
-    console.log(`nrv install — one-shot Nirvana setup
+    console.log(`nrv setup — one-shot Nirvana setup
 
 USAGE
-  nrv install              install / repair hooks across all agents
-  nrv install --dry        show what would change, don't write anything
-  nrv install --check      report status (exit 0 = ready, 1 = needs setup)
-  nrv install --uninstall  remove our hooks (keeps user's other settings)
-  nrv install -h           this help
+  nrv setup                        install / repair hooks across all agents
+  nrv setup --dry                  show what would change, don't write anything
+  nrv setup --check                report status (exit 0 = ready, 1 = needs setup)
+  nrv setup --uninstall            remove our hooks and PATH block (keeps user's other settings)
+  nrv setup --repair-path          Windows: list temporary nrv-* entries left on the
+                                     user PATH by earlier test runs (nothing written)
+  nrv setup --repair-path --apply  remove exactly those entries, keep the rest as is
+  nrv setup -h                     this help
+
+COMPATIBILITY
+  nrv install --bootstrap runs the same setup. Existing install flags such as
+  --check and --repair-path remain supported.
 
 WHAT IT DOES
   1. Verifies toolchain (bun installed, PATH includes ~/.local/bin)
@@ -408,6 +626,12 @@ WHAT IT DOES
   3. Creates timestamped backups before modifying any file
   4. Smoke-tests the audit pipe (writes a sentinel event)
 
+ENVIRONMENT
+  NIRVANA_SKIP_PATH_PERSIST=1  never persist ~/.local/bin to the user PATH
+                               (Windows registry / shell profile); this process
+                               only. Set by every test that installs into a
+                               temporary HOME.
+
 After install, every Write/Edit/Bash by Claude Code OR Gemini-CLI lands in
 ~/.harness-logs/<today>/audit.jsonl automatically. Watch with 'nrv watch'.
 
@@ -416,6 +640,8 @@ inline, with no dispatch, no quality gate and no audit trail.
 `);
     process.exit(EXIT.OK);
   }
+
+  if (flags["repair-path"]) process.exit(repairUserPath(!!flags.apply && !flags.dry));
 
   const dryRun = !!flags.dry;
   const uninstall = !!flags.uninstall;
@@ -432,6 +658,9 @@ inline, with no dispatch, no quality gate and no audit trail.
   console.log(`  ${pth.ok ? "✓" : "⚠"} PATH includes ~/.local/bin`);
   if (!pth.ok && mode === "install" && !check) {
     for (const n of wireLocalBinOnPath(dryRun)) console.log(`     ${n}`);
+  }
+  if (mode === "uninstall" && !check) {
+    for (const n of unwireLocalBinFromPath(dryRun)) console.log(`     ${n}`);
   }
   const scripts = checkScripts();
   console.log(`  ${scripts.ok ? "✓" : "✗"} hook scripts present${scripts.ok ? "" : ` — missing: ${scripts.missing.join(", ")}`}`);
@@ -482,6 +711,7 @@ inline, with no dispatch, no quality gate and no audit trail.
         const { after } = patchSettings(spec, "install");
         fs.writeFileSync(spec.settingsPath, JSON.stringify(after, null, 2) + "\n", "utf8");
         console.log(`     → created ${spec.settingsPath} with hooks`);
+        if (spec.name === "Codex") for (const n of codexTrust("install")) console.log(`     ${n}`);
         anyChange = true;
         installedCount++;
       }
@@ -490,6 +720,14 @@ inline, with no dispatch, no quality gate and no audit trail.
     const result = patchSettings(spec, mode);
     if (!result.changed) {
       console.log(`  ✓ ${spec.name} — already ${mode === "install" ? "installed" : "uninstalled"}`);
+      // The hooks were there; the trust record may not be (an install older
+      // than this step, or a config.toml the user rewrote). Same idempotence:
+      // record what is missing, say nothing when nothing is.
+      if (spec.name === "Codex" && !dryRun) {
+        const notes = codexTrust(check ? "check" : mode);
+        for (const n of notes) console.log(`     ${n}`);
+        if (check && notes.some((n) => n.startsWith("⚠"))) anyChange = true;
+      }
       if (mode === "install") installedCount++;
       continue;
     }
@@ -506,6 +744,7 @@ inline, with no dispatch, no quality gate and no audit trail.
     const bak = backup(spec.settingsPath);
     fs.writeFileSync(spec.settingsPath, JSON.stringify(result.after, null, 2) + "\n", "utf8");
     console.log(`  ✓ ${spec.name} — ${mode}ed${bak ? ` (backup: ${path.basename(bak)})` : ""}`);
+    if (spec.name === "Codex") for (const n of codexTrust(mode)) console.log(`     ${n}`);
     anyChange = true;
     if (mode === "install") installedCount++;
   }
@@ -546,7 +785,7 @@ inline, with no dispatch, no quality gate and no audit trail.
       console.log(`Watch with: ${anyChange ? "(may need to restart your agent for hooks to load) " : ""}nrv watch`);
     }
   } else {
-    console.log("Done. Hooks removed. Other settings preserved.");
+    console.log("Done. Hooks and PATH block removed. Other settings preserved.");
   }
   process.exit(EXIT.OK);
 }

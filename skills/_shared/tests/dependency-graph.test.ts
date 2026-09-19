@@ -272,3 +272,55 @@ describe("toDagNodes bridges into planDag", () => {
     expect(plan.layers[1]).toEqual(["emp"]);
   });
 });
+
+describe("agent nodes", () => {
+  // A role no squad covers: briefed, depending and yielding like a squad; nothing else may touch it.
+  test("an agent node accepts briefs, depends_on and yields, and nothing else", () => {
+    const g = emptyGraph();
+    addNode(g, node("brief-1", "brief"));
+    addNode(g, node("squad-a", "squad"));
+    addNode(g, node("role-writer", "agent"));
+    addNode(g, node("deliv-1", "deliverable"));
+    addEdge(g, edge("e1", "brief-1", "role-writer", "briefs"));
+    addEdge(g, edge("e2", "role-writer", "squad-a", "depends_on"));
+    addEdge(g, edge("e3", "role-writer", "deliv-1", "yields"));
+    expect(validateGraph(g)).toEqual([]);
+    expect(buildOrder(g).order.map((n) => n.id)).toEqual(["brief-1", "squad-a", "role-writer", "deliv-1"]);
+    expect(reachableFromBriefs(g).has("role-writer")).toBeTrue();
+
+    expect(isCompatibleEdge("briefs", "brief", "agent")).toBeTrue();
+    expect(isCompatibleEdge("yields", "agent", "deliverable")).toBeTrue();
+    expect(isCompatibleEdge("owns", "company", "agent")).toBeFalse();
+    expect(isCompatibleEdge("staffs", "employee", "agent")).toBeFalse();
+    expect(isCompatibleEdge("covers", "agent", "company")).toBeFalse();
+    expect(isCompatibleEdge("feeds", "material", "agent")).toBeFalse();
+    expect(isCompatibleEdge("embodies", "agent", "mind_clone")).toBeFalse();
+    const issues = validateGraph({ nodes: [node("company-a", "company"), node("role-writer", "agent")], edges: [edge("bad", "company-a", "role-writer", "owns")] });
+    expect(issues.map((i) => i.message)).toEqual(['edge type "owns" is not allowed from company to agent']);
+  });
+});
+
+describe("squad composition edges", () => {
+  // `consumes` compiles to `feeds`, and its provider is a squad, not a
+  // material: the compatibility table has to admit squad → squad or the
+  // derived edge would be rejected by validateGraph before anyone saw it.
+  test("feeds accepts a squad provider without losing the material one", () => {
+    expect(isCompatibleEdge("feeds", "squad", "squad")).toBeTrue();
+    expect(isCompatibleEdge("feeds", "material", "squad")).toBeTrue();
+    expect(isCompatibleEdge("feeds", "material", "company")).toBeTrue();
+    expect(isCompatibleEdge("feeds", "squad", "employee")).toBeFalse();
+    expect(isCompatibleEdge("feeds", "company", "squad")).toBeFalse();
+  });
+
+  test("both composition edges order the provider before the consumer", () => {
+    const g: DependencyGraph = {
+      nodes: [node("squad:consumer", "squad"), node("squad:provider", "squad")],
+      edges: [
+        edge("depends_on:consumer->provider", "squad:consumer", "squad:provider", "depends_on"),
+        edge("feeds:provider->consumer", "squad:provider", "squad:consumer", "feeds"),
+      ],
+    };
+    expect(validateGraph(g)).toEqual([]);
+    expect(buildOrder(g).order.map((n) => n.id)).toEqual(["squad:provider", "squad:consumer"]);
+  });
+});

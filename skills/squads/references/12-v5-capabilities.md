@@ -22,7 +22,7 @@ language intent ("criar funil de vendas completo") to an invocation point
 inside the squad — workflow, task, or agent.
 
 Without `capabilities[]` in `squad.yaml`, the squad remains manually
-executable (`*squad run`) but is **invisible to the harness**. The harness
+executable (`nrv run --squad <slug>`) but is **invisible to the harness**. The harness
 only routes to squads whose capabilities have well-declared descriptions,
 examples, and domains (BM25 indexes that metadata).
 
@@ -31,7 +31,7 @@ examples, and domains (BM25 indexes that metadata).
 ```yaml
 capabilities:
   - id: marketing.funnel.create        # dotted, ≥3 segments
-    description: >                      # 20-500 chars, indexed by BM25
+    description: >                      # 20-1500 chars, indexed by BM25
       Criação de funil de vendas completo, da awareness ao closing.
     domains: [marketing, sales]         # 1-5 from CAPABILITY_CATALOG_V1
     invoke:
@@ -166,29 +166,28 @@ Workflows are auditable, testable, resumable.
 
 ---
 
-## When to use `humanize: true/false`
+## How the output is judged: `acceptance[]`
 
-Human-facing outputs pass through humanization (P11) before the final
-return to the user.
+There is no `humanize` field. The writing contract lives in the runtime
+memory files (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) and enters the context
+of every dispatched agent, which writes human prose from the first token. What
+a capability declares instead is the contract the judge reads.
 
 ```yaml
 - id: copy.sales_letter.write
   # ...
-  humanize: true                # default — literary/textual output
-
-- id: data.pipeline.export
-  # ...
-  humanize: false               # technical output (json/binary/file)
+  acceptance:
+    - id: offer_stated
+      description: the letter names the offer, its price and its deadline
+      blocking: true
+      minimumScore: 0.8
 ```
 
-**Rule of thumb:**
-- user-facing `markdown`, `string`, `html` → `humanize: true`
-- technical `json`, `binary`, `file` → `humanize: false`
-- In doubt → `true` (default)
-
-Without humanization on a human-facing capability, the platform's
-zero-human perception breaks. P11 (Squad v5 §27) is blocking when the
-output goes straight to the end user.
+**Fallback order**, when `acceptance[]` is absent: the `success_indicators` of
+the invoked workflow, then the `## Acceptance Criteria` of the invoked task,
+then the generic brief conformance requirement. Declaring it is what turns a
+one-line "did it follow the brief" verdict into one judged dimension per
+promise the capability made.
 
 ---
 
@@ -233,7 +232,7 @@ Define success before coding:
    Paste into `not_for[]`.
 3. Run the local BM25 search (once the registry is populated):
    ```bash
-   bun ~/.nirvana/skills/squads/tests/smoke-v5.ts
+   nrv find "<one of your example_briefs>"
    ```
    Verify your capability is the top hit for its own examples.
 4. Run the validator:
@@ -253,14 +252,14 @@ of them pass.
 ## Final checklist (P5)
 
 - [ ] `id` follows regex `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$`
-- [ ] `description` ≥20 and ≤500 chars, concrete
+- [ ] `description` ≥20 and ≤1500 chars (`LIMITS.capability_description_max`), concrete
 - [ ] `domains[]` 1-5 from the catalog (or `experimental_domains: true`)
 - [ ] `invoke` points to an existing file in the squad
 - [ ] `examples[]` ≥1, all ≥5 chars
 - [ ] `not_for[]` cites an alternative capability when known
 - [ ] `fidelity.status` honest (`experimental` by default)
 - [ ] `outputs[]` declared with the correct type
-- [ ] `humanize` set (true for human text, false for tech)
+- [ ] `acceptance[]` declared, or the invoked task carries acceptance criteria
 - [ ] `model_hint` appropriate for the complexity
 - [ ] `*squad validate <name>` validation passes
 - [ ] Registry rebuild finds the new capability

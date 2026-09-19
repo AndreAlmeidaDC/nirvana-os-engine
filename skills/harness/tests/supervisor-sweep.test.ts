@@ -1,8 +1,9 @@
 // supervisor-sweep.test.ts — recovery semantics of the never-stall sweep:
 // dead pid → resume seam; live-but-stalled → SIGTERM + redispatch seam;
 // retries exhausted → stalled + notify; guards (self-pid, recursion, opt-out);
-// nothing-pending maybeSweep <20ms; launchd plist content via --print.
+// nothing-pending maybeSweep <20ms.
 // Hermetic: one temp SQLite per case, injectable seams, fake children.
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
 import { describe, expect, test, afterAll } from "bun:test";
 import { acquireLockSync } from "../../_shared/lib/file-lock.ts";
 import * as fs from "node:fs";
@@ -17,10 +18,11 @@ process.env.NIRVANA_SKILLS_DIR = path.resolve(import.meta.dir, "..", "..");
 process.env.NIRVANA_RUN_LEDGER_DB = path.join(TMP, "maybe-sweep.sqlite");
 
 import {
-  sweep, maybeSweep, renderLaunchdPlist, salvageStalledRun, redispatchRun, resumeOutcome, renderEscalationNotice,
+  sweep, maybeSweep, salvageStalledRun, redispatchRun, resumeOutcome, renderEscalationNotice,
   type RecoveryResult, type RedispatchOverrides, type SalvageVerdict,
 } from "../scripts/supervisor.ts";
-import { openLedger, openRun, getRun, markState, pidAlive, type LedgerHandle, type RunRow } from "../lib/run-ledger.ts";
+import { openLedger, openRun, getRun, markState, pidAlive, setSupervisorMeta, type LedgerHandle, type RunRow } from "../lib/run-ledger.ts";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 let dbSeq = 0;
 function freshLedger(): LedgerHandle {
@@ -54,7 +56,7 @@ describe("supervisor sweep — recovery paths", () => {
     expect(after.retries).toBe(1);
     expect(s.resumed).toBe(1);
     expect(s.recovered).toBe(1);
-  });
+  }, spawnBudgetMs(2));
 
   test("failed resume keeps the run recoverable for the next sweep", () => {
     const h = freshLedger();
@@ -65,7 +67,7 @@ describe("supervisor sweep — recovery paths", () => {
     expect(after.retries).toBe(1);
     expect(s.resumed).toBe(1);
     expect(s.recovered).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 
   test("expired lease + live-but-stalled pid → SIGTERM (default kill) + redispatch seam", async () => {
     const h = freshLedger();
@@ -110,7 +112,7 @@ describe("supervisor sweep — recovery paths", () => {
     expect(after.state).toBe("running");
     expect(Date.parse(after.lease_expires_at!)).toBeGreaterThan(Date.now());
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 
   test("retries exhausted → stalled + notify seam; resume NOT attempted; later sweeps skip it", () => {
     const h = freshLedger();
@@ -129,7 +131,7 @@ describe("supervisor sweep — recovery paths", () => {
     expect(notified).toBe(1);
     expect(s2.skipped).toBe(1);
     expect(s2.escalated).toBe(0);
-  });
+  }, spawnBudgetMs(3));
 
   test("valid lease → untouched", () => {
     const h = freshLedger();
@@ -137,7 +139,7 @@ describe("supervisor sweep — recovery paths", () => {
     const s = sweep({ handle: h, resumeImpl: okResume([]), redispatchImpl: () => ({ ok: true }), notifyImpl: noNotify });
     expect(s.skipped).toBe(1);
     expect(getRun(h, row.run_id)!.state).toBe("dispatched");
-  });
+  }, spawnBudgetMs(2));
 
   test("self-guard: a run claiming the supervisor's own pid is never signaled nor recovered", () => {
     const h = freshLedger();
@@ -153,7 +155,7 @@ describe("supervisor sweep — recovery paths", () => {
     expect(touched.length).toBe(0);
     expect(s.skipped).toBe(1);
     expect(getRun(h, row.run_id)!.state).toBe("running");
-  });
+  }, spawnBudgetMs(2));
 
   test("kill seam only ever receives the LEDGERED pid", () => {
     const h = freshLedger();
@@ -168,7 +170,7 @@ describe("supervisor sweep — recovery paths", () => {
     });
     expect(killed).toEqual([child.pid!]);
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 
   test("sweep never throws — a poisoned row is counted as an error, the rest still sweep", () => {
     const h = freshLedger();
@@ -183,7 +185,7 @@ describe("supervisor sweep — recovery paths", () => {
     });
     expect(s.errors).toBe(1);
     expect(getRun(h, good.run_id)!.state).toBe("delivered");
-  });
+  }, spawnBudgetMs(3));
 });
 
 // ── artifact salvage at exhaustion ────────────────────────────────────────
@@ -241,7 +243,7 @@ function auditLines(): any[] {
   const day = new Date().toISOString().slice(0, 10);
   const p = path.join(process.env.HARNESS_LOGS_DIR!, day, "audit.jsonl");
   if (!fs.existsSync(p)) return [];
-  return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return {}; } });
+  return fs.readFileSync(p, "utf8").split("\n").filter(Boolean).map(l => { try { return parseAuditLine(l); } catch { return {}; } });
 }
 // audit.js flattens the payload onto the record (Object.assign(base, payload)).
 function auditFor(runId: string, event: string): any[] {
@@ -274,7 +276,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     // Escalation still fired — salvage enriches it, never silences it.
     expect(auditFor(row.run_id, "human_notification_required").length).toBe(1);
     expect(auditFor(row.run_id, "x_ledger_notify_human").length).toBe(1);
-  });
+  }, spawnBudgetMs(2));
 
   test("THE CEILING: exhaustion + artifacts that PASS + NO manifest → WITHHELD, reason in the audit", () => {
     const h = freshLedger();
@@ -307,7 +309,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(auditFor(row.run_id, "x_ledger_salvage_result").at(-1)?.ceiling).toContain("interrupted");
     expect(auditFor(row.run_id, "human_notification_required").at(-1)?.delivered).toBe(false);
     expect(auditFor(row.run_id, "x_ledger_notify_human").at(-1)?.artifacts).toBe(1);
-  });
+  }, spawnBudgetMs(2));
 
   test("exhaustion + artifacts that FAIL the gate → WITHHELD for quality, ceiling not the reason", () => {
     const h = freshLedger();
@@ -327,7 +329,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(notices[0].gate).toBe("fail");
     expect(notices[0].ceiling).toBeNull();
     expect(notices[0].delivered).toBe(false);
-  });
+  }, spawnBudgetMs(2));
 
   test("exhaustion + NO artifacts → current behavior unchanged: stalled, notified once, nothing judged", () => {
     const h = freshLedger();
@@ -348,7 +350,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(getRun(h, row.run_id)!.state).toBe("stalled");
     expect(notices[0].judged).toBe(false);
     expect(notices[0].skipReason).toBe("no_artifacts");
-  });
+  }, spawnBudgetMs(2));
 
   test("the salvage is READ-ONLY: no runtime spawn, outputs dir byte-identical afterwards", () => {
     const h = freshLedger();
@@ -368,7 +370,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     // runHeadless seam, so nothing on disk moved.
     expect(snapshot(oroot)).toEqual(before);
     expect(getRun(h, row.run_id)!.state).toBe("withheld");
-  });
+  }, spawnBudgetMs(2));
 
   test("MID-RECOVERY: a run with retries left never reaches the salvage (resume path)", () => {
     const h = freshLedger();
@@ -389,7 +391,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(salvages.length).toBe(0);   // structurally unreachable: escalate() never ran
     expect(s.escalated).toBe(0);
     expect(s.salvaged).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 
   test("MID-RECOVERY: a live-but-stalled run with retries left never reaches the salvage (redispatch path)", () => {
     const h = freshLedger();
@@ -410,7 +412,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(s.redispatched).toBe(1);
     expect(salvages.length).toBe(0);
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 
   test("a live ledgered child aborts the salvage even if the call site is reached", () => {
     const h = freshLedger();
@@ -432,7 +434,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     expect(notices[0].skipReason).toBe("live_writer");
     expect(getRun(h, row.run_id)!.state).toBe("stalled");
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 
   test("already-salvaged row is not re-judged; a NEW stalled run still notifies", () => {
     const h = freshLedger();
@@ -488,7 +490,7 @@ describe("supervisor salvage — artifacts of an escalated run are judged, never
     sweep(deps());
     expect(notified).toBe(3);
     expect(getRun(h, c.run_id)!.state).toBe("stalled");
-  });
+  }, spawnBudgetMs(7));
 
   test("the escalation notice carries the verdict, not just the reason", () => {
     const h = freshLedger();
@@ -678,8 +680,9 @@ describe("supervisor redispatch — the outcome goes through the delivery pipeli
 
   test("failing text artifacts → WITHHELD, and the unattended sweep spends NOTHING on revisions", () => {
     // maxRevisions 0 here is a BUDGET rule, not the salvage's read-only rule:
-    // the sweep runs under launchd every 120s with nobody watching. A failing
-    // gate is withheld and escalated; the human runs `nrv revise` deliberately.
+    // the sweep runs unattended, whether from `watch`'s loop or a lazy
+    // background trigger, with nobody watching. A failing gate is withheld
+    // and escalated; the human runs `nrv revise` deliberately.
     const h = freshLedger();
     const { row } = redispatchCase(h, { "nota.md": FAILING_MD });
     const revisions: unknown[] = [];
@@ -729,7 +732,7 @@ describe("supervisor redispatch — the outcome goes through the delivery pipeli
     const noMeta = redispatchRun(h, bare, quietDelivery());
     expect(noMeta.finalState).toBe("failed");
     expect(noMeta.detail).toContain("cannot re-dispatch");
-  });
+  }, spawnBudgetMs(2));
 
   test("through the sweep: the summary counts what the pipeline actually decided", () => {
     const h = freshLedger();
@@ -751,7 +754,7 @@ describe("supervisor redispatch — the outcome goes through the delivery pipeli
     expect(after.retries).toBe(1);
     expect(auditFor(row.run_id, "x_ledger_recovery_result").at(-1)?.final_state).toBe("delivered");
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 
   test("the resume branch reads revise.ts's EXIT CODE, never its prose", () => {
     // defaultResume used to map exit 0 → delivered and grep stdout for
@@ -784,7 +787,7 @@ describe("supervisor redispatch — the outcome goes through the delivery pipeli
     expect(getRun(h, row.run_id)!.state).toBe("withheld");
     expect(auditFor(row.run_id, "x_ledger_recovery_result").at(-1)?.final_state).toBe("withheld");
     child.kill("SIGKILL");
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("supervisor — lazy sweep guards and speed", () => {
@@ -807,37 +810,35 @@ describe("supervisor — lazy sweep guards and speed", () => {
     expect(spawned).toBe(false);
     expect(elapsed).toBeLessThan(20);
     // A pending run appears, but the last sweep was <5 min ago → still skipped
-    // (the background cadence belongs to launchd/watch, not the hot path).
+    // (the background cadence belongs to `watch`/dispatch-exit, not the hot path).
     const h = openLedger();
     openRun(h, { initialLeaseSec: -60 });
     expect(maybeSweep()).toBe(false);
-  });
-});
+  }, spawnBudgetMs(2));
 
-describe("supervisor — launchd plist", () => {
-  test("install --print emits a sane plist without touching LaunchAgents", () => {
-    const supervisorScript = path.resolve(import.meta.dir, "..", "scripts", "supervisor.ts");
-    const r = spawnSync(process.execPath, [supervisorScript, "install", "--print"], {
-      encoding: "utf8", env: { ...process.env },
-    });
-    expect(r.status).toBe(0);
-    const plist = r.stdout;
-    expect(plist).toContain("<key>Label</key><string>sh.nirvana.supervisor</string>");
-    expect(plist).toContain("<key>StartInterval</key><integer>120</integer>");
-    expect(plist).toContain("<key>RunAtLoad</key><true/>");
-    expect(plist).toContain("<string>sweep</string>");
-    expect(plist).toContain("<string>--quiet</string>");
-    expect(plist).toContain(supervisorScript);
-    // In-process render matches the CLI output.
-    expect(renderLaunchdPlist()).toBe(plist);
-  });
+  test("dispatch-return trigger: once the throttle window reopens, the same call spawns again", () => {
+    // dispatch.ts wires `process.on("exit", () => maybeSweep())` so a dispatch
+    // that ran for tens of minutes reconciles once more on the way out. That
+    // second call is just maybeSweep() again — its own 5-minute floor is what
+    // makes a SHORT dispatch pay nothing extra, and what makes a LONG one fire
+    // for real. Simulated here by rewinding last_sweep_at past the floor
+    // instead of waiting 5 real minutes.
+    process.env.NIRVANA_RUN_LEDGER_DB = path.join(TMP, "maybe-sweep-return.sqlite");
+    const h = openLedger();
+    openRun(h, { initialLeaseSec: -60 }); // countNonTerminal() > 0
+    expect(maybeSweep()).toBe(true); // trigger 1: dispatch start
+    expect(maybeSweep()).toBe(false); // immediately after: still throttled
+    setSupervisorMeta(h, "last_sweep_at", String(Date.now() - 10 * 60_000)); // simulate elapsed dispatch time
+    expect(maybeSweep()).toBe(true); // trigger 2: dispatch return, window reopened
+  }, spawnBudgetMs(2));
 });
 
 describe("sweep — cross-process lock", () => {
   test("a second sweeper skips while the first holds the lock", () => {
-    // Two triggers exist (launchd every 120s + the lazy maybeSweep a user
-    // command spawns), so without this lock both would recover the SAME row:
-    // two paid re-dispatches writing the same outputs dir at once.
+    // Two triggers exist (an `nrv supervisor watch` loop + the lazy
+    // maybeSweep a user command spawns), so without this lock both would
+    // recover the SAME row: two paid re-dispatches writing the same outputs
+    // dir at once.
     const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "nrv-sweeplock-")), "ledger.sqlite");
     const held = acquireLockSync(dbPath, { timeoutMs: 0 });
     try {

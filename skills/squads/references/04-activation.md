@@ -17,12 +17,13 @@ Template: `~/.nirvana/skills/squads/templates/dependencies.template.yaml`. Refer
 | Category | Purpose | Example item |
 |---|---|---|
 | `system` | OS-level CLIs that must be on PATH | `ffmpeg`, `git`, `uv` — checked then installed via brew/apt/choco per-platform |
-| `python` | Python packages | `pip` or `uv` packages (with optional `target_dir`) |
-| `node` | Node packages | `npm` / `pnpm` / `yarn` packages (with optional `cwd`) |
+| `python` | Python packages | installed into the SHARED venv `~/.nirvana/python/venv` through a discovered interpreter (uv when present); skipped when pip's offline `--dry-run` proves every token present at its declared version; `target_dir` is ignored (`use_squad_venv: true` opts into a venv inside the squad); no usable Python is a warning, not a failure |
+| `node` | Node packages | installed into the SHARED store `~/.nirvana/node_modules`, then the squad dir is symlinked to it; `cwd` is ignored. `global: true` still goes through npm for packages that must be a command on PATH |
 | `services` | Long-lived daemons (cloned + installed, NOT started) | Pixelle-Video, ComfyUI, Ollama |
 | `custom_nodes` | ComfyUI-specific custom node repos | `kijai/ComfyUI-WanVideoWrapper`, etc. |
 | `models` | HuggingFace / URL downloads | `Wan-AI/Wan2.1-T2V-14B`. Items with `size_gb > 1` require user consent |
 | `env_vars` | Existing env vars to verify (NEVER written) | `GEMINI_API_KEY`, `RUNNINGHUB_API_KEY` — surfaced as set / missing_required / missing_optional |
+| `mcps` | MCP servers the squad needs or works better with (NEVER installed: the host runtime configures and runs them) | `- name: comfyui`, `purpose: "…"`, `required: false` — surfaced as host_configured / host_missing with the host file that names the server |
 | `post_install` | Hooks run after everything else | re-index registry, ping a service, run a smoke test |
 
 ### Synthesis fallback
@@ -50,6 +51,11 @@ Run full validation (see `03-validation.md`). If any Core blocking check fails �
 ### Step 3: Resolve target runtime
 
 Inspect `runtime_requirements`:
+
+- Missing `policy` means `declared`. The active runtime must appear in `minimum` or `compatible`.
+- `policy: active` selects the runtime hosting the session without list membership.
+- Prefer its registered adapter. Without one, require an explicit runtime bridge that proves every required semantic feature.
+- Never install, start, or switch runtimes. `incompatible` is always a hard denial.
 - Harness detects active runtime.
 - Verify it appears in `minimum` or `compatible`.
 - If runtime matches `incompatible` → STOP with error.

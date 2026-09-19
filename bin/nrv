@@ -10,10 +10,13 @@
 #   nrv use-businesses "<brief>"          → route forcing business-first preference
 #   nrv use-squads "<brief>"              → route forcing squad-first preference
 #   nrv find "<query>"                    → dry-run capability discovery
-#   nrv validate                          → harness self-test
+#   nrv validate <kind> <slug|path>       → admission gate (squad|business|mind-clone); bare = deprecated doctor alias
+#   nrv migrate <slug> --to 6 [--apply]   → convert a squad to Squad Protocol 6.0 (dry-run by default)
 #   nrv index                             → re-index squads + businesses
+#   nrv deps [scan|adopt|link|install|env] → the one home every dependency installs into (~/.nirvana)
+#   nrv config list|get|set|unset|explain → operational settings (value + origin per key)
 #   nrv init <target_dir> [--copy]        → bootstrap a new Nirvana project
-#   nrv validate-mind-clones              → audit canonical mind-clone library
+#   nrv validate-mind-clones              → audit the mind-clone library (alias of validate mind-clone --all)
 #   nrv help                              → list all sub-commands
 
 set -euo pipefail
@@ -27,7 +30,29 @@ if command -v bun >/dev/null 2>&1; then
 elif [ -x "$HOME/.bun/bin/bun" ]; then
   BUN_BIN="$HOME/.bun/bin/bun"
 else
-  echo "nrv: bun not found" >&2
+  # Bun IS the runtime: every subcommand below ends in `exec "$BUN_BIN"`, so a
+  # missing binary is the end of the road. "bun not found" was the whole message,
+  # which left anyone whose ~/.bun was wiped (new machine, cleaned PATH) with the
+  # bare fact and no way out. setup.sh already answers this well; the launcher is
+  # where the same person lands AFTER the install, and it said nothing.
+  #
+  # Name the command for THIS system rather than listing every platform: a reader
+  # who has to pick can pick wrong, and a wrong pick is a second failure. Git Bash
+  # reports MINGW/MSYS/CYGWIN from `uname -s` and needs the PowerShell installer,
+  # not the curl one.
+  echo "nrv: bun not found. Nirvana-OS runs on Bun." >&2
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*)
+      echo "  Install it, then run nrv again:" >&2
+      echo '    powershell -c "irm bun.sh/install.ps1 | iex"' >&2
+      echo "  If the execution policy blocks that, install it with winget:" >&2
+      echo "    winget install Oven-sh.Bun" >&2 ;;
+    *)
+      echo "  Install it, then run nrv again:" >&2
+      echo "    curl -fsSL https://bun.sh/install | bash" >&2
+      echo "  NEVER use 'npm install -g bun' (EACCES in /usr/local)." >&2 ;;
+  esac
+  echo "  Already installed? Open a new terminal, or put ~/.bun/bin on your PATH." >&2
   exit 1
 fi
 
@@ -117,14 +142,17 @@ case "$cmd" in
     exec "$BUN_BIN" "$SKILLS/harness/scripts/route.ts" "$@" --prefer squad ;;
   find)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/find.ts" "$@" ;;
-  validate)
-    exec "$BUN_BIN" "$SKILLS/harness/scripts/validate.ts" "$@" ;;
+  validate|verify)
+    # the admission gate; bare `nrv validate` still runs the doctor with a deprecation notice
+    exec "$BUN_BIN" "$SKILLS/_shared/scripts/verify.ts" "$@" ;;
   watch|tail)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/watch.ts" "$@" ;;
   watch-fs|fswatch)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/watch-fs.ts" "$@" ;;
   index)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/index.ts" "$@" ;;
+  config)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/config.ts" "$@" ;;
   pack-manifest|gen-pack-manifest)
     exec "$BUN_BIN" "$SKILLS/_shared/scripts/gen-pack-manifest.ts" "$@" ;;
   init|init-project)
@@ -132,7 +160,7 @@ case "$cmd" in
   install)
     # nrv install — overloaded: with --bootstrap routes to the system installer.
     # Default routes to the asset installer (Tier 0/1: businesses, squads, mind-clones, packs).
-    if [[ "${1:-}" == "--bootstrap" || "${1:-}" == "--check" || "${1:-}" == "--starter" || "${1:-}" == "--no-starter" || "${1:-}" == "--dry" ]]; then
+    if [[ "${1:-}" == "--bootstrap" || "${1:-}" == "--check" || "${1:-}" == "--starter" || "${1:-}" == "--no-starter" || "${1:-}" == "--dry" || "${1:-}" == "--repair-path" ]]; then
       exec "$BUN_BIN" "$SKILLS/_shared/scripts/install.ts" "$@"
     fi
     exec "$BUN_BIN" "$SKILLS/_shared/scripts/install-asset.ts" "$@" ;;
@@ -177,6 +205,9 @@ case "$cmd" in
     exec "$BUN_BIN" "$SKILLS/harness/scripts/guard.ts" "$@" ;;
   fix-squad|doctor-squad)
     exec "$BUN_BIN" "$SKILLS/squads/scripts/fix-squad.ts" "$@" ;;
+  migrate|migrate-squad)
+    # v5 -> v6 conversion; dry-run by default, --apply writes, --rollback <ts> restores
+    exec "$BUN_BIN" "$SKILLS/squads/scripts/migrate-squad.ts" "$@" ;;
   memory|mem)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/memory.ts" "$@" ;;
   gate)
@@ -189,6 +220,9 @@ case "$cmd" in
         echo "available rubrics: voice-fidelity"
         exit 2 ;;
     esac ;;
+  deps)
+    # nrv deps [status|scan|adopt|link|install|env] — the single dependency home
+    exec "$BUN_BIN" "$SKILLS/_shared/scripts/deps.ts" "$@" ;;
   doctor|capability-doctor)
     # nrv doctor [--system|--capability]
     case "${1:-system}" in
@@ -198,6 +232,12 @@ case "$cmd" in
     esac ;;
   dispatch)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/dispatch.ts" "$@" ;;
+  team)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/chain.ts" "$@" ;;
+  audit-where)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-where.ts" "$@" ;;
+  audit-tail)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-tail.ts" "$@" ;;
   run|autopilot)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/dispatch.ts" "$@" --exec ;;
   auto)
@@ -206,6 +246,8 @@ case "$cmd" in
     exec "$BUN_BIN" "$SKILLS/harness/scripts/revise.ts" "$@" ;;
   run-track)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/run-track.ts" "$@" ;;
+  multi-target|mt)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/multi-target.ts" "$@" ;;
   supervisor)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/supervisor.ts" "$@" ;;
   clean|clean-project|purge)
@@ -225,6 +267,12 @@ case "$cmd" in
     if [ "${1:-}" = "emit" ]; then
       shift; exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-emit.ts" "$@"
     fi
+    if [ "${1:-}" = "where" ]; then
+      shift; exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-where.ts" "$@"
+    fi
+    if [ "${1:-}" = "tail" ]; then
+      shift; exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-tail.ts" "$@"
+    fi
     exec "$BUN_BIN" "$SKILLS/harness/scripts/audit-view.ts" "$@" ;;
   search)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/search.ts" "$@" ;;
@@ -232,6 +280,10 @@ case "$cmd" in
     exec "$BUN_BIN" "$SKILLS/harness/scripts/export.ts" "$@" ;;
   ask)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/ask.ts" "$@" ;;
+  exec)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/exec.ts" "$@" ;;
+  mine-briefs)
+    exec "$BUN_BIN" "$SKILLS/harness/scripts/mine-real-briefs.ts" "$@" ;;
   launch)
     exec "$BUN_BIN" "$SKILLS/harness/scripts/launch.ts" "$@" ;;
   tui|cockpit-tui)

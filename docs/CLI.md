@@ -16,7 +16,18 @@ nrv <subcommand> [args]
 |---|---|
 | `nrv install --bootstrap` | Wire audit hooks into Claude Code, Gemini-CLI, and Antigravity (run once after installing; idempotent). |
 | `nrv install --check` | Report status; exit 0 if ready, 1 if it needs setup. |
-| `nrv doctor` | Full system diagnostic (binaries, skills, hooks, patches). |
+| `nrv install --repair-path` | Windows: list temporary `nrv-*` entries left on the user PATH (nothing written); `--apply` removes exactly those. |
+| `nrv doctor` | Full system diagnostic (binaries, skills, hooks, patches, and the `config` section: every operational setting with its effective value and origin). |
+
+## Configure
+
+| Command | What it does |
+|---|---|
+| `nrv config list [--json]` | Every operational setting (multi-target, Gauntlet, runtime, routing, supervisor, updates, budget, quality gate) with its effective value, where it comes from (a variable, the project file, the global file, the engine file, the default) and its default. |
+| `nrv config get <key>` / `nrv config explain <key>` | The effective value; `explain` adds the description, the default, the allowed scopes and the legacy variable. |
+| `nrv config set <key> <value> [--global\|--project]` / `nrv config unset <key> [...]` | Writes `<project>/.nirvana/config.yaml` (the default inside a project) or `~/.nirvana/config.yaml` (kept across `nrv update`), one line at a time, comments preserved. Refuses a value the schema rejects, a scope the key does not accept, and a key pinned by a variable in this shell, each with the reason; every write audits `x_settings_changed`. |
+
+Precedence, always: environment variable > `<project>/.nirvana/config.yaml` > `~/.nirvana/config.yaml` > the engine's `skills/harness/config.yaml` > the default. The full key table, the variables that stay environment-only and the reasons are in `docs/architecture/configuration.md`.
 
 ## Talk to it / run work
 
@@ -25,17 +36,19 @@ nrv <subcommand> [args]
 | `nrv auto "<brief>"` | **Autopilot.** The router picks the best company for your brief, executes it headless, verifies, and runs the quality gate. (= `run --auto`.) |
 | `nrv run <business> "<brief>"` | Autopilot against a company you name: dispatch + execute + verify + gate. |
 | `nrv dispatch <business> "<brief>"` | Scaffold a run (brief + DNA injection + audit) without auto-executing. |
+| `nrv dispatch --business <slug> \| --squad <slug>[:<capabilityId>] \| --agent-x "<brief>" [--exec]` | Name the target yourself; the three flags are mutually exclusive with each other and with `--auto`, and none of them consults the router. `--squad` takes an optional capability id: without one the dispatch resolves the squad's capability from the brief. `--exec` runs it, otherwise it only scaffolds. (`--judge-x` is the engine's Gauntlet judge, spawned by the evaluator adapter on an evaluation brief; it is not a producer.) |
 | `nrv revise <project> "<change>"` | Apply a change while keeping the same runtime session. |
 | `nrv launch <name> --pillars=brand,marketing,gtm` | Scaffold a multi-pillar 360° launch (default: all 11 pillars). |
 | `nrv ask <clone> "<question>"` | Talk directly to a single specialist (mind-clone), DNA injected. |
+| `nrv multi-target plan\|run\|status <plan.json>` | Multi-target engine by plan file (alias `nrv mt`): `plan` compiles the waves, `run` executes them over the Run Kernel (`nrv config set multi_target.enabled false` or `NIRVANA_MULTI_TARGET_KILL_SWITCH=1` turns it off), `status` reads the projection. |
 
-Useful flags on `run` / `auto`: `--team` (real multi-employee orchestration), `--zip` / `--pdf` (bundle deliverables), `--runtime=claude-code|codex|gemini-cli|antigravity-cli`, `--max-budget=<usd>`, `--timeout=<min>`, `--mode=agentic|fast` (routing mode).
+Useful flags on `run` / `auto`: `--single` / `--team` (how many seats of the business run the brief — by default a director reads the brief against the org chart and decides, answering "one seat" when one is enough; `--single` skips that call, `--team` asks for a chain of 3 to 6), `--zip` / `--pdf` (bundle deliverables), `--runtime=claude-code|codex|gemini-cli|antigravity-cli`, `--max-budget=<usd>`, `--timeout=<min>`, `--mode=agentic|fast` (routing mode), `--execution-mode=standard|gauntlet|auto` (default `standard`), `--gauntlet-intensity=light|balanced|exhaustive` (a Business target needs `NIRVANA_BUSINESS_GAUNTLET_ALLOWLIST=<slug>`), `--run-id=<runId>` (adopt a Run already prepared in the project's kernel, the way Glance does).
 
 ## See it happen
 
 | Command | What it does |
 |---|---|
-| `nrv glance [--allow-actions]` | Open the **Glance** web cockpit: live runs, the capability graph, and the audit trail of everything your organization is doing. |
+| `nrv glance [--read-only]` | Open the **Glance** web cockpit: live runs, the capability graph, and the audit trail of everything your organization is doing. In an adopted project, a chat Message runs a child `dispatch.ts` with a live timeline, cancel, and recovery after a restart; `--read-only` disables execution and every write endpoint (`NIRVANA_GLANCE_EXECUTION=0` keeps the cockpit up without spawning). The gear opens the "Configuração" panel: every `nrv config` key with its own control, saved per key into the project or the global file and holding from the next Message; the `.env` section stays for secrets, library scope and `LLM_CASCADE`. |
 | `nrv tui [--once\|--json]` | Terminal cockpit: live audit, active projects, registries. |
 | `nrv watch [project]` | Tail audit events live in the terminal. |
 | `nrv audit-view <project>` | Rich chronological view of a project's audit chain. |
@@ -59,6 +72,8 @@ Useful flags on `run` / `auto`: `--team` (real multi-employee orchestration), `-
 | `nrv export <project> [--format=zip\|tgz]` | Bundle a project's outputs to share. |
 | `nrv clean <project> [--hard]` | Remove a project scaffold (trash by default). |
 
+A project is where a run's audit, briefs and deliverables live, for every runtime — including OpenClaw, whose agent must have the project as its workspace. How each one enters it: [docs/architecture/project-directory-and-runtimes.md](architecture/project-directory-and-runtimes.md).
+
 ## Libraries & distribution
 
 | Command | What it does |
@@ -73,11 +88,20 @@ Useful flags on `run` / `auto`: `--team` (real multi-employee orchestration), `-
 
 | Command | What it does |
 |---|---|
-| `nrv validate` | Self-test (registries, validators, audit). |
+| `nrv validate <kind> <slug\|path> [--fix] [--strict] [--json]` | Admission gate for one squad, business or mind-clone (`nrv verify` is an alias). |
+| `nrv validate <kind> --all [--record [--allow-regression]]` | Verify every installed entity of a kind; `--record` writes the debt baseline. |
+| `nrv validate --pack <content-dir> [--json]` | Verify a pack's content before it ships. |
 | `nrv validate-chain <project> [--strict\|--all]` | Audit-chain integrity check. |
+| `nrv migrate <slug\|path> --to 6 [--apply] [--all] [--map-refs]` | Convert a squad to Squad Protocol 6.0: canonical workflow documents, extension-less refs, acceptance from `success_indicators` (`nrv migrate-squad` is an alias). |
+| `nrv migrate <slug\|path> --rollback <ts>` | Undo a conversion from its backup, while the squad has not changed since. |
 | `nrv baseline [--days=N] [--save]` | Snapshot system KPIs from the audit log. |
 | `nrv improver run [--days=N]` | Meta-Nirvana: mine the audit log and propose improvements. |
 | `nrv update [--check\|--force]` | Self-update: pull + re-run installer + re-index. |
+| `nrv update <pack> [--keep-clones\|--keep-squads\|--keep-businesses] [--check]` | Update an installed pack. A component you changed since the pack installed it is backed up under `~/.nirvana/backups/packs/<pack>/<stamp>/` before the overlay replaces it; `--keep-<kind>` leaves what is on disk as it is (new components still arrive). |
+
+> `nrv validate` exits `0` admitted · `1` an error the debt baseline does not cover · `2` only warnings, under `--strict` · `64` usage error or unknown entity. The system doctor moved to `nrv doctor`; `nrv validate` with no arguments still runs it, with a deprecation notice, for one release. Kind aliases: `biz`, `clone`, `mc`. Full contract: [docs/architecture/validate-gate.md](architecture/validate-gate.md).
+>
+> `nrv migrate` is dry run by default: it prints the report and writes nothing until `--apply`, and every applied run leaves a timestamped backup that `--rollback <ts>` restores. `--all` walks the whole squad library. Full contract: [SQUAD_PROTOCOL_V6.md](../skills/squads/SQUAD_PROTOCOL_V6.md) §35.
 
 ---
 
@@ -89,7 +113,7 @@ nrv auto "crie uma landing page para um SaaS de logística"   # autopilot, route
 nrv run brand-creative-studio "Manifesto for a SaaS called Atlas"
 nrv launch atlas --pillars=brand,marketing,gtm
 nrv ask rory-sutherland "Critique this headline: ..."
-nrv glance --allow-actions                              # watch your organization work
+nrv glance                                              # watch your organization work
 nrv init ~/Projects/cliente-x --copy
 ```
 

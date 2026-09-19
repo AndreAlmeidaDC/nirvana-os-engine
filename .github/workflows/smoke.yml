@@ -10,8 +10,11 @@
 # sobrevivem para checkouts parciais e para o tarball instalado.
 name: smoke
 on:
+  # Um run por mudança: `push` só em main (pós-merge); branches de trabalho
+  # recebem o CI pelo `pull_request` abaixo. Antes, um push numa `feat/**`
+  # com PR aberto disparava dois runs completos e o merge esperava pelos dois.
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
   # PRs de fork: `pull_request` (nunca pull_request_target) — roda o código do
   # contribuidor SEM secrets e sem token de escrita. É o que dá feedback de CI
   # a quem contribui, e é seguro por construção.
@@ -36,6 +39,17 @@ jobs:
         with:
           bun-version: latest
 
+      # `bun.lock` or nothing. With no node_modules Bun auto-installs each
+      # dependency from the package.json RANGE at import time, so `zod: ^4.4.0`
+      # resolved to 4.5.1 on the day it was published — and 4.5.0 had made the
+      # seconds group of `z.string().datetime()` mandatory, which moved the
+      # `pattern` inside two generated JSON Schemas without a line of
+      # validators.ts changing. The parity gate compares committed bytes, so it
+      # went red deterministically against a tree nobody could reproduce: every
+      # checkout that installs from the lockfile gets 4.4.3 and passes.
+      - name: Install the pinned dependency tree
+        run: bun install --frozen-lockfile
+
       - name: Instalar o engine da fonte (fresh HOME, não-interativo)
         run: bun scripts/install.ts
 
@@ -50,8 +64,21 @@ jobs:
       # skills/_shared/tests, skills/businesses/tests and skills/squads/tests
       # unrun — including runtime-links.test.ts, the only behavioural test of
       # scripts/install.ts. A test that CI never executes is a comment.
+      #
+      # `--timeout`: Bun's 5 s default applies to HOOKS as well as tests, and 158
+      # hooks across the suite delete install trees, start servers or open a
+      # file-backed Run Kernel without an explicit budget. On windows-latest,
+      # measured 20-35x slower at fsync, those cross 5 s and the file fails as
+      # `(fail) (unnamed) — a beforeEach/afterEach hook timed out`, naming no
+      # test, with every named test in it passing. The victim rotates with the
+      # runner's speed: three different files in three runs recorded in
+      # helpers/test-budgets.ts, plus glance-multi-target-projection (6257 ms)
+      # and verify-install-hooks (6980 ms) here. The per-hook budgets in that
+      # helper stay — they document which hooks are genuinely heavy — and this
+      # raises the floor for the ones nobody has annotated yet. Headroom, not
+      # slack: a hook that truly wedges still fails, only later.
       - name: unit — the whole suite
-        run: bun test skills
+        run: bun test skills --timeout=30000
 
       - name: nrv doctor (warnings ok; falha crítica reprova)
         run: |
@@ -69,6 +96,37 @@ jobs:
           bun scripts/build-engine-tarball.ts
           NIRVANA_ENGINE_TARBALL="$PWD/dist/nirvana-os-engine.tar.gz" node packaging/cli/bin/cli.mjs
 
+      # A skills.sh install lands the thin `nirvana` skill alone; its bootstrap
+      # must put the engine on the machine from the same tarball. --update forces
+      # the path past the "already installed" gate the earlier steps satisfied.
+      - name: Bootstrap via the nirvana skill (same tarball, forced reinstall)
+        run: |
+          if [ ! -f skills/nirvana/scripts/bootstrap.sh ] || [ ! -f dist/nirvana-os-engine.tar.gz ]; then
+            echo "sem skill nirvana ou sem tarball — step pulado"; exit 0
+          fi
+          export NIRVANA_ENGINE_TARBALL="$PWD/dist/nirvana-os-engine.tar.gz" NIRVANA_BOOTSTRAP_YES=1
+          # --update on both: the earlier steps already installed the engine here,
+          # and a bare --dry-run rightly answers "already installed" in that case.
+          sh skills/nirvana/scripts/bootstrap.sh --dry-run --update | grep -q "dry run"
+          sh skills/nirvana/scripts/bootstrap.sh --update | tee "$RUNNER_TEMP/boot.log"
+          grep -q "Checksum verified" "$RUNNER_TEMP/boot.log"
+          sh skills/nirvana/scripts/bootstrap.sh | grep -q "already installed"
+          test -f "$HOME/.nirvana/skills/nirvana/SKILL.md"
+          test ! -e "$HOME/.nirvana/skills/nirvana-os"
+          test -f "$HOME/.squads-registry.json"
+
+      - name: Bootstrap via the nirvana skill (PowerShell mirror)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:NIRVANA_ENGINE_TARBALL = "$PWD\dist\nirvana-os-engine.tar.gz"
+          $env:NIRVANA_BOOTSTRAP_YES = "1"
+          $upd = powershell -NoProfile -ExecutionPolicy Bypass -File skills\nirvana\scripts\bootstrap.ps1 -Update | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host $upd; exit $LASTEXITCODE }
+          if ($upd -notmatch "Checksum verified") { Write-Host $upd; exit 1 }
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -File skills\nirvana\scripts\bootstrap.ps1 | Out-String
+          if ($out -notmatch "already installed") { Write-Host $out; exit 1 }
+
   # Os gates de contrato do repositório. Rodavam só na máquina de quem lembrasse
   # de chamá-los, o que não é gate — é sugestão. A paridade de changelog entrou
   # aqui porque a deriva que ela detecta (uma release escrita só no idioma
@@ -85,6 +143,17 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      # `bun.lock` or nothing. With no node_modules Bun auto-installs each
+      # dependency from the package.json RANGE at import time, so `zod: ^4.4.0`
+      # resolved to 4.5.1 on the day it was published — and 4.5.0 had made the
+      # seconds group of `z.string().datetime()` mandatory, which moved the
+      # `pattern` inside two generated JSON Schemas without a line of
+      # validators.ts changing. The parity gate compares committed bytes, so it
+      # went red deterministically against a tree nobody could reproduce: every
+      # checkout that installs from the lockfile gets 4.4.3 and passes.
+      - name: Install the pinned dependency tree
+        run: bun install --frozen-lockfile
 
       - name: Gates de contrato (comandos, auditoria, inglês, changelog, pureza)
         run: |

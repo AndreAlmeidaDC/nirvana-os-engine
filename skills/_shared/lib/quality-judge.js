@@ -20,17 +20,20 @@
 
 'use strict';
 
+const { extractJsonObject } = require('./model-json.js');
+
 const fs = require('fs');
 const path = require('path');
 
+// host-agent-driver.js already delegates to the canonical .ts under Bun and
+// falls back to its own inline legacy implementation otherwise — the .ts
+// fallback that used to live here was dead code that only a `.js` requiring
+// a `.ts` (a Windows landmine, see that file's header) could ever reach.
 let _hostDriver = null;
 function loadHostDriver() {
   if (_hostDriver) return _hostDriver;
   try { _hostDriver = require(path.join(__dirname, 'host-agent-driver.js')); }
-  catch {
-    try { _hostDriver = require(path.join(__dirname, 'host-agent-driver.ts')); }
-    catch { _hostDriver = null; }
-  }
+  catch { _hostDriver = null; }
   return _hostDriver;
 }
 
@@ -70,18 +73,18 @@ function buildUserMessage(artifact, context) {
   ].join('\n');
 }
 
+// The gate's verdict, read out of whatever the judge's runtime printed around
+// it. This used to strip a code fence and then match `/\{[\s\S]*"verdict"[\s\S]*\}/`
+// — greedy on both sides, so on any runtime that wraps the answer in an event
+// stream the span opened in the telemetry and the gate could not read its own
+// judge. Balanced scan, last object carrying a `verdict`.
 function extractJson(text) {
   if (!text) return null;
-  const stripped = text
-    .replace(/^[\s\S]*?```(?:json)?\s*/i, '')
-    .replace(/```[\s\S]*$/, '')
-    .trim();
-  const candidate = stripped.length > 0 ? stripped : text;
-  const m = candidate.match(/\{[\s\S]*"verdict"[\s\S]*\}/);
-  if (!m) {
-    try { return JSON.parse(candidate); } catch { return null; }
-  }
-  try { return JSON.parse(m[0]); } catch { return null; }
+  const withVerdict = extractJsonObject(text, (v) => v && v.verdict !== undefined);
+  if (withVerdict) return withVerdict;
+  // No `verdict` anywhere: take the last readable object, then the raw text, so
+  // a judge that answered in another shape still reaches the caller's own checks.
+  return extractJsonObject(text) ?? (() => { try { return JSON.parse(text); } catch { return null; } })();
 }
 
 /**
@@ -189,9 +192,12 @@ async function runQualityJudge({ phase, artifact, rubric_path, context, timeoutM
   // Use retry wrapper so stalled judge calls get one automatic retry.
   let retry = null;
   try { retry = require(path.join(__dirname, 'host-agent-retry.js')); } catch {}
+  // No floors here. The driver's budget is a budget of SILENCE and the runtime
+  // this judge calls prints one JSON object at the END of the call, so the old
+  // pair (120s wall clock, 60s "stall") could only ever measure how long the
+  // model was allowed to think. A caller with a real deadline still passes one.
   const callOpts = {
-    timeoutMs: timeoutMs || 120_000,
-    heartbeatMs: 60_000,
+    ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
     maxRetries: 1,
   };
   const r = retry && retry.callWithRetryOnStall

@@ -93,16 +93,16 @@
     },
     "runtime_requirements": {
       "type": "object",
-      "required": ["minimum"],
       "additionalProperties": false,
       "properties": {
+        "policy": { "enum": ["declared", "active"], "default": "declared" },
         "minimum": {
           "type": "array",
           "items": {
             "type": "object",
             "required": ["runtime"],
             "properties": {
-              "runtime": { "enum": ["claude-code", "codex", "gemini-cli", "cursor", "antigravity", "openclaw", "opencode"] },
+              "runtime": { "enum": ["claude-code", "codex", "antigravity-cli", "antigravity", "gemini-cli", "pi", "kimi-cli", "grok-cli", "qwen-code", "opencode", "cursor", "openclaw"] },
               "version": { "type": "string" }
             }
           },
@@ -110,7 +110,12 @@
         },
         "compatible": { "type": "array" },
         "incompatible": { "type": "array" }
-      }
+      },
+      "allOf": [{
+        "if": { "properties": { "policy": { "const": "active" } }, "required": ["policy"] },
+        "then": {},
+        "else": { "required": ["minimum"] }
+      }]
     },
     "features_required": {
       "type": "array",

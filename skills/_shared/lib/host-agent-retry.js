@@ -41,14 +41,15 @@ function loadAudit() {
   return _audit;
 }
 
+// host-agent-driver.js already delegates to the canonical .ts under Bun and
+// falls back to its own inline legacy implementation otherwise — the .ts
+// fallback that used to live here was dead code that only a `.js` requiring
+// a `.ts` (a Windows landmine, see that file's header) could ever reach.
 let _driver = null;
 function loadDriver() {
   if (_driver) return _driver;
   try { _driver = require(path.join(__dirname, 'host-agent-driver.js')); }
-  catch {
-    try { _driver = require(path.join(__dirname, 'host-agent-driver.ts')); }
-    catch { _driver = null; }
-  }
+  catch { _driver = null; }
   return _driver;
 }
 
@@ -77,7 +78,11 @@ async function callWithRetryOnStall(persona, userMessage, opts = {}) {
   let currentMsg = userMessage;
   while (true) {
     const r = await driver.callHostAgentAsync(persona, currentMsg, driverOpts);
-    const stalled = r && (r.error === 'stall' || r.error === 'stall_warning');
+    // `inactivity_timeout` is the same verdict at the wider window: the driver
+    // killed a child that had stopped producing bytes. A wrapper that retries
+    // one and not the other would silently stop retrying the moment a caller
+    // let the driver pick the budget.
+    const stalled = r && (r.error === 'stall' || r.error === 'stall_warning' || r.error === 'inactivity_timeout');
     if (!stalled) return r;
     emitSafe('stall_detected', {
       attempt,

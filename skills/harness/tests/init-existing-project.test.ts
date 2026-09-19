@@ -113,8 +113,8 @@ describe("on-demand mode leaves the project's behavior alone", () => {
     expect(agents).toContain("MY LINE");
     expect(agents).toContain("nirvana-os:on-demand-contract:v1");
     expect(agents).toContain("ONLY when the user explicitly asks");
-    expect(agents).not.toContain("nirvana-os:invocation-contract:v1");
-    expect(agents).not.toContain("nirvana-os:writing-contract:v1");
+    expect(agents).not.toContain("nirvana-os:invocation-contract:v2");
+    expect(agents).not.toContain("nirvana-os:writing-contract:v2");
     expect(agents).not.toMatch(/invoke the .?harness.? skill for any concrete artifact/i);
   }, INIT_TIMEOUT_MS);
 
@@ -123,7 +123,7 @@ describe("on-demand mode leaves the project's behavior alone", () => {
     runInitWith(dir, "--orchestrators=on-demand");
     const claude = fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8");
     expect(claude).toContain("nirvana-os:on-demand-contract:v1");
-    expect(claude).not.toContain("nirvana-os:invocation-contract:v1");
+    expect(claude).not.toContain("nirvana-os:invocation-contract:v2");
   }, INIT_TIMEOUT_MS);
 
   test("on-demand is idempotent", () => {
@@ -146,7 +146,7 @@ describe("on-demand mode leaves the project's behavior alone", () => {
     // name so the compat promise is explicit rather than incidental.
     const dir = project("od-default", { "CLAUDE.md": "# Mine\n" });
     runInit(dir);
-    expect(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8")).toContain("nirvana-os:invocation-contract:v1");
+    expect(fs.readFileSync(path.join(dir, "CLAUDE.md"), "utf8")).toContain("nirvana-os:invocation-contract:v2");
   }, INIT_TIMEOUT_MS);
 });
 
@@ -183,5 +183,81 @@ describe("streams carry meaning — PowerShell paints stderr red", () => {
     // and the two contract appends are distinguishable in the log
     expect(`${r.stdout}`).toContain("appended invocation contract");
     expect(`${r.stdout}`).toContain("appended writing contract");
+  }, INIT_TIMEOUT_MS);
+});
+
+describe("a contract written by an earlier engine is refreshed in place", () => {
+  test("the v1 block becomes the current template; the user's lines above and the writing contract below survive", () => {
+    const v1 = [
+      "# My rules", "KEEP-ME-ABOVE", "",
+      "<!-- nirvana-os:invocation-contract:v1 -->",
+      "# Project guidelines (old)", "", "invoke the **`harness` skill** for any concrete artifact", "OLD-LINE-MUST-GO", "",
+      "---", "", "<!-- nirvana-os:writing-contract:v1 -->", "## Writing contract (for any prose deliverable)", "OLD-WRITING-LINE-MUST-GO", "Gate flags = build fails. No auto-rewrite.", "",
+      "## The user's own section", "KEEP-ME-BELOW", "",
+    ].join("\n");
+    const dir = project("refresh-v1", { "AGENTS.md": v1, "CLAUDE.md": v1 });
+    const r = runInit(dir);
+    expect(`${r.stdout}`).toContain("refreshed invocation contract (v1 → v2)");
+    for (const f of ["AGENTS.md", "CLAUDE.md"]) {
+      const c = fs.readFileSync(path.join(dir, f), "utf8");
+      expect(c).toContain("KEEP-ME-ABOVE");
+      expect(c).toContain("KEEP-ME-BELOW");
+      expect(c).not.toContain("OLD-LINE-MUST-GO");
+      expect(c).not.toContain("OLD-WRITING-LINE-MUST-GO");
+      expect(c.indexOf("Gate flags = build fails")).toBeLessThan(c.indexOf("KEEP-ME-BELOW"));
+      expect(c).not.toContain("nirvana-os:invocation-contract:v1");
+      expect(c).toContain("nirvana-os:invocation-contract:v2");
+      expect(c).toMatch(/Skill\("nirvana"/);
+      expect(c.indexOf("KEEP-ME-ABOVE")).toBeLessThan(c.indexOf("nirvana-os:invocation-contract:v2"));
+      expect(c.indexOf("nirvana-os:invocation-contract:v2")).toBeLessThan(c.indexOf("KEEP-ME-BELOW"));
+      expect(c.match(/nirvana-os:writing-contract:v2/g)!.length).toBe(1);
+      expect(c).not.toContain("nirvana-os:writing-contract:v1");
+      expect(c).toContain("is not a deliverable and is not judged by it");
+    }
+    // Idempotent: a second run changes nothing.
+    const first = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+    runInit(dir);
+    expect(fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8")).toBe(first);
+  }, INIT_TIMEOUT_MS);
+});
+
+describe("a duplicated old block is collapsed by the refresh", () => {
+  test("two v1 writing contracts become one v2, and the user's lines after them survive", () => {
+    const block = ["<!-- nirvana-os:writing-contract:v1 -->", "## Writing contract (for any prose deliverable)", "OLD-W", "Gate flags = build fails. No auto-rewrite.", ""].join("\n");
+    const src = ["<!-- nirvana-os:invocation-contract:v2 -->", "# current contract", "", "---", "", block, "", "---", "", block, "## Mine", "KEEP-ME-LAST", ""].join("\n");
+    const dir = project("dup-writing", { "AGENTS.md": src });
+    runInit(dir);
+    const c = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+    expect(c.match(/nirvana-os:writing-contract:v2/g)!.length).toBe(1);
+    expect(c).not.toContain("writing-contract:v1");
+    expect(c).not.toContain("OLD-W");
+    expect(c).toContain("KEEP-ME-LAST");
+    expect(c.match(/Gate flags = build fails/g)!.length).toBe(1);
+  }, INIT_TIMEOUT_MS);
+});
+
+describe("Claude Code deny rules for dotenv files", () => {
+  test("init writes permissions.deny for .env files, merges into an existing settings.json, and is idempotent", () => {
+    const dir = project("deny-rules", { "CLAUDE.md": "# Mine\n" });
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(npm test)"], deny: ["Read(./.env)"] }, other: true }, null, 2));
+    runInit(dir);
+    const s = JSON.parse(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8"));
+    expect(s.other).toBe(true);
+    expect(s.permissions.allow).toEqual(["Bash(npm test)"]);
+    expect(s.permissions.deny).toContain("Read(./.env)");
+    expect(s.permissions.deny).toContain("Read(./.env.*)");
+    expect(s.permissions.deny.filter((r: string) => r === "Read(./.env)").length).toBe(1);
+    const first = fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8");
+    runInit(dir);
+    expect(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8")).toBe(first);
+  }, INIT_TIMEOUT_MS);
+
+  test("a settings.json that is not valid JSON is left alone", () => {
+    const dir = project("deny-rules-bad", { "CLAUDE.md": "# Mine\n" });
+    fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".claude", "settings.json"), "{ not json");
+    runInit(dir);
+    expect(fs.readFileSync(path.join(dir, ".claude", "settings.json"), "utf8")).toBe("{ not json");
   }, INIT_TIMEOUT_MS);
 });

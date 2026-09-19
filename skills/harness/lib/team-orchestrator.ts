@@ -24,11 +24,14 @@ import { runHeadless, AUTONOMOUS_DIRECTIVE, type Runtime } from "./host-agent-dr
 import { runWithCascade } from "./cascade-runner.ts";
 import { sessionKey, getSession, putSession, dropSession, type EntityKind } from "./session-store.ts";
 import { harnessLogsDir } from "../../_shared/lib/log-paths.ts";
+import { stamp } from "../../_shared/lib/audit-provenance.ts";
+import { scopeGuard } from "../../_shared/lib/scope-guard.ts";
 import { runSquadHeadless } from "./squad-exec.ts";
+import { resolveEntityDir } from "../../_shared/lib/entity-resource-map.ts";
+import { extractJsonObject } from "../../_shared/lib/model-json.ts";
 
 const SKILLS = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
-const BUSINESSES = path.join(os.homedir(), "businesses");
 
 export interface TeamRunArgs {
   slug: string;
@@ -49,23 +52,82 @@ export interface TeamRunArgs {
   /** The user's USE_* rules block (formatRulesForDirective) — appended to each
    * step's AUTONOMOUS_DIRECTIVE so the maestro honors it when delegating. */
   rulesDirective?: string;
+  /** Where the businesses library lives, overriding scope resolution. Mirrors
+   *  `SquadExecArgs.squadsRoot`, and exists for the same reason: `paths` is
+   *  memoized on first access, so a test that points `BUSINESSES_DIR` at a
+   *  fixture only wins if it is the first thing in the process to touch it —
+   *  which makes the outcome depend on test file order, and makes the env write
+   *  leak into every other file sharing the runner. An argument is honest where
+   *  a process-wide mutation is a race. */
+  businessesRoot?: string;
+  /** `--team`: the user already decided there is a chain, so the director is
+   *  asked for 3 to 6 seats instead of being free to answer "one". Without it
+   *  the number of steps is the director's call, which is the point — a flag
+   *  nobody passes is not a decision, it is a default wearing a disguise. */
+  forceChain?: boolean;
+  /** Full trust (the engine default) unless the user asked for `--safe`. The
+   *  director and every step run with the tools of their runtime and no
+   *  permission prompts, because a decision-maker with no tools decides on
+   *  hearsay. `--safe` is the user saying otherwise, and the user's order wins
+   *  over the default — which is the only reason this is a field and not a
+   *  constant. */
+  yolo?: boolean;
+  /** Test seam: canned cascade runner (zero-token tests). Same shape
+   *  `SquadExecArgs.runWithCascadeImpl` already uses, so one idiom covers both
+   *  executors. The chain had no test file at all before this — only
+   *  `buildStepBrief` was pinned — so every behaviour of the loop itself was
+   *  unprotected. */
+  runWithCascadeImpl?: typeof runWithCascade;
+  /** Test seam: canned director. Without it `pickChain` reaches a real runtime,
+   *  which is why the chain could not be tested at all. */
+  runHeadlessImpl?: typeof runHeadless;
 }
 
 export interface ChainStep { employee: string; task: string; }
-export interface StepResult { employee: string; ok: boolean; sessionId: string | null; costUsd: number | null; durationMs: number; outputsDir: string; }
-export interface TeamResult { ok: boolean; steps: StepResult[]; chain: ChainStep[]; lastSessionId: string | null; totalCostUsd: number; totalDurationMs: number; error?: string; }
+export interface StepResult {
+  employee: string; ok: boolean; sessionId: string | null; costUsd: number | null;
+  durationMs: number; outputsDir: string;
+  /** 1 normally, 2 when the step was retried. */
+  attempts?: number;
+  /** Set when the step failed BOTH times and the chain went on without it. The
+   *  string is what the colleagues downstream are told is missing. */
+  failed?: string;
+}
+/** A seat that was asked and did not deliver. Named, never swallowed. */
+export interface ChainGap { employee: string; task: string; }
+
+export interface TeamResult { ok: boolean; steps: StepResult[]; chain: ChainStep[]; gaps: ChainGap[]; lastSessionId: string | null; totalCostUsd: number; totalDurationMs: number; error?: string; }
 
 function appendAudit(payload: Record<string, any>, projectRoot?: string): void {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const dir = path.join(harnessLogsDir({ cwd: projectRoot }), today);
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n");
+    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(stamp({ ts: new Date().toISOString(), ...payload })) + "\n");
   } catch { /* non-fatal */ }
 }
 
-function listEmployees(slug: string): { name: string; role: string; description: string }[] {
-  const dir = path.join(BUSINESSES, slug, "employees");
+/** The one place this module decides where the business lives.
+ *
+ *  Both callers must agree: `pickChain` lists the seats from it and `runStep`
+ *  grants it to the dispatch. Resolving separately is how a run gets the roster
+ *  of one tree and the key to another — the failure `entity-resource-map` names
+ *  in its own header. */
+function businessDir(args: TeamRunArgs): string {
+  return args.businessesRoot
+    ? path.join(args.businessesRoot, args.slug)
+    : resolveEntityDir("businesses", args.slug, args.projectDir);
+}
+
+/** The seats the director gets to choose from.
+ *
+ *  The old `path.join(os.homedir(), "businesses")` ignored `BUSINESSES_DIR`,
+ *  `NIRVANA_HOME` and the project scope alike: a business installed under a
+ *  redirected home, or living in the project, listed zero seats — and
+ *  `pickChain` then silently degraded the whole company to its single intake
+ *  employee, which reads like a product decision rather than a missing path. */
+function listEmployees(args: TeamRunArgs): { name: string; role: string; description: string }[] {
+  const dir = path.join(businessDir(args), "employees");
   if (!fs.existsSync(dir)) return [];
   const out: { name: string; role: string; description: string }[] = [];
   for (const f of fs.readdirSync(dir).sort()) {
@@ -81,43 +143,108 @@ function listEmployees(slug: string): { name: string; role: string; description:
   return out;
 }
 
-function pickChain(args: TeamRunArgs): ChainStep[] {
-  const employees = listEmployees(args.slug);
-  if (employees.length <= 1) return [{ employee: args.intakeEmployee, task: "Execute o brief de ponta a ponta. Você é o único employee deste business." }];
+function pickChain(args: TeamRunArgs): { chain: ChainStep[]; reason: string } {
+  const employees = listEmployees(args);
+  if (employees.length <= 1) {
+    return {
+      chain: [{ employee: args.intakeEmployee, task: "Carry the brief end to end. You are the only employee of this business." }],
+      reason: "the business has a single seat",
+    };
+  }
 
   const list = employees.map(e => `- ${e.name} (${e.role}): ${e.description}`).join("\n");
   const prompt = [
-    `Você é o diretor de orquestração do business "${args.slug}". Sua única função é decidir a cadeia ideal de employees para executar o brief abaixo com QUALIDADE NIRVANA — o melhor que existe.`,
+    `You are the orchestration director of the business "${args.slug}". Your only job is to decide the chain of employees that executes the brief below at the highest quality this system can reach.`,
     "",
-    "PREMISSA FUNDAMENTAL: nada nas coxas. A cadeia deve ativar os especialistas certos e cada sub-tarefa deve mandar o employee USAR o que há de melhor disponível (geradores de imagem reais como `nano-banana-pro` ou `image2-virtuoso`, bibliotecas modernas de primeiríssima via CDN confiável, dispatchar outros squads do registry quando fizer sentido). Nunca peça SVG genérico para visual, nunca improvise no que um especialista faz melhor.",
+    "HOW TO WRITE A SUB-TASK: say what has to EXIST when the employee is done, and what is non-negotiable about it. Do not say how to get there. Whoever executes is the specialist — they know the tools of their own craft better than you do, and a step-by-step written upstream only takes away their freedom to do it better. A requirement on the RESULT is legitimate (\"the images have to be real generated images, not placeholders\", \"the HTML has to open without a build step\"); a recipe for the METHOD is not (\"use library X\", \"first do A, then B\").",
     "",
-    "BRIEF DO CLIENTE:",
+    "CLIENT BRIEF:",
     args.brief,
     "",
-    "EMPLOYEES DISPONÍVEIS:",
+    "AVAILABLE EMPLOYEES:",
     list,
     "",
-    `REGRAS:`,
-    `- "${args.intakeEmployee}" é o intake/synthesizer e DEVE ser o ÚLTIMO da cadeia (consolida os outputs dos colegas em entregáveis finais).`,
-    `- Inclua de 3 a 6 employees na cadeia (incluindo o synthesizer). Pule employees irrelevantes ao brief.`,
-    `- Ordene pela dependência lógica: quem dá o input vem antes de quem precisa dele.`,
-    `- Cada sub-tarefa deve mandar o employee usar os melhores recursos disponíveis para o seu tipo de output (imagens reais, bibliotecas atuais, especialistas externos quando aplicável).`,
+    "RULES:",
+    `- "${args.intakeEmployee}" is the intake/synthesizer and MUST be LAST in the chain (it consolidates the colleagues' outputs into the final deliverables).`,
+    args.forceChain
+      ? "- Include 3 to 6 employees in the chain (the synthesizer counts). Skip employees irrelevant to the brief."
+      : "- THE ORG CHART IS THE CONTRACT, not a suggestion. If a seat's declared role covers part of this brief, THAT SEAT does that part. You are not judging who is capable: the same model sits in every chair, so \"the synthesizer could do this\" is always true and is never the question. Ask instead whose JOB it is. The synthesizer works alone only when NO seat's role covers the work.",
+    args.forceChain ? "" : "- A seat is also how a mind-clone reaches the work: personas are ranked against the SEAT'S task, not against the company. Skip the seat and the persona the brief needed is never injected — a comedy screenplay written by the CEO because it could is a screenplay with no screenwriter's voice in it.",
+    args.forceChain ? "" : "- Six seats at most, and skip any whose role the brief does not touch. Cost is the tie-breaker between two defensible chains, never the test for whether to delegate.",
+    "- Order by logical dependency: whoever produces an input comes before whoever needs it.",
+    "- Each sub-task: the expected result and what is mandatory about it. The path belongs to whoever executes.",
+    "- The DELIVERABLE follows the language of the client brief above. These instructions are in English; what the business ships is not.",
     "",
-    'Responda APENAS um JSON válido: {"chain":[{"employee":"<nome-exato>","task":"<sub-tarefa em 1-2 frases, citando que ferramentas/recursos top usar quando aplicável>"}, ...]}',
-    "Sem markdown, sem cercas, sem comentário antes ou depois.",
-  ].join("\n");
+    'Answer with ONE valid JSON object only: {"reason":"<one sentence: why THIS number of steps>","chain":[{"employee":"<exact-name>","task":"<1-2 sentences: what has to exist at the end, and what is non-negotiable>"}, ...]}',
+    "No markdown, no fences, no comment before or after.",
+    // The two mandate rules above are chain-only, so they render as "" under
+    // --team; dropping the empties keeps the rule list from growing blank lines.
+  ].filter(line => line !== "").join("\n");
 
   appendAudit({ event: "team_director_called", project_id: args.projectId, business_slug: args.slug, employees_available: employees.length }, args.projectRoot);
-  const res = runHeadless({
-    runtime: args.runtime, prompt, cwd: os.tmpdir(),
-    allowedTools: [], permissionMode: "default",
+  // The director makes the most consequential call of the run — who works, and
+  // how much the run costs — and it used to make it blindfolded: no tools, and a
+  // temp directory for a working directory. All it could see was the one-line
+  // description of each seat, pasted above. Every other decision-maker in this
+  // system reads before deciding (the router gets Read/Glob/Grep/Bash), and this
+  // one had less to go on than any of them.
+  //
+  // It now runs like the agents it dispatches: full trust, in the project, with
+  // the business granted. If it wants to open a seat's method file before
+  // deciding the seat is unnecessary, it can.
+  const res = (args.runHeadlessImpl ?? runHeadless)({
+    // The director decides and returns a plan. It has Bash and full trust so it
+    // can read a seat method file before ruling the seat out, which is also how
+    // it could shell out to `nrv dispatch` — so it is stamped as a planner,
+    // which may open nothing.
+    dispatchRole: "planner",
+    runtime: args.runtime, prompt, cwd: args.projectRoot,
+    addDirs: [businessDir(args), args.projectDir],
+    yolo: args.yolo ?? true,
     timeoutMs: 5 * 60 * 1000,
   });
   const txt = (res.result || "").trim();
-  const m = txt.match(/\{[\s\S]*\}/);
-  if (!m) throw new Error(`director returned no JSON: ${txt.slice(0, 200)}`);
-  let parsed: any;
-  try { parsed = JSON.parse(m[0]); } catch (e: any) { throw new Error(`invalid director JSON: ${e.message}`); }
+  let parsed = extractDirectorPlan(txt);
+
+  // The director runs with tools, full trust and the project granted — it runs
+  // like the agents it dispatches. That is deliberate, and it has a cost: an
+  // agent with tools treats its final message as a REPORT of work done, not as
+  // the payload. Measured on meridian-advisory (2026-09-18, 16 seats): it
+  // decided well and then narrated the decision, twice, in auto and under
+  // --team. The second answer said, in the client's language, "I returned the
+  // chain as a single JSON object" — while returning prose that named the seats
+  // it had chosen. The plan existed; only the envelope was missing.
+  //
+  // So ask once more, for the envelope alone. The re-ask carries the previous
+  // answer and asks it to be transcribed, never re-decided: the judgement was
+  // already made and paid for, and a second opinion would be a different chain
+  // for no reason. It is a short prompt with no tools and no directories, which
+  // is also why it does not reproduce the failure — there is no work to report.
+  if (!parsed) {
+    appendAudit({
+      event: "x_director_reask", project_id: args.projectId, business_slug: args.slug,
+      reason: "no_json_object_in_answer", answer_chars: txt.length,
+    }, args.projectRoot);
+    const reask = [
+      "You already decided the chain. Below is your own answer. Transcribe the decision you ALREADY made into JSON. Do not decide again, do not add or drop an employee, do not explain.",
+      "",
+      "YOUR ANSWER:",
+      txt.slice(0, 6000),
+      "",
+      "VALID EMPLOYEE NAMES (use these spellings exactly):",
+      employees.map(e => `- ${e.name}`).join("\n"),
+      "",
+      'Your entire reply must be this one JSON object and nothing else: {"reason":"<one sentence>","chain":[{"employee":"<exact-name>","task":"<what has to exist at the end>"}, ...]}',
+      "No preamble, no summary of what you did, no markdown fences. The JSON object is the whole reply.",
+    ].join("\n");
+    const retry = (args.runHeadlessImpl ?? runHeadless)({
+      runtime: args.runtime, prompt: reask, cwd: args.projectRoot,
+      yolo: args.yolo ?? true,
+      timeoutMs: 2 * 60 * 1000,
+    });
+    parsed = extractDirectorPlan((retry.result || "").trim());
+    if (!parsed) throw new Error(`director returned no usable JSON plan, and none after one re-ask: ${txt.slice(0, 200)}`);
+  }
   if (!Array.isArray(parsed.chain) || !parsed.chain.length) throw new Error("director retornou cadeia vazia");
 
   const known = new Set(employees.map(e => e.name));
@@ -126,9 +253,11 @@ function pickChain(args: TeamRunArgs): ChainStep[] {
     .map((s: any) => ({ employee: s.employee, task: String(s.task || "Execute sua especialidade aplicada ao brief.").trim() }));
   if (!chain.length) throw new Error("director picked no valid employee");
   if (chain[chain.length - 1].employee !== args.intakeEmployee) {
-    chain.push({ employee: args.intakeEmployee, task: `Síntese final: leia os outputs dos colegas em _team/* e consolide os ENTREGÁVEIS FINAIS sob ${args.outputsRoot}. Cite premissas em "## Premissas assumidas".` });
+    chain.push({ employee: args.intakeEmployee, task: `Final synthesis: read the colleagues' outputs under _team/* and consolidate the FINAL DELIVERABLES under ${args.outputsRoot}. State any assumptions under a "## Assumptions" heading.` });
   }
-  return chain;
+  const reason = String(parsed.reason || "").replace(/\s+/g, " ").trim().slice(0, 300)
+    || "the director stated no reason";
+  return { chain, reason };
 }
 
 /**
@@ -150,10 +279,11 @@ function runWithSession(
   args: TeamRunArgs,
   cascadeArgs: Parameters<typeof runWithCascade>[0],
 ): ReturnType<typeof runWithCascade> {
+  const cascade = args.runWithCascadeImpl ?? runWithCascade;
   const key = sessionKey(args.runtime, kind, slug);
   const prior = getSession(args.projectDir, key);
 
-  let res = runWithCascade(prior ? { ...cascadeArgs, sessionId: prior } : cascadeArgs);
+  let res = cascade(prior ? { ...cascadeArgs, sessionId: prior } : cascadeArgs);
 
   if (!res.ok && prior) {
     // The session may have died outside our control. There is no reliable way
@@ -165,7 +295,7 @@ function runWithSession(
       business_slug: args.slug, entity: `${kind}:${slug}`, runtime: args.runtime, session_id: prior,
     }, args.projectRoot);
     dropSession(args.projectDir, key);
-    res = runWithCascade(cascadeArgs);
+    res = cascade(cascadeArgs);
   } else if (prior && res.ok) {
     appendAudit({
       event: "session_resumed", trace_id: args.projectId, project_id: args.projectId,
@@ -177,37 +307,78 @@ function runWithSession(
   return res;
 }
 
-function runStep(step: ChainStep, idx: number, total: number, args: TeamRunArgs, priorOutputs: { employee: string; dir: string }[]): StepResult {
+/** The step brief handed to one employee of the chain: its sub-task, the client's
+ * brief, the colleagues' outputs so far and where to write. Exported so the
+ * scope-guard gate and the tests render it without running the chain. */
+export function buildStepBrief(step: ChainStep, idx: number, total: number, args: Pick<TeamRunArgs, "brief" | "outputsRoot">, priorOutputs: { employee: string; dir: string }[], employeeOutDir: string, gaps: ChainGap[] = []): string {
+  const isLast = idx === total - 1;
+  const priorBlock = priorOutputs.length
+    ? "## What your colleagues produced (read it before writing yours)\n" + priorOutputs.map(p => `- **${p.employee}** → ${p.dir}`).join("\n") + "\n\n"
+    : "";
+  // A colleague that was asked and did not deliver. The next seats are told
+  // plainly, because the alternative is one of them assuming the material
+  // exists and quietly building on nothing.
+  const gapBlock = gaps.length
+    ? "## What never arrived\nThese seats were dispatched and did not deliver. None of it exists on disk — do not go looking, and do not write as if you had read it:\n"
+      + gaps.map(g => `- **${g.employee}** — was responsible for: ${g.task}`).join("\n")
+      + "\nCarry on with what does exist. If the absence blocks part of your work, do all the rest and say which part was left out and why.\n\n"
+    : "";
+  const outputInstr = isLast
+    ? `## Output\nWrite the FINAL DELIVERABLES as files under: \`${args.outputsRoot}\`\nRead everything the colleagues produced under \`_team/*\` and consolidate it. State your assumptions under "## Assumptions" in the main deliverable. Do NOT duplicate a colleague's work — synthesize, refine, complete.`
+      + (gaps.length ? `\n\nAlso write \`${args.outputsRoot}/_QA-RESERVATIONS.md\`: what is missing from this delivery because of the seats that did not deliver, and what that practically costs whoever uses the material. If the file already exists, add to it instead of overwriting.` : "")
+    : `## Output\nWrite YOUR work as well-named Markdown files under: \`${employeeOutDir}\`\nOne or more files with your analysis and the deliverable of your specialty. The colleagues after you will read it to continue — write with them in mind.`;
+
+  return [
+    `# Task for ${step.employee} — step ${idx + 1} of ${total}`,
+    "",
+    "## Your sub-task in this chain",
+    step.task,
+    "",
+    "## The client's original brief",
+    args.brief,
+    "",
+    // These instructions are English; the deliverable is not. Without saying so,
+    // an English prompt quietly turns a Portuguese brief into an English
+    // delivery — the language of the instruction leaking into the work.
+    "## Language\nThese instructions are in English. What you DELIVER follows the language of the client brief above.",
+    "",
+    // A seat is handed a RANKED LIST of mind-clones and told to choose; nothing
+    // is auto-injected unless the brief named one. On 2026-09-04 three seats
+    // each picked a clone, logged a good reason, and then worked without ever
+    // loading it — so the persona was a name in a log, not a voice in the work,
+    // and the run read as if it had clone fidelity it never had. Rule 9 of the
+    // protocol names that exact failure: never claim fidelity you did not load.
+    "## If you pick a mind-clone, LOAD IT\nYour prompt lists candidates; nothing was injected for you. Choosing one and working from what you already know about that person is NOT embodying them — it is the failure the protocol calls claiming fidelity you did not load. If you pick one, run `nrv inspect-clone <slug>` — it prints `Path:` and the artifacts it holds — then READ `agent/AGENT.md`, `agent/SOUL.md` and `dna/dna-schema.md` under that path, and work from what they say. (Not `--dna`: that flag prints layer COUNTS, not the DNA.) If you decide none fits, say so in your output and work as yourself; that is honest and allowed.",
+    "",
+    priorBlock + gapBlock + outputInstr,
+    scopeGuard("en"),
+  ].join("\n");
+}
+
+function runStep(step: ChainStep, idx: number, total: number, args: TeamRunArgs, priorOutputs: { employee: string; dir: string }[], gaps: ChainGap[] = []): StepResult {
   const isLast = idx === total - 1;
   const employeeOutDir = isLast ? args.outputsRoot : path.join(args.outputsRoot, "_team", step.employee);
   fs.mkdirSync(employeeOutDir, { recursive: true });
 
-  const priorBlock = priorOutputs.length
-    ? "## Outputs dos colegas (leia antes de produzir o seu)\n" + priorOutputs.map(p => `- **${p.employee}** → ${p.dir}`).join("\n") + "\n\n"
-    : "";
-  const outputInstr = isLast
-    ? `## Saída\nEscreva os ENTREGÁVEIS FINAIS como arquivos sob: \`${args.outputsRoot}\`\nLeia tudo que os colegas produziram em \`_team/*\` e consolide. Cite as premissas em "## Premissas assumidas" no entregável principal. NÃO duplique trabalho dos colegas — sintetize, refine, complete.`
-    : `## Saída\nEscreva o SEU trabalho como arquivos Markdown bem nomeados sob: \`${employeeOutDir}\`\nUm ou mais arquivos com sua análise + entregável da sua especialidade. Os colegas seguintes vão ler para continuar — escreva pensando neles.`;
-
-  const stepBrief = [
-    `# Tarefa para ${step.employee} — step ${idx + 1} de ${total}`,
-    "",
-    "## Sua sub-tarefa nesta cadeia",
-    step.task,
-    "",
-    "## Brief original do cliente",
-    args.brief,
-    "",
-    priorBlock + outputInstr,
-  ].join("\n");
+  const stepBrief = buildStepBrief(step, idx, total, args, priorOutputs, employeeOutDir, gaps);
 
   const stepBriefFile = path.join(employeeOutDir, ".step-brief.md");
   fs.writeFileSync(stepBriefFile, stepBrief);
 
+  const bizDir = businessDir(args);
+
+  // The child resolves the business independently, and independently is how the
+  // two disagree: this process may have resolved a project-scoped copy while the
+  // subprocess, walking its own resolution, lands on the global one — then the
+  // prompt describes one tree and the grant below opens another. Handing it the
+  // library root this run already settled on removes the second opinion.
   const ep = spawnSync("bun", [
     path.join(SKILLS, "businesses/lib/employee-prompt.ts"),
     args.slug, step.employee, args.projectDir, stepBriefFile, employeeOutDir,
-  ], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  ], {
+    encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
+    env: { ...process.env, BUSINESSES_DIR: path.dirname(bizDir) },
+  });
   if (ep.status !== 0) {
     appendAudit({ event: "team_step_failed", project_id: args.projectId, business_slug: args.slug, employee: step.employee, reason: "employee-prompt build failed", error: ep.stderr?.slice(0, 500) }, args.projectRoot);
     return { employee: step.employee, ok: false, sessionId: null, costUsd: null, durationMs: 0, outputsDir: employeeOutDir };
@@ -216,11 +387,25 @@ function runStep(step: ChainStep, idx: number, total: number, args: TeamRunArgs,
   appendAudit({ event: "dispatch_business", trace_id: args.projectId, project_id: args.projectId, business_slug: args.slug, employee: step.employee, mode: "team-step", step: idx + 1, total }, args.projectRoot);
 
   const res = runWithSession("employee", step.employee, args, {
-    runtime: args.runtime, prompt: ep.stdout, cwd: args.projectDir, addDirs: [args.projectRoot],
+    // An employee may use a squad to build its deliverable, and may not convene
+    // another company. That is the whole allowance.
+    dispatchRole: "employee",
+    // bizDir is granted so the employee prompt's resource map is a door and not a
+    // sign: `playbooks/`, `standards/`, `rubrics/` and `templates/` live under it,
+    // and on claude-code and agy an ungranted path is simply refused. Same grant
+    // squads already have, with the same caveat: `--add-dir` adds a WORKSPACE root
+    // and this path runs with the permission bypass, so the directory is writable.
+    // The prompt says in words that it is read-only, which is the instrument the
+    // rest of the engine uses to keep deliverables where they belong.
+    runtime: args.runtime, prompt: ep.stdout, cwd: args.projectRoot, addDirs: [args.projectDir, employeeOutDir, bizDir],
+    // The chain never passed this, so `--safe` stopped at the business door and
+    // every employee inside ran in full trust regardless.
+    yolo: args.yolo ?? true,
     appendSystemPrompt: AUTONOMOUS_DIRECTIVE + (args.rulesDirective ?? ""),
     maxBudgetUsd: args.maxBudgetUsd, timeoutMs: args.timeoutMs,
     brief: args.brief, projectRoot: args.projectRoot, outputsRoot: employeeOutDir,
     taskHint: `team-step ${idx + 1}/${total} (${step.employee})`,
+    label: `${args.slug}/${step.employee}`,
     projectId: args.projectId,
   });
 
@@ -256,21 +441,75 @@ function runMandatorySquad(squadSlug: string, args: TeamRunArgs): StepResult {
     timeoutMs: args.timeoutMs,
     rulesDirective: args.rulesDirective,
     autonomousDirective: AUTONOMOUS_DIRECTIVE,
+    // The seam travels down: a mandatory squad dispatched from a chain must be
+    // testable from the same fixture that tests the chain.
+    ...(args.runWithCascadeImpl ? { runWithCascadeImpl: args.runWithCascadeImpl } : {}),
   });
   return { employee: `squad:${squadSlug}`, ok: r.ok, sessionId: r.sessionId, costUsd: r.costUsd, durationMs: r.durationMs, outputsDir: r.outputsDir };
 }
 
-export function runTeam(args: TeamRunArgs): TeamResult {
+/**
+ * The chain, decided and audited — with no opinion about who executes it.
+ *
+ * Exported because there are TWO executors and only one of them was ever
+ * getting a chain. `runTeam` (below) spawns a child runtime per step; the
+ * interactive maestro spawns an in-process subagent per step and reaches this
+ * through `nrv chain plan`. Both must decide the same way and leave the same
+ * three events behind, or a reader cannot tell one path's silence from the
+ * other's absence — measured on a live run 2026-09-04, where a business with 14
+ * seats ran as one agent and the deliverable still named six of them.
+ *
+ * Throws on a director that returns nothing usable; the caller decides what a
+ * failed decision means for it.
+ */
+/**
+ * The director's plan, pulled out of whatever the runtime printed around it.
+ *
+ * This was `txt.match(/\{[\s\S]*\}/)`: greedy, from the first `{` in the text
+ * to the last `}`. On a runtime that surrounds the final message with a JSONL
+ * event stream — Codex does — that span opens inside the telemetry and closes
+ * inside the answer, so it never parses. The director had answered correctly
+ * and the run died with "invalid director JSON", which then read as "this
+ * business does not work" and dropped the whole org chart to `agent-x`.
+ *
+ * Scan for BALANCED objects instead, skipping braces inside strings, and keep
+ * the last one that actually looks like a plan. The answer comes after the
+ * noise, and a telemetry line has no `chain`.
+ */
+export function extractDirectorPlan(text: string): any | null {
+  return extractJsonObject(text, (v) => v && Array.isArray(v.chain));
+}
+
+export function planChain(args: TeamRunArgs): { chain: ChainStep[]; reason: string } {
   let chain: ChainStep[];
-  try { chain = pickChain(args); }
+  let reason: string;
+  try { ({ chain, reason } = pickChain(args)); }
   catch (e: any) {
     appendAudit({ event: "team_director_failed", project_id: args.projectId, business_slug: args.slug, error: e?.message || String(e) }, args.projectRoot);
-    return { ok: false, steps: [], chain: [], lastSessionId: null, totalCostUsd: 0, totalDurationMs: 0, error: `director: ${e?.message || e}` };
+    throw e;
   }
+  // Why this run costs what it costs. The chain length is a decision rather
+  // than a flag, so it owes the owner a reason: five dispatches on a brief one
+  // seat could have carried is a bill, and reading it back from the audit is how
+  // the director's judgement gets checked instead of assumed.
+  appendAudit({
+    event: "x_chain_shape_decided", project_id: args.projectId, business_slug: args.slug,
+    steps: chain.length, reason, forced: args.forceChain ? "team" : "auto",
+  }, args.projectRoot);
   appendAudit({ event: "team_chain_selected", project_id: args.projectId, business_slug: args.slug, chain: chain.map(s => ({ employee: s.employee, task: s.task.slice(0, 120) })) }, args.projectRoot);
+  return { chain, reason };
+}
+
+export function runTeam(args: TeamRunArgs): TeamResult {
+  let chain: ChainStep[];
+  try { ({ chain } = planChain(args)); }
+  catch (e: any) {
+    return { ok: false, steps: [], chain: [], gaps: [], lastSessionId: null, totalCostUsd: 0, totalDurationMs: 0, error: `director: ${e?.message || e}` };
+  }
 
   const steps: StepResult[] = [];
   const priorOutputs: { employee: string; dir: string }[] = [];
+  const gaps: ChainGap[] = [];
   const mandatorySquads = args.mandatorySquads ?? [];
   for (let i = 0; i < chain.length; i++) {
     // Right before the synthesizer (last step), dispatch each mandatory squad
@@ -284,18 +523,61 @@ export function runTeam(args: TeamRunArgs): TeamResult {
         // it already has. The squad_run_failed event is in the audit.
       }
     }
-    const r = runStep(chain[i], i, chain.length, args, priorOutputs);
-    steps.push(r);
+    const isLast = i === chain.length - 1;
+    let r = runStep(chain[i], i, chain.length, args, priorOutputs, gaps);
+    let attempts = 1;
+
+    // One retry, from a cold session. `runWithSession` already does this when a
+    // session existed to resume; a first-ever step had no such second chance, so
+    // a transport hiccup killed the whole chain on its first breath.
     if (!r.ok) {
+      dropSession(args.projectDir, sessionKey(args.runtime, "employee", chain[i].employee));
+      appendAudit({
+        event: "x_chain_step_retried", trace_id: args.projectId, project_id: args.projectId,
+        business_slug: args.slug, employee: chain[i].employee, step: i + 1, total: chain.length,
+      }, args.projectRoot);
+      r = runStep(chain[i], i, chain.length, args, priorOutputs, gaps);
+      attempts = 2;
+    }
+    r.attempts = attempts;
+    steps.push(r);
+
+    if (r.ok) {
+      priorOutputs.push({ employee: chain[i].employee, dir: r.outputsDir });
+      continue;
+    }
+
+    // Twice failed. The chain used to stop here, which threw away every
+    // colleague's finished work and never ran the seat whose whole job is to
+    // consolidate it — the run ended with a full `_team/` on disk and nothing
+    // assembled. It goes on instead, and what is missing travels with it: the
+    // next steps are told, the synthesizer is told to record it in the
+    // delivery, and the audit carries it.
+    r.failed = `${chain[i].employee} did not deliver (2 attempts)`;
+    gaps.push({ employee: chain[i].employee, task: chain[i].task });
+    appendAudit({
+      event: "x_chain_gap", trace_id: args.projectId, project_id: args.projectId,
+      business_slug: args.slug, employee: chain[i].employee, step: i + 1, total: chain.length,
+      attempts, task: chain[i].task.slice(0, 200),
+    }, args.projectRoot);
+
+    // The synthesizer is the exception: nothing downstream can cover for it, so
+    // its failure is the run's failure.
+    if (isLast) {
       const totalCost = steps.reduce((s, x) => s + (x.costUsd || 0), 0);
       const totalDur = steps.reduce((s, x) => s + x.durationMs, 0);
-      return { ok: false, steps, chain, lastSessionId: r.sessionId, totalCostUsd: totalCost, totalDurationMs: totalDur, error: `step ${i + 1} (${chain[i].employee}) falhou` };
+      return { ok: false, steps, chain, gaps, lastSessionId: r.sessionId, totalCostUsd: totalCost, totalDurationMs: totalDur, error: `step ${i + 1} (${chain[i].employee}) falhou` };
     }
-    priorOutputs.push({ employee: chain[i].employee, dir: r.outputsDir });
   }
 
   const totalCost = steps.reduce((s, x) => s + (x.costUsd || 0), 0);
   const totalDur = steps.reduce((s, x) => s + x.durationMs, 0);
-  appendAudit({ event: "team_completed", project_id: args.projectId, business_slug: args.slug, steps: chain.length, total_cost_usd: totalCost, total_duration_ms: totalDur }, args.projectRoot);
-  return { ok: true, steps, chain, lastSessionId: steps[steps.length - 1].sessionId, totalCostUsd: totalCost, totalDurationMs: totalDur };
+  // `gaps` rides on completion so "the chain finished" and "the chain finished
+  // whole" stay two different statements in the log.
+  appendAudit({
+    event: "team_completed", project_id: args.projectId, business_slug: args.slug,
+    steps: chain.length, total_cost_usd: totalCost, total_duration_ms: totalDur,
+    ...(gaps.length ? { gaps: gaps.map(g => g.employee) } : {}),
+  }, args.projectRoot);
+  return { ok: true, steps, chain, gaps, lastSessionId: steps[steps.length - 1].sessionId, totalCostUsd: totalCost, totalDurationMs: totalDur };
 }

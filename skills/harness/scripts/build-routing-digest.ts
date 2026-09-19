@@ -7,14 +7,16 @@
  * them into ONE pipe-delimited English file (`.routing-digest.md`, written next
  * to the registries, scope-aware via ROUTING_DIGEST_PATH) that a router LLM can
  * read whole: every business, squad, capability collision and mind-clone, one
- * line each, under a hard <50k-token budget (chars/4 heuristic).
+ * line each. A token budget (`routing.digest_token_budget`, chars/4 heuristic)
+ * degrades the digest by levels when set; the default is no budget at all.
  *
  * Budget degradation ladder (entries are NEVER dropped):
  *   L0  full format (2 example briefs, capability one-liners, 160c descriptions)
  *   L1  drop the 2nd example brief (businesses + squads keep 1)
  *   L2  additionally drop capability one-liners in the squads section (ids only)
  *   L3  additionally truncate all descriptions to 100c (incl. clone one-liners,
- *       which are the clone's description field)
+ *       which are the clone's description field) and cut squad produces to 3
+ *   L4  additionally drop the clone and squad domain lists
  * The applied level is reported in the digest header.
  *
  * Also emits `.keyword-aliases.json` (same directory): cross-language alias
@@ -44,6 +46,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { paths as nrvPaths, parseArgs, EXIT } from "../../_shared/lib/bun-helpers.ts";
 import { resolveScope } from "../../_shared/lib/scope.ts";
+import { resolveSetting } from "../../_shared/lib/settings.ts";
 
 // ─────────────────────────────────────────────────────────────────────
 // Paths — where the registries and the digest live (scope-aware)
@@ -111,6 +114,8 @@ export interface DigestResult {
   tokens: number;
   degradationLevel: 0 | 1 | 2 | 3 | 4;
   overBudget: boolean;
+  /** The budget the ladder was walked against (0 = none). */
+  budget: number;
   counts: {
     businesses: number;
     squads: number;
@@ -122,7 +127,21 @@ export interface DigestResult {
   };
 }
 
-export const TOKEN_BUDGET = 50_000;
+/** No budget. The digest used to be sized by a 50k constant with no knob, and a
+ *  library that outgrew it degraded to the last rung in silence: the domains
+ *  lists the agentic router reads were the first thing dropped. A budget is
+ *  something an owner sets on purpose (`routing.digest_token_budget`); by
+ *  default nothing is considered and the digest ships whole. */
+export const TOKEN_BUDGET = 0;
+
+/** The budget in force: `routing.digest_token_budget` from config, 0 = none
+ *  (level 0, never over budget). */
+export function configuredTokenBudget(): number {
+  try {
+    const v = Number(resolveSetting("routing.digest_token_budget").value);
+    return Number.isFinite(v) && v >= 0 ? v : TOKEN_BUDGET;
+  } catch { return TOKEN_BUDGET; }
+}
 
 /** chars/4 heuristic — the budget currency of the digest. */
 export const estimateTokens = (text: string): number => Math.ceil(text.length / 4);
@@ -153,21 +172,30 @@ interface LadderKnobs {
   capOneLiners: boolean;   // squads section (dropped at L2)
   descMax: number;         // 160 → 100 at L3
   oneLinerMax: number;     // clone one_liner: 120 → 100 at L3 (it IS the clone's description)
+  squadProduces: number;   // squad produces list: 6 → 3 at L3
   cloneDomains?: boolean;  // clone domain lists (dropped at L4 — the biggest compressible block)
+  squadDomains?: boolean;  // squad domain lists (dropped at L4, same reason as clone domains)
 }
 
 const KNOBS: Record<0 | 1 | 2 | 3 | 4, LadderKnobs> = {
-  0: { exampleBriefs: 2, capOneLiners: true, descMax: 160, oneLinerMax: 120 },
-  1: { exampleBriefs: 1, capOneLiners: true, descMax: 160, oneLinerMax: 120 },
-  2: { exampleBriefs: 1, capOneLiners: false, descMax: 160, oneLinerMax: 120 },
-  3: { exampleBriefs: 1, capOneLiners: false, descMax: 100, oneLinerMax: 100 },
+  0: { exampleBriefs: 2, capOneLiners: true, descMax: 160, oneLinerMax: 120, squadProduces: 6 },
+  1: { exampleBriefs: 1, capOneLiners: true, descMax: 160, oneLinerMax: 120, squadProduces: 6 },
+  2: { exampleBriefs: 1, capOneLiners: false, descMax: 160, oneLinerMax: 120, squadProduces: 6 },
+  3: { exampleBriefs: 1, capOneLiners: false, descMax: 100, oneLinerMax: 100, squadProduces: 3 },
   // Level 4 exists because the library outgrew level 3 the moment the
   // enrichment waves landed (54.7k tokens at level 3 with 398 enriched
   // clones). Clone domains are the biggest single block in the digest and the
   // most compressible: the one_liner already states what the clone serves, and
   // the agent escalates to the manifest for finalists. Entries are still never
   // dropped — every clone keeps its line.
-  4: { exampleBriefs: 1, capOneLiners: false, descMax: 90, oneLinerMax: 90, cloneDomains: false },
+  //
+  // Squad domains go at the same rung and for the same reason. Measured on the
+  // owner's library (205 squads, 555 clones), the two squad segments cost 2.4k
+  // and 3.9k tokens against 5.3k of headroom at this rung, so one of them has
+  // to yield: `produces` stays because it is the OBJECT of the brief, which the
+  // router's own prompt says decides most of the call, and `domains` averages
+  // 3.5 broad labels that the description already implies.
+  4: { exampleBriefs: 1, capOneLiners: false, descMax: 90, oneLinerMax: 90, squadProduces: 3, cloneDomains: false, squadDomains: false },
 };
 
 function briefsSeg(briefs: string[], count: number, maxLen: number): string {
@@ -196,6 +224,15 @@ function businessLine(slug: string, b: any, k: LadderKnobs): string {
 
 function squadLine(slug: string, s: any, capsById: Record<string, any[]>, k: LadderKnobs): string {
   const segs: string[] = [slug, trunc(flat(s.description) || "—", k.descMax)];
+  // domains + produces, the same two segments the business line has carried
+  // since this file was written. The router's own prompt tells it the OBJECT of
+  // a brief decides most of the call, and the squads section was the one place
+  // that never stated an object — while the registry aggregated both at squad
+  // level all along.
+  const domains = k.squadDomains === false ? [] : strList(s.domains).slice(0, 10);
+  if (domains.length) segs.push(`domains: ${domains.join(",")}`);
+  const produces = strList(s.produces).slice(0, k.squadProduces);
+  if (produces.length) segs.push(`produces: ${produces.join(",")}`);
   const capIds = strList(s.capabilities);
   if (capIds.length) {
     const rendered = capIds.map((id) => {
@@ -245,7 +282,7 @@ function renderAt(input: DigestInput, level: 0 | 1 | 2 | 3 | 4, generatedAt: str
     "# Generated by harness/scripts/build-routing-digest.ts — do not edit by hand.",
     `generated_at: ${generatedAt}`,
     `counts: businesses=${bizSlugs.length} | squads=${squadSlugs.length} | capability_ids=${capIds.length} | capability_providers=${providerCount} | capability_collisions=${collisions.length} | mind_clones=${cloneSlugs.length} (${enriched.length} with routing block)`,
-    `degradation_level: ${level} (0=full · 1=single example brief · 2=+no capability one-liners · 3=+descriptions and clone one-liners at 100c · 4=+no clone domains; entries are never dropped)`,
+    `degradation_level: ${level} (0=full · 1=single example brief · 2=+no capability one-liners · 3=+descriptions and clone one-liners at 100c and squad produces at 3 · 4=+no clone or squad domains; entries are never dropped)`,
     "escalation (finalists only — never for the survey):",
     `  businesses registry: ${input.registryPaths.businesses} (each entry's manifest_path → full business.yaml)`,
     `  squads registry: ${input.registryPaths.squads} (each entry's manifest_path → full squad.yaml)`,
@@ -255,7 +292,7 @@ function renderAt(input: DigestInput, level: 0 | 1 | 2 | 3 | 4, generatedAt: str
     "## businesses (slug | description | domains: | produces: top 6 | caps: ids | ex: briefs | not:)",
     ...bizSlugs.map((s) => businessLine(s, input.businesses[s], k)),
     "",
-    "## squads (slug | description | caps: id — one-liner | ex: briefs | not:)",
+    "## squads (slug | description | domains: | produces: top 6 | caps: id — one-liner | ex: briefs | not:)",
     ...squadSlugs.map((s) => squadLine(s, input.squads[s], input.capabilities, k)),
     "",
     "## capability collisions (id → providers; disambiguate via the squads section above)",
@@ -283,7 +320,7 @@ function renderAt(input: DigestInput, level: 0 | 1 | 2 | 3 | 4, generatedAt: str
  * into exit 1).
  */
 export function buildDigest(input: DigestInput, opts: { budgetTokens?: number; generatedAt?: string } = {}): DigestResult {
-  const budget = opts.budgetTokens ?? TOKEN_BUDGET;
+  const budget = opts.budgetTokens ?? configuredTokenBudget();
   const generatedAt = opts.generatedAt ?? new Date().toISOString();
   let text = "";
   let tokens = 0;
@@ -292,14 +329,15 @@ export function buildDigest(input: DigestInput, opts: { budgetTokens?: number; g
     level = l;
     text = renderAt(input, l, generatedAt);
     tokens = estimateTokens(text);
-    if (tokens < budget) break;
+    if (budget === 0 || tokens < budget) break;
   }
   const capIds = Object.keys(input.capabilities);
   return {
     text,
     tokens,
     degradationLevel: level,
-    overBudget: tokens >= budget,
+    overBudget: budget > 0 && tokens >= budget,
+    budget,
     counts: {
       businesses: Object.keys(input.businesses).length,
       squads: Object.keys(input.squads).length,
@@ -530,7 +568,7 @@ if (import.meta.main) {
       digest_path: checkBudget ? null : digestPath,
       aliases_path: checkBudget ? null : aliasesPath,
       tokens: digest.tokens,
-      budget: TOKEN_BUDGET,
+      budget: digest.budget,
       degradation_level: digest.degradationLevel,
       over_budget: digest.overBudget,
       counts: digest.counts,
@@ -538,14 +576,15 @@ if (import.meta.main) {
     }, null, 2));
   } else if (!quiet) {
     const c = digest.counts;
-    console.error(`[build-routing-digest] ~${digest.tokens} tokens (budget ${TOKEN_BUDGET}, chars/4) · degradation level ${digest.degradationLevel}`);
+    console.error(`[build-routing-digest] ~${digest.tokens} tokens (budget ${digest.budget || "none"}, chars/4) · degradation level ${digest.degradationLevel}`);
     console.error(`[build-routing-digest] businesses=${c.businesses} squads=${c.squads} capability_ids=${c.capabilityIds} providers=${c.capabilityProviders} collisions=${c.capabilityCollisions} clones=${c.mindClones} (${c.mindClonesEnriched} enriched)`);
     console.error(`[build-routing-digest] alias groups: ${aliases.length}`);
     if (!checkBudget) {
       console.error(`[build-routing-digest] digest → ${digestPath}`);
       console.error(`[build-routing-digest] aliases → ${aliasesPath}`);
     }
-    if (digest.overBudget) console.error(`[build-routing-digest] OVER BUDGET even at level 3 — trim registry descriptions/briefs.`);
+    if (digest.overBudget) console.error(`[build-routing-digest] OVER BUDGET even at level ${digest.degradationLevel}, the last rung — raise it with \`nrv config set routing.digest_token_budget <tokens>\` (0 = no budget) or trim registry descriptions/briefs.`);
+    else if (digest.degradationLevel > 0) console.error(`[build-routing-digest] degraded to level ${digest.degradationLevel} to fit the budget — level 4 drops every domains list; raise routing.digest_token_budget to keep them.`);
   }
 
   if (checkBudget && digest.overBudget) process.exit(EXIT.FAILURES);

@@ -1,4 +1,4 @@
-<!-- nirvana-os:invocation-contract:v1 -->
+<!-- nirvana-os:invocation-contract:v2 -->
 # Project guidelines (universal — Claude Code · Gemini-CLI · Codex · Cursor · Antigravity · any agent runtime)
 
 This file is the contract every agent must read **before doing anything**.
@@ -17,12 +17,20 @@ Copies named `CLAUDE.md` and `GEMINI.md` exist alongside it for runtimes that lo
 
 ## 0.5. Your role when reading this file
 
-When you (the LLM) read this file, you are the **orchestrator**, not the executor.
+**First, decide which of the two roles you are. The answer is in the environment, not in your judgement.**
+
+Check `NIRVANA_DISPATCH_DEPTH`. If it is set to any number, **you are a dispatched executor**: some other agent already did the orchestrating and picked you. Your job is the opposite of everything below — **produce the artifact yourself** and do not dispatch, do not delegate, do not open subagents, do not invoke the harness. The brief you were given is your work, not a brief to route. Stop reading this section and go do it.
+
+If it is unset, you are the orchestrator and the rest of this section is yours.
+
+Why this check exists: without it, a dispatched agent read the orchestrator instructions below, dutifully delegated, and the agent it spawned read them too. Two dispatches became fifteen running agents, each opening its own subagents, one of them looping against this very rule. The engine now also refuses a dispatch past `execution.max_dispatch_depth` and denies a worker its runtime's own subagent tool, but those are backstops. This paragraph is the fix.
+
+When you (the LLM) read this file as the **orchestrator**, you are not the executor.
 
 Your output is **dispatches**, never artifacts. You:
 
 - ✅ Read the brief, refine and clarify it, pick targets via the dispatch cascade, dispatch them, verify.
-- ✅ Write to: `~/.harness-logs/`, `.nirvana/briefs/`, `.nirvana/plans/`, `.nirvana/outputs/<trace>/audit.jsonl`, and `HANDOFF.json`.
+- ✅ Write to: `~/.harness-logs/`, `.nirvana/briefs/`, `.nirvana/plans/`, `outputs/<trace>/audit.jsonl`, and `HANDOFF.json`.
 - ❌ Never write the deliverable yourself: no code, no prose, no HTML, no markdown content, no images, no PDFs.
 - ❌ Never create files in the `output_path` / `outputs_root` of the brief — that path belongs to the dispatched agent.
 
@@ -31,6 +39,12 @@ If you find yourself opening `Write` or `Edit` to produce content the user asked
 The only briefs that bypass this rule are pure utility lookups (`list`, `inspect`, `audit`, `cost`, `glance`) — and those don't produce artifacts anyway.
 
 **Dispatch cascade (always):** Business → Squad → `agent-x.<runtime>` (the runtime's fallback generalist at `~/.nirvana/skills/_shared/agents/`). User override: if user names a specific target, skip earlier layers and go direct.
+
+**Never dispatch in `fast` mode.** `fast` is the BM25 router: offline, reproducible, free, and measured at 0.224 top-1 against real first-touch briefs — it loses the right destination entirely in two thirds of them. It is a diagnostic and a preview, not a way to pick who does the work. Route with it, read what it says, and dispatch through the agentic cascade. If the user explicitly asks for a fast dispatch, say what it costs in accuracy and do it.
+
+**Never set a spend ceiling the user did not ask for.** `--max-budget` is hard, not advisory: crossing it stops the run per the configured action, and a run stopped halfway costs everything it spent and delivers nothing. A ceiling chosen by the orchestrator rather than by the owner is a guess about someone else's money. Pass one only when the user named a number, or when a business manifest declares `run_budget_usd` — that is the owner speaking through the manifest.
+
+**Who may dispatch what.** A **business** opens its own org chart and the squads its seats carry. An **employee** may use squads to build its deliverable, as many as the work needs, and nothing else — a seat that convenes another company is the runaway. A **squad** executes and **never** dispatches; so does `agent-x`; so does any decision step (a director, a judge, a router). The engine enforces this from `NIRVANA_DISPATCH_ROLE` and refuses the spawn, so this paragraph describes a rule rather than requesting one.
 
 ---
 
@@ -51,16 +65,56 @@ curl -fsSL https://bun.sh/install | bash            # macOS / Linux
 powershell -c "irm bun.sh/install.ps1 | iex"        # Windows
 ```
 
+<!-- nirvana:deps-rule:v1 -->
+## Dependencies — one home, `~/.nirvana`, never anywhere else
+
+Every dependency this system installs lives in ONE place. Node packages in
+`~/.nirvana/node_modules`, Python packages in `~/.nirvana/python`, and the
+runtimes tools download for themselves (Chromium for Puppeteer, browsers for
+Playwright, model weights) in `~/.nirvana/cache/<tool>`. One copy on disk,
+shared by every squad and every project.
+
+**Never run `bun install`, `bun add`, `npm install`, `pnpm add` or `pip install`
+inside a squad, a business, a pack or the project you are working in.** Doing it
+writes a full dependency tree into that directory — hundreds of megabytes,
+duplicated for every squad that needs the same package, scattered across the
+user's disk. It is the single most expensive mistake available in this system.
+
+Use the command instead:
+
+```
+nrv deps install <pkg>[@version] …   # add to the shared store
+nrv deps link <squad-slug|dir>       # point a directory at the store
+nrv deps status                      # where things are, and what escaped
+nrv activate <squad>                 # installs what a squad DECLARES, centrally
+```
+
+If a script cannot resolve a package, the fix is `nrv deps link <dir>` (which
+symlinks `node_modules` to the store) or running under `nrv deps env`. It is
+never a local install.
+
+`npm install` is the worst offender: run inside a linked directory it deletes
+the link without asking ("Removing non-directory node_modules") and rebuilds a
+private copy, so the scatter returns silently. `nrv deps status` and
+`nrv doctor` report any tree that reappears; `nrv deps adopt --apply` folds it
+back in.
+
+The one exception is a real system program — `ffmpeg`, `git`, `pandoc`,
+`epubcheck` — which belongs to the machine's package manager (`brew`, `apt`) and
+is installed once, globally, on purpose. Declare those in the squad's
+`dependencies.yaml` under `system:` and let `nrv activate` handle them.
+
 ## 1. The Nirvana protocol — invoke the harness skill
 
-When the user asks for **any concrete artifact** — book, video, PDF, post, copy, design, illustration, brand, code, page, app, report, analysis, research, dataset, audit, anything — invoke the **`harness` skill**. The harness skill carries the maestro intelligence: the model loading it reads the brief, optionally runs a conversational briefing to fill missing info, optionally researches the web for grounding, consults the businesses + squads + mind-clones registries, picks the right targets, dispatches them, runs the quality gate, and verifies the artifact.
+When the user asks for **any concrete artifact** — book, video, PDF, post, copy, design, illustration, brand, code, page, app, report, analysis, research, dataset, audit, anything — invoke the **harness** — the orchestrator at `~/.nirvana/skills/harness/SKILL.md`, reached through the `nirvana` skill; it is not registered as a skill of its own. The harness carries the maestro intelligence: the model loading it reads the brief, optionally runs a conversational briefing to fill missing info, optionally researches the web for grounding, consults the businesses + squads + mind-clones registries, picks the right targets, dispatches them, runs the quality gate, and verifies the artifact.
 
 You don't pre-route by shell. You don't decide the cascade in your own head. You invoke the harness skill and let it orchestrate. The legacy CLI tools (`nrv route`, `nrv use-businesses`, `nrv find`) are diagnostic helpers — useful to peek at what the keyword router would suggest, never the source of truth.
 
 How invocation looks per runtime:
 
-- Claude Code / Anthropic SDK: `Skill("harness", "<user's brief verbatim>")` (or trust the auto-activation by description match).
-- Gemini-CLI / Codex / Cursor / etc.: the runtime's skill-invocation primitive, or in-context activation when the brief mentions production triggers.
+- Claude Code / Anthropic SDK: `Skill("nirvana", "<user's brief verbatim>")` (or trust the auto-activation by description match); the door reads the harness.
+- Any runtime that can read a file (Codex, Gemini-CLI, Antigravity, Pi, OpenClaw, Cursor…): read `~/.nirvana/skills/harness/SKILL.md` and follow it as your operating instructions for this brief (its `../_shared/…` references resolve against `~/.nirvana/skills/harness/`).
+- Shell-only runtimes (Hermes, legacy gemini-cli, headless): `nrv dispatch --auto --exec "<user's brief verbatim>"` (`--exec=<runtime>` pins one; without `--exec` the command only scaffolds).
 
 Pass the user's brief verbatim. Don't reformulate before invocation — the harness handles amplification, briefing, and clarification on its own.
 

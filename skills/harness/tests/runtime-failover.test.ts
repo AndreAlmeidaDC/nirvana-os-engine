@@ -15,6 +15,7 @@
 //
 // The three tests below pin, in order: the cause survives the chatter; the EOL
 // surface classifies as auth; a dead runtime hands off instead of ending the run.
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -25,6 +26,7 @@ import { classify } from "../lib/quota-detector.ts";
 import { runWithCascade } from "../lib/cascade-runner.ts";
 import { isInCooldown } from "../lib/cooldown-registry.ts";
 import { writeFakeCli } from "./helpers/fake-cli.ts";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 // Verbatim stderr from the failed gemini-cli run of the 2026-08-05 matrix.
 const REAL_GEMINI_STDERR = [
@@ -136,7 +138,7 @@ describe("cascade — a dead runtime hands off instead of ending the run", () =>
     } finally {
       process.env.PATH = process.env.PATH!.replace(`${probeDir}${path.delimiter}`, "");
     }
-  });
+  }, spawnBudgetMs(4));
 
   test("auth failure rotates to the next runtime and the work completes", () => {
     const res = runWithCascade({
@@ -164,7 +166,7 @@ describe("cascade — a dead runtime hands off instead of ending the run", () =>
   test("handing off does not hide the broken credential — the audit still says so", () => {
     const dir = path.join(TMP, "logs", new Date().toISOString().slice(0, 10));
     const events = fs.readFileSync(path.join(dir, "audit.jsonl"), "utf8")
-      .split("\n").filter(Boolean).map(l => JSON.parse(l));
+      .split("\n").filter(Boolean).map(l => parseAuditLine(l));
     const auth = events.find(e => e.event === "runtime_auth_failed");
     expect(auth).toBeDefined();
     expect(auth.runtime).toBe("gemini-cli");

@@ -33,8 +33,20 @@
  * `.nirvana/state/squads/<slug>/`; this entry stops the old ones travelling.
  */
 export const RUN_STATE_EXCLUDES: Record<string, string[]> = {
-  squads: ["projects", "outputs", ".runs", ".squad-state", ".squads-outputs", ".wiki-brain-state", ".vercel", ".omc", "_internal", "SQUAD-DOCTOR-REPORT.md"],
-  businesses: ["memory/projects", "memory/learned.md", ".squad-state", ".squads-outputs", ".vercel"],
+  // `.nirvana` is project state, never squad content: running any `nrv` command
+  // with the cwd inside a squad materializes one there, carrying the machine's
+  // registries and routing digest — which hold absolute paths into the author's
+  // home. Measured 2026-09-03: 3 squads in the live library had picked one up
+  // during an audit campaign, and the list did not exclude it, so the next build
+  // would have shipped the author's paths to every buyer.
+  squads: ["projects", "outputs", ".runs", ".nirvana", ".squad-state", ".squads-outputs", ".wiki-brain-state", ".vercel", ".omc", "_internal", "SQUAD-DOCTOR-REPORT.md"],
+  // Root-level `projects` and `outputs` join `memory/projects`: same concept one
+  // level up, and the squads list already excludes both. Four businesses in the
+  // library carry an empty scaffolded `projects/`; empty it is harmless, but this
+  // list is what the installer, the uninstaller, the migrator, the pack build and
+  // now the resource map all consult — and the day one of them accumulates there,
+  // all five have to agree it is not authored content.
+  businesses: ["memory/projects", "memory/learned.md", "projects", "outputs", ".nirvana", ".squad-state", ".squads-outputs", ".vercel"],
   "mind-clones": [],
 };
 

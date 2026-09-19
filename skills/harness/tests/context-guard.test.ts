@@ -11,11 +11,13 @@
 // step the protocol tells the orchestrator to run, whose exit code carries the
 // verdict and whose state lands in the HANDOFF so the decision is auditable
 // rather than merely claimed.
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
 import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "nrv-ctx-guard-"));
 const SKILLS = path.resolve(import.meta.dir, "..", "..");
@@ -51,7 +53,7 @@ function auditEvents(): any[] {
       if (e.isDirectory()) walk(p);
       else if (e.name === "audit.jsonl") {
         for (const l of fs.readFileSync(p, "utf8").split("\n")) {
-          if (l.trim()) { try { out.push(JSON.parse(l)); } catch { /* partial line */ } }
+          if (l.trim()) { try { out.push(parseAuditLine(l)); } catch { /* partial line */ } }
         }
       }
     }
@@ -69,7 +71,7 @@ describe("nrv guard context — the verdict", () => {
     const r = guard(["context", "--project", dir, "--used", "50000", "--window", "200000"]);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("25%");
-  });
+  }, spawnBudgetMs(2));
 
   test("at the threshold it orders a rollover — exit 8, not a warning to ignore", () => {
     const dir = freshProject();
@@ -80,7 +82,7 @@ describe("nrv guard context — the verdict", () => {
     expect(r.stderr).toContain("CONTEXT GUARD");
     expect(r.stderr).toContain("HANDOFF");
     expect(r.stderr).toContain(dir);          // tells you how to resume THIS run
-  });
+  }, spawnBudgetMs(2));
 
   test("exit 8 is distinct from the loop guard's exit 7", () => {
     // Both guards stop the prose, for different reasons and with different
@@ -90,7 +92,7 @@ describe("nrv guard context — the verdict", () => {
     const roll = guard(["context", "--project", dir, "--used", "999999", "--window", "200000"]);
     expect(roll.status).toBe(8);
     expect(roll.status).not.toBe(7);
-  });
+  }, spawnBudgetMs(2));
 
   test("the threshold is configurable, and the default window is documented", () => {
     const dir = freshProject();
@@ -101,7 +103,7 @@ describe("nrv guard context — the verdict", () => {
     const dflt = guard(["context", "--project", freshProject(), "--used", "150000"]);
     expect(dflt.status).toBe(8);
     expect(dflt.stderr).toContain("200,000");
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("nrv guard context — the record", () => {
@@ -116,7 +118,7 @@ describe("nrv guard context — the record", () => {
     expect(st.ratio).toBeCloseTo(0.75, 2);
     expect(st.rollovers).toBe(1);
     expect(typeof st.checked_at).toBe("string");
-  });
+  }, spawnBudgetMs(2));
 
   test("rollovers accumulate; a check under budget does not inflate the count", () => {
     const dir = freshProject();
@@ -124,7 +126,7 @@ describe("nrv guard context — the record", () => {
     guard(["context", "--project", dir, "--used", "50000", "--window", "200000"]);   // fresh session, under budget
     guard(["context", "--project", dir, "--used", "180000", "--window", "200000"]);  // filled again
     expect(handoffState(dir).rollovers).toBe(2);
-  });
+  }, spawnBudgetMs(3));
 
   test("a rollover emits context_budget_warning — the event the cockpit already renders", () => {
     const dir = freshProject();
@@ -134,12 +136,12 @@ describe("nrv guard context — the record", () => {
     expect(ev[0].used_tokens).toBe(150000);
     expect(ev[0].budget_tokens).toBe(140000);
     expect(ev[0].action).toBe("rollover_required");
-  });
+  }, spawnBudgetMs(2));
 
   test("staying under budget emits nothing — silence is the normal state", () => {
     guard(["context", "--project", freshProject(), "--used", "10000", "--window", "200000"]);
     expect(auditEvents().filter((e) => e.event === "context_budget_warning").length).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("nrv guard context — refusing to guess", () => {
@@ -151,19 +153,19 @@ describe("nrv guard context — refusing to guess", () => {
       expect(r.status).toBe(2);
       expect(r.stderr).toContain("usage:");
     }
-  });
+  }, spawnBudgetMs(2));
 
   test("a window of zero is rejected rather than dividing by it", () => {
     const r = guard(["context", "--project", TMP, "--used", "100", "--window", "0"]);
     expect(r.status).toBe(2);
-  });
+  }, spawnBudgetMs(2));
 
   test("an unknown subcommand still prints both usages", () => {
     const r = guard(["nonsense"]);
     expect(r.status).toBe(2);
     expect(r.stderr).toContain("guard tick");
     expect(r.stderr).toContain("guard context");
-  });
+  }, spawnBudgetMs(2));
 
   test("an unwritable project dir degrades to a warning, never loses the verdict", () => {
     // Losing the record is bad; losing the ROLLOVER because the record failed
@@ -171,5 +173,5 @@ describe("nrv guard context — refusing to guess", () => {
     const r = guard(["context", "--project", "/proc/nonexistent-nirvana", "--used", "150000", "--window", "200000"]);
     expect(r.status).toBe(8);
     expect(r.stderr).toContain("CONTEXT GUARD");
-  });
+  }, spawnBudgetMs(2));
 });

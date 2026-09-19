@@ -25,10 +25,11 @@
 import { readdirSync, existsSync, statSync, createReadStream } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { parseAuditLine } from "../../_shared/lib/cloudevents.js";
 import { harnessLogsDir } from "../../_shared/lib/log-paths.ts";
 
 const TERMINAL_EVENTS = new Set(["gate_passed", "gate_failed", "validation_failed", "delivered", "dispatch_blocked"]);
-const DISPATCH_EVENTS = new Set(["dispatch_business", "dispatch_squad", "dispatch_skill"]);
+const DISPATCH_EVENTS = new Set(["dispatch_business", "dispatch_squad"]);
 
 export interface TraceSpan {
   event: string;
@@ -101,7 +102,9 @@ async function readLines(path: string, fn: (obj: Record<string, unknown> | null)
     const line = raw.trim();
     if (!line) continue;
     try {
-      fn(JSON.parse(line) as Record<string, unknown>);
+      // Both forms: an envelope is projected to the flat shape spans are
+      // built from; a legacy line comes back by identity.
+      fn(parseAuditLine(line) as Record<string, unknown>);
     } catch {
       parseErrors++;
       fn(null);

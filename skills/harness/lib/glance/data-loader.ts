@@ -1,16 +1,24 @@
 /**
  * data-loader.ts — scope-aware data access for Nirvana Glance.
  *
- * All reads are derived from the scope-aware paths.js + scope.ts. The
- * visualizer never writes anything outside the OS temp dir (and not even
- * that, in read-only mode).
+ * Most reads are derived from the scope-aware paths.js + scope.ts, and the
+ * visualizer writes nothing outside the OS temp dir on its own. The org-chart
+ * card editor (updateEmployeePosition / createEmployeeBelow, below) is the
+ * one deliberate exception: real writes to a business's employees/*.md and
+ * org-chart.yaml, gated one layer up by server.ts's --allow-actions check.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import yaml from "yaml";
 import { paths } from "../../../_shared/lib/bun-helpers.ts";
 import { resolveScope, enumerate } from "../../../_shared/lib/scope.ts";
+import { readFrontmatter } from "../../../_shared/lib/frontmatter-edit.ts";
+import * as orgChartEditor from "./org-chart-editor.ts";
+import * as employeeFrontmatterEditor from "./employee-frontmatter-editor.ts";
+import { parseAuditLine } from "../../../_shared/lib/cloudevents.js";
+import { provenanceOf } from "../../../_shared/lib/audit-provenance.js";
 
 // Neutral skills-tree root. Resolves to ~/.nirvana/skills when present so the
 // tree survives ~/.claude removal; falls back to the legacy ~/.claude/skills.
@@ -193,6 +201,16 @@ export function getBusinessDetail(slug: string) {
     ? fs.readdirSync(employeesDir).filter(f => f.endsWith(".md")).map(f => f.replace(/\.md$/, "")).sort()
     : [];
 
+  // Full employee markdown (frontmatter + body), keyed by slug — the org
+  // chart renderer (org-chart-renderer.js) reads role/description/dna/
+  // squads_authorized out of each employee's own frontmatter. org_chart_raw
+  // alone only carries the reports-to/manages edges, not who anyone is.
+  const employeesMd: Record<string, string> = {};
+  for (const slug2 of employees) {
+    const p = path.join(employeesDir, `${slug2}.md`);
+    try { employeesMd[slug2] = fs.readFileSync(p, "utf8"); } catch { /* skip unreadable */ }
+  }
+
   return {
     slug,
     source: match.source,
@@ -204,7 +222,194 @@ export function getBusinessDetail(slug: string) {
     routing_raw: routingRaw,
     memory_preview: memoryPreview,
     employees,
+    employees_md: employeesMd,
   };
+}
+
+// ──────────────────── Org-chart card editing (Glance actions) ────────────────────
+// Edit an existing position or add a new one below it, from the org-chart tab.
+// Two files move together: the employee's own .md frontmatter (identity/description/
+// DNA/squads, plus a reports_to mirror) and the business's org-chart.yaml (the real
+// hierarchy edges) — org-chart-editor.ts does the line-surgical org-chart.yaml part,
+// employee-frontmatter-editor.ts the frontmatter part. Both preserve every byte they
+// don't need to touch; see those files' header comments for why that matters here.
+
+function resolveBusinessDir(slug: string): string {
+  const biz = listBusinesses().find(b => b.slug === slug);
+  if (!biz) throw new Error(`business "${slug}" not found`);
+  return biz.dir;
+}
+
+function slugify(s: string): string {
+  return String(s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // strip accents (á -> a + combining acute)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+}
+
+/** This business's employee-slug prefix (e.g. "ac" for ac-bookkeeping-coord),
+ *  taken from whichever prefix the majority of existing employees share —
+ *  a fresh business with zero employees has nothing to derive from, so
+ *  callers get "" (no prefix) rather than a guess. */
+function employeeSlugPrefix(employeeSlugs: string[]): string {
+  const counts = new Map<string, number>();
+  for (const s of employeeSlugs) {
+    const m = /^([a-z0-9]{2,5})-/.exec(s);
+    if (m) counts.set(m[1], (counts.get(m[1]) || 0) + 1);
+  }
+  let best = "", bestCount = 0;
+  for (const [prefix, count] of counts) if (count > bestCount) { best = prefix; bestCount = count; }
+  return best;
+}
+
+function uniqueEmployeeSlug(businessDir: string, base: string): string {
+  const employeesDir = path.join(businessDir, "employees");
+  const existing = new Set(
+    fs.existsSync(employeesDir) ? fs.readdirSync(employeesDir).filter(f => f.endsWith(".md")).map(f => f.replace(/\.md$/, "")) : []
+  );
+  if (!existing.has(base)) return base;
+  for (let i = 2; ; i++) { const c = `${base}-${i}`; if (!existing.has(c)) return c; }
+}
+
+function chartUsesSupportedShape(orgChartRaw: string): boolean {
+  return /^chart:\s*$/m.test(orgChartRaw);
+}
+
+/** Employee's current parent per org-chart.yaml (not the frontmatter mirror,
+ *  which can drift) — null for the root. */
+function currentParentOf(chartRaw: string, employeeSlug: string): string | null {
+  const parsed = yaml.parse(chartRaw) || {};
+  const entry = (parsed.chart || []).find((e: any) => e.employee === employeeSlug);
+  return entry?.reports?.[0] ?? null;
+}
+
+export interface EmployeeEditPatch {
+  role?: string;
+  description?: string;
+  reportsTo?: string;
+  assignedMindClones?: string[];
+  squadsAuthorized?: string[];
+}
+
+/** Validates DNA/squad references against the real registries; throws
+ *  listing exactly which slugs don't resolve, so a typo is rejected
+ *  loudly instead of silently written into a business's org chart. */
+function validateReferences(patch: EmployeeEditPatch) {
+  if (patch.assignedMindClones?.length) {
+    const clones = listMindClones();
+    const bad = patch.assignedMindClones.filter(ref => {
+      const bareSlug = ref.split("/").pop();
+      return !clones.some(mc => ref === `${mc.category}/${mc.slug}` || bareSlug === mc.slug);
+    });
+    if (bad.length) throw new Error(`unknown mind-clone(s): ${bad.join(", ")}`);
+  }
+  if (patch.squadsAuthorized?.length) {
+    const squads = listSquads();
+    const bad = patch.squadsAuthorized.filter(ref => !squads.some(sq => sq.slug === ref));
+    if (bad.length) throw new Error(`unknown squad(s): ${bad.join(", ")}`);
+  }
+}
+
+/** Edits one employee's card: frontmatter fields, and — when reportsTo names
+ *  a different manager — a real reparent in org-chart.yaml (cycle-checked). */
+export function updateEmployeePosition(businessSlug: string, employeeSlug: string, patch: EmployeeEditPatch): { ok: true } {
+  const bizDir = resolveBusinessDir(businessSlug);
+  const empPath = path.join(bizDir, "employees", `${employeeSlug}.md`);
+  if (!fs.existsSync(empPath)) throw new Error(`employee "${employeeSlug}" not found in ${businessSlug}`);
+  validateReferences(patch);
+
+  const orgChartPath = path.join(bizDir, "org-chart.yaml");
+  const orgChartRaw = fs.existsSync(orgChartPath) ? fs.readFileSync(orgChartPath, "utf8") : "";
+
+  const fmPatch: employeeFrontmatterEditor.EmployeePatch = {
+    role: patch.role, description: patch.description,
+    assignedMindClones: patch.assignedMindClones, squadsAuthorized: patch.squadsAuthorized,
+  };
+
+  if (patch.reportsTo !== undefined) {
+    if (!chartUsesSupportedShape(orgChartRaw)) {
+      throw new Error("this business's org-chart.yaml uses a legacy format Glance can't reparent yet — edit reports_to by hand");
+    }
+    const oldParent = currentParentOf(orgChartRaw, employeeSlug);
+    if (patch.reportsTo !== oldParent) {
+      const employees = fs.readdirSync(path.join(bizDir, "employees")).map(f => f.replace(/\.md$/, ""));
+      if (!employees.includes(patch.reportsTo)) throw new Error(`"${patch.reportsTo}" is not an employee of ${businessSlug}`);
+      if (orgChartEditor.wouldCreateCycle(orgChartRaw, yaml.parse, employeeSlug, patch.reportsTo)) {
+        throw new Error(`moving "${employeeSlug}" under "${patch.reportsTo}" would create a reporting cycle`);
+      }
+      const newChartRaw = orgChartEditor.reparentEmployee(orgChartRaw, employeeSlug, oldParent, patch.reportsTo);
+      fs.writeFileSync(orgChartPath, newChartRaw, "utf8");
+      fmPatch.reportsTo = patch.reportsTo;
+    }
+  }
+
+  const empRaw = fs.readFileSync(empPath, "utf8");
+  const newEmpRaw = employeeFrontmatterEditor.applyEmployeePatch(empRaw, fmPatch);
+  if (newEmpRaw !== empRaw) fs.writeFileSync(empPath, newEmpRaw, "utf8");
+  return { ok: true };
+}
+
+export interface NewEmployeeInput {
+  role: string;
+  description?: string;
+  reportsTo: string;
+}
+
+/** Creates a new employee reporting to `reportsTo`: a minimal-but-valid .md
+ *  skeleton plus a real chart:[] entry + parent direct_reports link. Not a
+ *  substitute for the businesses skill's full creation pipeline (no
+ *  acceptance criteria, no DNA assignment) — a deliberately small seed the
+ *  owner can flesh out afterward, either by hand or via that skill. */
+export function createEmployeeBelow(businessSlug: string, input: NewEmployeeInput): { ok: true; slug: string } {
+  const bizDir = resolveBusinessDir(businessSlug);
+  const employeesDir = path.join(bizDir, "employees");
+  const existingSlugs = fs.existsSync(employeesDir)
+    ? fs.readdirSync(employeesDir).filter(f => f.endsWith(".md")).map(f => f.replace(/\.md$/, ""))
+    : [];
+  if (!existingSlugs.includes(input.reportsTo)) throw new Error(`"${input.reportsTo}" is not an employee of ${businessSlug}`);
+
+  const orgChartPath = path.join(bizDir, "org-chart.yaml");
+  const orgChartRaw = fs.existsSync(orgChartPath) ? fs.readFileSync(orgChartPath, "utf8") : "";
+  if (!chartUsesSupportedShape(orgChartRaw)) {
+    throw new Error("this business's org-chart.yaml uses a legacy format Glance can't extend yet — add the employee by hand");
+  }
+
+  const prefix = employeeSlugPrefix(existingSlugs);
+  const base = [prefix, slugify(input.role)].filter(Boolean).join("-") || "new-employee";
+  const slug = uniqueEmployeeSlug(bizDir, base);
+  const description = input.description?.trim() || `${input.role} at ${businessSlug}.`;
+
+  const skeleton = [
+    "---",
+    `name: ${slug}`,
+    `role: ${slugify(input.role).replace(/-/g, "_")}`,
+    `description: "${description.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`,
+    `reports_to: ${input.reportsTo}`,
+    "manages: []",
+    "authority_level: tier-3",
+    // No `effort:` and no `model:`. A seat that declares neither is dispatched
+    // without either, so the runtime uses the model and effort the USER has
+    // configured. Stamping `effort: medium` into every new employee was the
+    // engine deciding that for them.
+    "operation_mode: zero_human",
+    "---",
+    "",
+    `# ${input.role}`,
+    "",
+    "## Role",
+    "",
+    `Adicionado via Glance. ${description}`,
+    "",
+  ].join("\n");
+  fs.writeFileSync(path.join(employeesDir, `${slug}.md`), skeleton, "utf8");
+
+  let newChartRaw = orgChartEditor.appendChartEntry(orgChartRaw, slug, input.reportsTo);
+  newChartRaw = orgChartEditor.addDirectReport(newChartRaw, input.reportsTo, slug);
+  fs.writeFileSync(orgChartPath, newChartRaw, "utf8");
+
+  return { ok: true, slug };
 }
 
 // ──────────────────────── Runs (audit-derived) ────────────────────────
@@ -214,17 +419,39 @@ export function getBusinessDetail(slug: string) {
 // Gemini-CLI, Codex, the auto-emit hook, anything. This is what powers
 // the Projects/Runs tab in Glance with paperclip-style command-center UX.
 
+/** Event names that say only "an agent was running" — which the run's status
+ *  already says. The hook fires one `tool_invoked` and one `bash_completed` per
+ *  tool call, and the ledger renews a lease on a timer; measured on 2026-08-28,
+ *  those four names were 4702 of 5250 events in ~/.harness-logs and 323 of 1940
+ *  in the project's log. Counting them made a run that did one thing and a run
+ *  that did fifty look equally busy.
+ *
+ *  Deliberately a DENY list, not an allow list: a new event name is signal until
+ *  someone measures that it is not, so a future emitter is never silently
+ *  dropped from the count. The events stay in the log — they have other readers
+ *  (the swimlane, the fabrication detector, cost). Only the count changes. */
+const NOISE_EVENTS = new Set([
+  "tool_invoked",
+  "bash_completed",
+  "x_ledger_lease_renewed",
+  "x_ledger_progress_ping",
+]);
+
 interface Run {
   trace_id: string;
   project_id: string | null;
   cwd: string | null;
-  brief: string | null;             // first brief_received text
+  brief: string | null;             // first brief_received excerpt
   business_slug: string | null;
   squad_name: string | null;
-  status: "running" | "delivered" | "gate_failed" | "no_match" | "unknown";
+  target: string | null;            // "<kind>:<slug>" of what the run was dispatched to
+  outputs_dir: string | null;       // where the dispatched target was told to write
+  status: "running" | "delivered" | "gate_failed" | "unknown";
   started_at: string;               // ISO of first event
   last_event_at: string;             // ISO of last event
-  event_count: number;
+  event_count: number;              // every event on the trace
+  noise_event_count: number;        // the NOISE_EVENTS share of event_count
+  signal_event_count: number;       // event_count - noise_event_count
   artifact_paths: string[];          // unique artifacts touched
   events: any[];                    // full timeline (truncated to last 200)
   suspicious: boolean;              // fabrication detector verdict
@@ -273,7 +500,8 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
 
   const { harnessLogsDir } = require(path.join(SKILLS_ROOT, "_shared", "lib", "log-paths.ts"));
   const HARNESS_LOGS_ROOT = harnessLogsDir();
-  if (!fs.existsSync(HARNESS_LOGS_ROOT)) return { runs: [], total: 0 };
+  // No logs root ⇒ undetermined, not zero runs. See listProjects above.
+  if (!fs.existsSync(HARNESS_LOGS_ROOT)) return { runs: null, total: null };
 
   // Walk last N days of audit logs (default 7)
   const days = opts.days ?? 7;
@@ -285,13 +513,64 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
 
   const runs = new Map<string, Run>();
 
-  for (const d of dirs) {
-    const f = path.join(HARNESS_LOGS_ROOT, d, "audit.jsonl");
+  // One run writes its audit to up to FOUR files: the orchestrator's daily log,
+  // one per dispatched target under its outputs tree, and the global fallback.
+  // Reading a subset is how a reader concludes a healthy run never dispatched —
+  // measured 2026-09-04, when a viewer looking only here saw gate_passed with no
+  // dispatch anywhere and was one sentence from reporting fraud. `validate-chain`
+  // disagreed, and the disagreement is what saved it. The cockpit reads them all.
+  // Two guards, both learned from breaking the tests that caught them:
+  //
+  //  - A caller that PINNED a log root (HARNESS_LOGS_DIR) means "read this, not
+  //    the world". Without this, a fixture with its own root went wandering
+  //    through the machine's real projects and reported the owner's runs.
+  //  - An absent root is UNDETERMINED, not zero, and that distinction has its
+  //    own test. Widening the search would have answered "zero runs" for a
+  //    question whose honest answer is "I cannot tell".
+  const perTargetLogs: string[] = [];
+  const rootIsPinned = !!process.env.HARNESS_LOGS_DIR;
+  try {
+    for (const projRoot of (rootIsPinned || !fs.existsSync(HARNESS_LOGS_ROOT) ? [] : listProjectRootsForAudit())) {
+      // The project's own daily log: where the orchestrator's phases land when
+      // the run happened inside a project. Missing it is why a chain run showed
+      // no seats here while its files sat on disk.
+      const projLogRoot = path.join(projRoot, ".nirvana", "logs", "harness");
+      try {
+        for (const d of fs.readdirSync(projLogRoot)) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+          const f = path.join(projLogRoot, d, "audit.jsonl");
+          if (fs.existsSync(f)) perTargetLogs.push(f);
+        }
+      } catch { /* no project log yet */ }
+
+      const outs = path.join(projRoot, "outputs");
+      if (!fs.existsSync(outs)) continue;
+      const stack = [outs];
+      while (stack.length) {
+        const dir = stack.pop()!;
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+        for (const e of entries) {
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) { if (stack.length < 512) stack.push(full); }
+          else if (e.name === "audit.jsonl") perTargetLogs.push(full);
+        }
+      }
+    }
+  } catch { /* a project tree we cannot walk contributes nothing, not an error */ }
+
+  for (const d of [...dirs, ...perTargetLogs]) {
+    const f = perTargetLogs.includes(d) ? d : path.join(HARNESS_LOGS_ROOT, d, "audit.jsonl");
     if (!fs.existsSync(f)) continue;
     const lines = fs.readFileSync(f, "utf8").split("\n").filter(Boolean);
     for (const line of lines) {
       let ev: any;
-      try { ev = JSON.parse(line); } catch { continue; }
+      // Both forms: a CloudEvents envelope comes back flat, a legacy line
+      // comes back by identity. See _shared/lib/cloudevents.js.
+      try { ev = parseAuditLine(line); } catch { continue; }
+      // Who wrote it, on the run view as on the tail. Without this the cockpit
+      // shows a typed dispatch and an emitted one identically.
+      try { ev._provenance = provenanceOf(JSON.parse(line)); } catch { ev._provenance = "unsigned"; }
       const tid = ev.trace_id || "no-trace";
       if (opts.since && ev.ts < opts.since) continue;
 
@@ -304,10 +583,14 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
           brief: null,
           business_slug: null,
           squad_name: null,
+          target: null,
+          outputs_dir: null,
           status: "unknown",
           started_at: ev.ts,
           last_event_at: ev.ts,
           event_count: 0,
+          noise_event_count: 0,
+          signal_event_count: 0,
           artifact_paths: [],
           events: [],
           suspicious: false,
@@ -326,6 +609,8 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
       // Track distinct hosts (for fabrication detector + UI hint)
       if (ev.host && !r.hosts.includes(ev.host)) r.hosts.push(ev.host);
       r.event_count++;
+      if (NOISE_EVENTS.has(ev.event)) r.noise_event_count++;
+      else r.signal_event_count++;
       if (ev.ts < r.started_at) r.started_at = ev.ts;
       if (ev.ts > r.last_event_at) r.last_event_at = ev.ts;
       if (!r.project_id && ev.project_id) r.project_id = ev.project_id;
@@ -334,14 +619,30 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
       const evSquad = ev.squad_name ?? (ev as any).squad;
       if (!r.business_slug && evBiz) r.business_slug = evBiz;
       if (!r.squad_name && evSquad) r.squad_name = evSquad;
-      // Capture brief from first brief_received
-      if (ev.event === "brief_received" && !r.brief) {
-        r.brief = ev.brief || ev.user_input || ev.payload?.brief || null;
+      // Capture brief from the first event that carries one. `brief_excerpt` is
+      // the bounded field every emitter writes today (see brief-excerpt.ts);
+      // `brief` is the router CLI's old unbounded one, still in logs on disk.
+      // dispatch_squad / dispatch_agent_x carry it too, so a run whose
+      // brief_received landed elsewhere still shows what it was asked to do.
+      if (!r.brief) {
+        r.brief = ev.brief_excerpt || ev.brief || ev.user_input || ev.payload?.brief || null;
       }
-      // Status precedence: gate_failed > delivered > no_match > running
+      // What the run was dispatched TO. Only ever read from the dispatch events
+      // — the ones whose whole purpose is to record the decision. Nothing is
+      // inferred: a run with no dispatch event keeps `target: null`, which the
+      // view renders as `—` (views/absence.js).
+      if (!r.target) {
+        if (ev.event === "dispatch_squad") r.target = `squad:${ev.squad_name ?? ev.squad_slug ?? "?"}`;
+        else if (ev.event === "dispatch_business") r.target = `business:${ev.business_slug ?? "?"}`;
+        else if (ev.event === "dispatch_agent_x") r.target = "agent-x";
+        else if (ev.event === "brief_received" && ev.target) r.target = String(ev.target);
+      }
+      if (!r.outputs_dir && (ev.outputs_dir || ev.outputs_root)) {
+        r.outputs_dir = ev.outputs_dir || ev.outputs_root;
+      }
+      // Status precedence: gate_failed > delivered > running
       if (ev.event === "delivered") r.status = "delivered";
       else if (ev.event === "gate_failed" && r.status !== "delivered") r.status = "gate_failed";
-      else if (ev.event === "no_match" && r.status === "unknown") r.status = "no_match";
       else if (r.status === "unknown") r.status = "running";
       // Track artifact paths
       const artifact = ev.artifact_path || (ev.event === "artifact_touched" ? ev.file_path : null);
@@ -388,12 +689,20 @@ export function buildRuns(opts: { since?: string; limit?: number; days?: number 
 
 export function getRun(trace_id: string): Run | null {
   const { runs } = buildRuns({ days: 30 });
-  return runs.find(r => r.trace_id === trace_id) || null;
+  return runs?.find(r => r.trace_id === trace_id) || null;
 }
 
+/**
+ * The projects the maestro has logged, or `null` when that cannot be determined.
+ *
+ * The directory's absence is not a measurement of zero projects: it means nothing
+ * has ever written there, or the logs live somewhere this process cannot see. The
+ * old `return []` turned that into "Projects 0" in the panel while runs were
+ * executing. `[]` is now reserved for a directory that exists and holds nothing.
+ */
 export function listProjects() {
   const dir = paths.MAESTRO_LOGS_DIR;
-  if (!fs.existsSync(dir)) return [];
+  if (!fs.existsSync(dir)) return null;
   return fs.readdirSync(dir)
     .filter(f => !f.startsWith(".") && fs.statSync(path.join(dir, f)).isDirectory())
     .map(id => {
@@ -441,6 +750,18 @@ export function getProjectDag(id: string) {
  * Returns events in newest-first order with synthetic numeric `id` so
  * the SSE delta logic upstream can de-duplicate.
  */
+/** Project roots whose outputs trees may hold per-target audit logs. Derived
+ *  from the projects Glance already knows about, so this walks what the cockpit
+ *  already lists and nothing else. */
+function listProjectRootsForAudit(): string[] {
+  // `discoverKnownProjects` — the name matters, and a silent catch is why it
+  // took a manual check to notice the first attempt called something that does
+  // not exist. A helper that swallows its own wiring error reports zero and
+  // looks healthy.
+  const { discoverKnownProjects } = require(path.join(SKILLS_ROOT, "harness", "lib", "glance", "project-discovery.ts"));
+  return (discoverKnownProjects() || []).map((p: any) => p.path).filter(Boolean).slice(0, 60);
+}
+
 export function tailJsonlEvents(limit = 50): Array<any> {
   const baseDir = paths.HARNESS_LOGS_DIR;
   if (!fs.existsSync(baseDir)) return [];
@@ -458,8 +779,15 @@ export function tailJsonlEvents(limit = 50): Array<any> {
     // the actual append order (Pre fires before Post, etc.).
     for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
       try {
-        const ev = JSON.parse(lines[i]);
-        out.push({ ...ev, id: new Date(ev.ts).getTime(), _ord: i });
+        // Provenance travels with the event, because the cockpit is where
+        // somebody decides whether a run happened. An event an agent typed
+        // renders identically to one the engine emitted unless the reader is
+        // told — measured 2026-09-04, when a maestro wrote its own
+        // dispatch_business and gate_passed into a live run's audit and
+        // nothing in their shape distinguished them.
+        const raw = JSON.parse(lines[i]);
+        const ev = parseAuditLine(lines[i]);
+        out.push({ ...ev, id: new Date(ev.ts).getTime(), _ord: i, _provenance: provenanceOf(raw) });
       } catch {}
     }
     if (out.length >= limit) break;
@@ -472,18 +800,20 @@ export function tailJsonlEvents(limit = 50): Array<any> {
 export function tailLogs(opts: { type: "harness" | "maestro"; date?: string; limit?: number }) {
   const limit = opts.limit ?? 200;
   const baseDir = opts.type === "harness" ? paths.HARNESS_LOGS_DIR : paths.MAESTRO_LOGS_DIR;
-  if (!fs.existsSync(baseDir)) return { events: [], source: baseDir, type: opts.type };
+  // The log root's absence is undetermined; a day directory that exists without
+  // events is a real, measured zero for that day.
+  if (!fs.existsSync(baseDir)) return { events: null, source: baseDir, type: opts.type };
 
   const date = opts.date ?? new Date().toISOString().slice(0, 10);
   const dayDir = path.join(baseDir, date);
-  if (!fs.existsSync(dayDir)) return { events: [], source: dayDir, type: opts.type };
+  if (!fs.existsSync(dayDir)) return { events: [], total_in_day: 0, source: dayDir, date, type: opts.type };
 
   const files = fs.readdirSync(dayDir).filter(f => f.endsWith(".jsonl")).sort();
   const events: any[] = [];
   for (const f of files) {
     const lines = fs.readFileSync(path.join(dayDir, f), "utf8").split("\n").filter(Boolean);
     for (const line of lines) {
-      try { events.push({ ...JSON.parse(line), _file: f }); } catch {}
+      try { events.push({ ...parseAuditLine(line), _file: f, _provenance: provenanceOf(JSON.parse(line)) }); } catch {}
     }
   }
   return {
@@ -495,9 +825,10 @@ export function tailLogs(opts: { type: "harness" | "maestro"; date?: string; lim
   };
 }
 
-export function listAvailableLogDates(type: "harness" | "maestro"): string[] {
+export function listAvailableLogDates(type: "harness" | "maestro"): string[] | null {
   const baseDir = type === "harness" ? paths.HARNESS_LOGS_DIR : paths.MAESTRO_LOGS_DIR;
-  if (!fs.existsSync(baseDir)) return [];
+  // No log root ⇒ undetermined; an existing root with no day directories ⇒ [].
+  if (!fs.existsSync(baseDir)) return null;
   return fs.readdirSync(baseDir)
     .filter(f => /^\d{4}-\d{2}-\d{2}$/.test(f))
     .sort()
@@ -871,10 +1202,6 @@ export function getMemoryStats() {
 // source: routing.yaml, squad.yaml capabilities, dna refs, mind-clones.
 
 export function buildGraph(opts: { include_decisions?: boolean } = {}) {
-  const yaml = (() => {
-    try { return require("yaml"); }
-    catch { return { parse: (s: string) => ({}) }; }
-  })();
   const linkExtractor = require(path.join(SKILLS_ROOT, "_shared", "lib", "link-extractor.js"));
 
   const nodes: any[] = [];
@@ -919,6 +1246,34 @@ export function buildGraph(opts: { include_decisions?: boolean } = {}) {
     }
   }
 
+  // Mind-clones → nodes (top-level only — categories not duplicated). Built
+  // BEFORE businesses: the uses-mc edges added in that loop target these ids,
+  // and addEdge() silently drops an edge whose target isn't in `seen` yet.
+  // mcSlugIndex is a fallback for employee frontmatter that cites a category
+  // path (e.g. `21-media-moguls/jane-friedman`) which no longer matches the
+  // clone's real, current category (this library is flat — jane-friedman is
+  // `_root/jane-friedman` on disk) — resolve by bare slug when the exact
+  // "category/slug" the employee cites isn't a real node id.
+  const mcSlugIndex = new Map<string, string>();
+  for (const mc of listMindClones()) {
+    const id = `mind-clone:${mc.category}/${mc.slug}`;
+    addNode({
+      id,
+      type: "mind-clone",
+      slug: `${mc.category}/${mc.slug}`,
+      label: mc.slug,
+      category: mc.category,
+      source: mc.source,
+    });
+    if (!mcSlugIndex.has(mc.slug.toLowerCase())) mcSlugIndex.set(mc.slug.toLowerCase(), id);
+  }
+  const resolveMindCloneId = (ref: string): string | null => {
+    const direct = `mind-clone:${ref}`;
+    if (seen.has(direct)) return direct;
+    const bareSlug = ref.split("/").pop()!.toLowerCase();
+    return mcSlugIndex.get(bareSlug) || null;
+  };
+
   // Businesses → nodes + routing edges to squads
   for (const biz of listBusinesses()) {
     addNode({
@@ -930,53 +1285,45 @@ export function buildGraph(opts: { include_decisions?: boolean } = {}) {
       employees: biz.employee_count,
       source: biz.source,
     });
-    // routing.yaml → business → squad
-    const routingPath = path.join(biz.dir, "routing.yaml");
-    if (fs.existsSync(routingPath)) {
-      try {
-        const r = yaml.parse(fs.readFileSync(routingPath, "utf8")) || {};
-        if (r.routes && typeof r.routes === "object") {
-          for (const [capId, route] of Object.entries(r.routes)) {
-            if (route && typeof route === "object" && (route as any).squad) {
-              addEdge({
-                source: `business:${biz.slug}`,
-                target: `squad:${(route as any).squad}`,
-                kind: "routes-via",
-                via: capId,
-              });
-            }
-          }
-        }
-      } catch {}
-    }
-    // dna refs (mind-clones used by employees)
+    // business → squad ("routes-via"): NOT in routing.yaml — verified against
+    // all 57 real routing.yaml files, every one uses `auto_routes: [{pattern,
+    // route_to}]` (route_to is an EMPLOYEE slug, for brief intake), never the
+    // `routes: { <cap>: { squad } }` shape this edge used to look for. That
+    // shape doesn't exist anywhere in the registry, so this edge was always
+    // empty (owner report, 2026-08-31: "Businesses não aparece no gráfico").
+    // The real link lives one level down, in each employee's own frontmatter
+    // (`squads_authorized` / `squad_dispatched`) — the same fields
+    // org-chart-renderer.js already reads to draw a card's "Squad →" line.
     const employeesDir = path.join(biz.dir, "employees");
     if (fs.existsSync(employeesDir)) {
+      const toList = (v: unknown): string[] => Array.isArray(v) ? v.filter(Boolean).map(String) : (v ? [String(v)] : []);
       for (const f of fs.readdirSync(employeesDir).filter(x => x.endsWith(".md"))) {
+        const empPath = path.join(employeesDir, f);
+        // uses-mc: mostly frontmatter (assigned_mind_clones / mind_clones_used —
+        // 108 of the real employee files), a small minority still use [[wikilink]]
+        // prose refs (13 files) — a Set merges both sources without duplicating
+        // the edge when a file happens to use both.
+        const mcTargets = new Set<string>();
         try {
-          const content = fs.readFileSync(path.join(employeesDir, f), "utf8");
-          const links = linkExtractor.extractFromContent(content);
-          for (const l of links) {
-            if (l.kind === "wikilink" || l.kind === "mdlink") {
-              addEdge({ source: `business:${biz.slug}`, target: `mind-clone:${l.target}`, kind: "uses-mc" });
-            }
+          const content = fs.readFileSync(empPath, "utf8");
+          for (const l of linkExtractor.extractFromContent(content)) {
+            if (l.kind === "wikilink" || l.kind === "mdlink") mcTargets.add(l.target);
           }
         } catch {}
+        try {
+          const fm = readFrontmatter(empPath)?.data || {};
+          for (const mc of [...toList((fm as any).assigned_mind_clones), ...toList((fm as any).mind_clones_used)]) mcTargets.add(mc);
+          const squadSlugs = new Set<string>([...toList((fm as any).squads_authorized), ...toList((fm as any).squad_dispatched)]);
+          for (const sq of squadSlugs) {
+            addEdge({ source: `business:${biz.slug}`, target: `squad:${sq}`, kind: "routes-via", via: f.replace(/\.md$/, "") });
+          }
+        } catch {}
+        for (const mc of mcTargets) {
+          const targetId = resolveMindCloneId(mc);
+          if (targetId) addEdge({ source: `business:${biz.slug}`, target: targetId, kind: "uses-mc" });
+        }
       }
     }
-  }
-
-  // Mind-clones → nodes (top-level only — categories not duplicated)
-  for (const mc of listMindClones()) {
-    const id = `mind-clone:${mc.category}/${mc.slug}`;
-    addNode({
-      id,
-      type: "mind-clone",
-      slug: `${mc.category}/${mc.slug}`,
-      label: mc.slug,
-      category: mc.category,
-      source: mc.source,
-    });
   }
 
   // Artifacts (briefs/handoffs/plans/dags/outputs) — "what was CREATED".

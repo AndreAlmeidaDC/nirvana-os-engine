@@ -33,6 +33,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { findProjectRoot } = require('./project-root.js');
 
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
@@ -44,19 +45,14 @@ function handoffPath(projectDir) {
   return path.join(projectDir, FILENAME);
 }
 
-// Walk up from cwd looking for .nirvana/ or .git/ — same logic as scope.ts
-// but in plain JS so it's loadable from CommonJS callers.
+// Walk up from cwd looking for .nirvana/ or .git/. Delegates to
+// project-root.js (the one implementation shared with paths.js, scope.ts,
+// log-paths.ts and wiki-lint.js) for the HOME/root/Windows-system-dir
+// hardening this walk lacked: a stray ~/.nirvana (the engine's own install)
+// sitting in HOME was mistaken for a project, exactly the mechanism that
+// broke PR #158 round 2 for log-paths.ts before it got the same fix.
 function findProjectRootFromCwd() {
-  let cur = process.cwd();
-  for (let i = 0; i < 30; i++) {
-    if (fs.existsSync(path.join(cur, '.nirvana')) || fs.existsSync(path.join(cur, '.git'))) {
-      return cur;
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-  return null;
+  return findProjectRoot(process.cwd(), { markers: ['.nirvana', '.git'] });
 }
 
 function writeHandoff(projectDir, partial) {
@@ -249,17 +245,44 @@ function updateHandoffPhase(projectDir, newPhase, opts) {
       last_task_completed: merged.last_task_completed || null,
       next_task_id: merged.next_task_id || null,
     };
-    const payload = JSON.stringify(event) + '\n';
+    // Stamped like every other engine write: an unstamped event reads as
+    // "somebody typed this", and the hook stream is the highest-volume writer
+    // in the system — leaving it unsigned would drown the signal in the very
+    // place a reader looks to decide whether a run is real.
+    //
+    // This is the SECOND copy of this block in this file. The first was fixed
+    // hours earlier and this one was missed, which is the argument against
+    // near-duplicate emitters: the fix lands on one, the defect survives in the
+    // other, and the measurement that finds it looks identical to the one that
+    // said the fix worked.
+    let stamped = event;
+    try { stamped = require('./audit-provenance.js').stamp(event); } catch { /* no key, still log */ }
+    const payload = JSON.stringify(stamped) + '\n';
     // Local project audit
     const localAuditPath = path.join(projectDir, merged.audit_log_path || 'audit.jsonl');
     fs.appendFileSync(localAuditPath, payload);
-    // Global daily audit (so nrv glance and cross-trace tools can see it)
+    // The DAILY log — resolved, never hardcoded. log-paths.js says it in its own
+    // header: a hardcoded ~/.harness-logs creates split brain, because writes go
+    // per-project while reads still hit $HOME and the chain breaks. It did:
+    // 2026-09-04, a run left six handoff events in the project-root audit and
+    // ZERO in the daily log `validate-chain` reads, and the run's own validator
+    // reported the gap before anyone here noticed it.
     const today = new Date().toISOString().slice(0, 10);
-    const globalDir = path.join(require('os').homedir(), '.harness-logs', today);
+    const globalDir = path.join(require('./log-paths.js').harnessLogsDir({ cwd: projectDir }), today);
     fs.mkdirSync(globalDir, { recursive: true });
     fs.appendFileSync(path.join(globalDir, 'audit.jsonl'), payload);
   } catch (e) {
     // non-fatal — handoff.json was still written
+  }
+
+  // Proof of life, as a side effect: advancing a phase means the run is alive,
+  // so beat its agentic ledger row and the business row(s) of the project. The
+  // employee never has to remember a heartbeat. Best effort, never throws.
+  try {
+    const ledger = require(path.join(SKILLS_ROOT, 'harness', 'lib', 'run-ledger.ts'));
+    ledger.beatAgenticRuns({ runId: merged.run_id || null, projectId: merged.project_id || null, source: 'handoff_phase_advanced' });
+  } catch (e) {
+    // non-fatal — the ledger is not this script's job
   }
 
   return merged;

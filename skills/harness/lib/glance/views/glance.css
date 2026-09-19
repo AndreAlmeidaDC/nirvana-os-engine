@@ -2,7 +2,7 @@
    Nirvana Glance — Page-specific layout and chrome.
    Tokens live in tokens.css. Components live in components.css.
    This file holds only:
-     · top-level layout (nav, sidebar, right-pane, activity-pane, panes)
+     · top-level layout (nav, sidebar, right-pane, activity-overlay, panes)
      · per-view layout (runs-grid, agents-grid, cost-charts, graph, …)
      · chart/d3/mermaid chrome
      · animations not bound to a single component
@@ -15,19 +15,27 @@
 html, body { height: 100%; }
 body {
   margin: 0;
-  background: var(--surface-0);
+  background: transparent;
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   -webkit-font-smoothing: antialiased;
 }
 
-.font-inter { font-family: var(--font-sans); }
-.glass {
-  background: var(--surface-glass);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+/* ─── Field background — the glass sheets (.gl in components.css) need a
+   backdrop with something to refract, or they read as a flat opacity, not
+   glass. Soft radial blobs in the theme's own accent/status tones, fixed
+   behind the whole shell. ─── */
+.field-bg {
+  position: fixed; inset: 0; z-index: -1;
+  /* Prime/clean pass (2026-08-31, owner request): the multi-color radial
+     wash read as loud and unprofessional. Flat surface color, no gradient,
+     no saturation boost — the glass sheets on top get their depth from
+     blur/alpha stacking on real content, not from a colored backdrop. */
+  background: var(--surface-0);
 }
+
+.font-inter { font-family: var(--font-sans); }
 
 /* ─── Top nav ─── */
 .glance-nav {
@@ -62,7 +70,37 @@ body {
   width: 300px; flex-shrink: 0;
   border-right: 1px solid var(--border-default);
   display: flex; flex-direction: column;
-  background: var(--surface-1);
+  transition: width var(--dur-base) var(--ease-out);
+  overflow: hidden;
+}
+/* Auto-collapses to a 64px icon rail when a run is open in detail and the
+   operator has not pinned the full width (page-layout-redesign.md §1.3). */
+.sidebar.icon-rail { width: 64px; }
+.sidebar.icon-rail .kind-card-label,
+.sidebar.icon-rail .kind-card-meta,
+.sidebar.icon-rail .sidebar-pin-label { display: none; }
+.sidebar.icon-rail .kind-card { justify-content: center; padding: 10px 6px; gap: 0; }
+
+.sidebar-foot { flex: none; padding: var(--space-2); border-top: 1px solid var(--border-default); }
+.sidebar-pin-btn {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px;
+  border-radius: var(--radius-md); border: 1px solid var(--border-default); background: var(--surface-1);
+  cursor: pointer; font-size: 12px; color: var(--text-secondary); font-family: inherit;
+}
+.sidebar-pin-btn:hover { background: var(--accent-soft); color: var(--accent); }
+.sidebar-pin-btn:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.sidebar.icon-rail .sidebar-pin-btn { justify-content: center; }
+.sidebar-pin-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.sidebar-pin-btn.hint-pulse { animation: sidebar-pin-pulse 1.4s ease-in-out 2; }
+@keyframes sidebar-pin-pulse { 0%, 100% { box-shadow: none; } 50% { box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 35%, transparent); } }
+
+/* Nielsen H1 (visibility of system status): the sidebar shrinking on its own
+   needs to SAY so — a one-time toast the first time it fires, pointing at
+   the pin escape hatch (ux-qa finding, page-layout-redesign.md §3.1). */
+.sidebar-hint {
+  position: fixed; left: 12px; bottom: 64px; z-index: var(--z-toast); width: 220px;
+  background: var(--surface-2); border: 1px solid var(--border-default); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-1); padding: 10px 12px; font-size: 12px; color: var(--text-secondary);
 }
 .kind-tabs {
   display: flex; flex-direction: column;
@@ -127,7 +165,6 @@ body {
   padding: 10px var(--space-3);
   border-radius: 10px;
   text-align: left;
-  background: var(--surface-0);
   border: 1px solid var(--border-default);
   cursor: pointer;
   transition: background var(--dur-fast) var(--ease-out),
@@ -396,26 +433,61 @@ body {
 }
 .tab-mini:hover:not(.active) { background: var(--accent-soft); color: var(--text-primary); }
 
+/* .org-canvas is the frame; the D3 renderer (org-chart-renderer.js) fills it
+   with .orgd3-root, which reads Glance's own theme tokens (--accent,
+   --surface-*, --status-danger-*) so it follows whichever theme is active
+   instead of a fixed palette — so no background/flex-center here that would
+   fight it. min-height only, no forced centering: the chart's own scroll
+   container manages its content. */
 .org-canvas {
   width: 100%; min-height: 480px;
-  background: var(--surface-0);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   position: relative; overflow: hidden;
-  display: flex; align-items: center; justify-content: center;
-}
-.org-canvas svg { width: 100% !important; height: 480px !important; cursor: grab; max-width: 100%; }
-.org-canvas svg:active { cursor: grabbing; }
-.org-canvas svg .nodeLabel,
-.org-canvas svg foreignObject div {
-  font-family: 'Inter', sans-serif !important;
-  font-size: var(--text-md) !important;
 }
 .org-empty {
   padding: 60px var(--space-4);
   text-align: center;
   color: var(--text-tertiary);
   font-size: var(--text-md);
+}
+
+/* Org-chart tab body needs to be a positioning context for .org-edit-panel,
+   which floats over the canvas the same way .graph-settings floats over the
+   knowledge graph. */
+.org-chart-tab-body { position: relative; }
+.org-edit-panel {
+  position: absolute;
+  top: 44px; right: 0;
+  z-index: var(--z-popover, 50);
+  width: 320px;
+  max-height: calc(100% - 44px);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-popover);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.org-edit-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-0);
+}
+.org-edit-body {
+  padding: var(--space-3) var(--space-4);
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: var(--space-3);
+}
+.org-edit-field { display: flex; flex-direction: column; gap: 4px; }
+.org-edit-field .memory-input, .org-edit-field .memory-textarea { width: 100%; }
+.org-edit-error { font-size: var(--text-sm); color: var(--status-danger-fg); }
+.org-edit-buttons {
+  display: flex; gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border-default);
 }
 
 .org-node rect {
@@ -601,6 +673,13 @@ body {
 .actions-menu-item.warning { color: var(--status-warn-fg); }
 .actions-menu-item.warning:hover { background: var(--status-warn-bg); }
 
+/* ─── Project switcher (topnav) ─── */
+.project-switcher-menu { width: 320px; }
+.project-switcher-item { display: flex; flex-direction: column; gap: 2px; }
+.project-switcher-item span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-switcher-other { display: flex; gap: var(--space-2); padding: var(--space-1) 10px var(--space-2); }
+.project-switcher-other .glance-search-input { flex: 1; }
+
 /* ─── Per-squad action buttons ─── */
 .detail-actions {
   display: flex; flex-wrap: wrap; gap: var(--space-1);
@@ -630,6 +709,26 @@ body {
 }
 .action-btn.warning:hover { filter: brightness(0.95); }
 .action-btn.small { font-size: var(--text-xs); padding: var(--space-1) var(--space-2); }
+
+/* ─── Admission gate verdict (nrv validate, read-only) ─── */
+.verify-panel {
+  margin: 0 var(--space-4) var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  background: var(--surface-1);
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 280px; overflow-y: auto;
+}
+.verify-verdict { font-weight: var(--weight-medium); font-size: var(--text-sm); }
+.verify-verdict.ok { color: var(--status-success-fg); }
+.verify-verdict.bad { color: var(--status-danger-fg); }
+.verify-finding {
+  font-family: var(--font-mono); font-size: var(--text-xs);
+  color: var(--text-secondary); line-height: 1.5;
+}
+.verify-finding.error { color: var(--status-danger-fg); }
+.verify-finding.warning { color: var(--status-warn-fg); }
 
 /* ─── Console drawer ─── */
 .console-drawer {
@@ -993,43 +1092,28 @@ body {
 .cost-table tbody tr:hover { background: var(--surface-2); }
 .cost-session-row { cursor: pointer; }
 
-/* Activity feed sidebar */
-.activity-pane {
-  width: 280px; min-width: 280px;
-  border-left: 1px solid var(--border-default);
-  background: var(--surface-0);
+/* Activity: on-demand overlay, not a permanently-reserved rail
+   (page-layout-redesign.md §1.3) — a bell in the topnav opens it. */
+.activity-trigger { position: relative; }
+.activity-badge {
+  position: absolute; top: -3px; right: -3px; background: var(--status-danger-solid); color: var(--text-inverse);
+  font-size: 9px; line-height: 1; padding: 2px 4px; border-radius: var(--radius-pill); font-variant-numeric: tabular-nums;
+}
+.activity-backdrop {
+  position: fixed; inset: 0; z-index: var(--z-modal);
+  background: color-mix(in oklab, var(--text-inverse) 55%, transparent);
+}
+.activity-overlay {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 320px; max-width: 90vw; z-index: var(--z-modal);
+  background: var(--surface-1); border-left: 1px solid var(--border-default); box-shadow: -12px 0 32px rgba(0,0,0,0.18);
   display: flex; flex-direction: column;
-  transition: width var(--dur-base), min-width var(--dur-base);
 }
-.activity-pane.collapsed {
-  width: 18px; min-width: 18px;
-  background: var(--surface-1);
-  border-left: 1px solid var(--border-default);
-}
-.activity-pane.collapsed .activity-header {
-  padding: 0;
-  border-bottom: 0;
-  height: 100%;
-  align-items: center;
-  justify-content: center;
-}
-.activity-pane.collapsed .activity-header .icon-btn {
-  width: 100%;
-  height: 100%;
-  border-radius: 0;
-  background: transparent;
-  border: 0;
-  color: var(--text-secondary);
-}
-.activity-pane.collapsed .activity-header .icon-btn:hover {
-  background: color-mix(in oklab, var(--accent) 14%, transparent);
-  color: var(--accent);
-}
-.activity-header {
-  display: flex; align-items: center; justify-content: space-between;
+.activity-overlay-head {
+  display: flex; align-items: center; gap: 8px;
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-default);
 }
+.activity-overlay-head .icon-btn { margin-left: auto; }
 .activity-title { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-tight); }
 .activity-counter {
   font-size: var(--text-xs); padding: 2px var(--space-2); border-radius: var(--radius-pill);
@@ -1073,14 +1157,66 @@ body {
 
 /* ─── Runs pane (audit-derived runs grouped by trace_id) ─── */
 .runs-pane { display: flex; flex-direction: column; gap: var(--space-2); }
+/* Runs rail dominant over the detail (page-layout-redesign.md §1.3): flex,
+   not a fixed grid track ratio — the rail is 280px full / 56px collapsed,
+   the detail takes whatever is left. */
 .runs-grid {
-  display: grid; grid-template-columns: minmax(360px, 1fr) 2fr;
+  display: flex;
   gap: var(--space-3); flex: 1; min-height: 0;
 }
 .runs-list {
-  display: flex; flex-direction: column; gap: 6px;
-  overflow-y: auto; padding-right: var(--space-1);
+  flex: none; width: 280px;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-out);
   min-height: 0;
+  border: 1px solid var(--border-default); border-radius: var(--radius-md);
+}
+.runs-list.collapsed { width: 56px; }
+.runs-list-head {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: var(--space-2); border-bottom: 1px solid var(--border-default);
+}
+.runs-list-search {
+  flex: 1; min-width: 0; padding: 6px 9px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default); background: var(--surface-0);
+  color: var(--text-primary); font-size: 12.5px; font-family: inherit;
+}
+.runs-list-collapse-btn {
+  flex: none; width: 28px; height: 28px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default); background: var(--surface-1);
+  color: var(--text-secondary); cursor: pointer; display: grid; place-items: center;
+}
+.runs-list-collapse-btn:hover { background: var(--accent-soft); color: var(--accent); }
+.runs-list-collapse-btn:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.runs-list-scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: var(--space-2);
+}
+.runs-list.collapsed .runs-list-scroll { align-items: center; }
+/* Collapsed rail: icon-strip mode — every run stays a real, labelled button. */
+.runs-list.collapsed .run-row { flex-direction: row; align-items: center; justify-content: center; padding: 8px; gap: 0; width: 40px; }
+.runs-list.collapsed .run-row .card-head,
+.runs-list.collapsed .run-row .card-title,
+.runs-list.collapsed .run-row .card-meta { display: none; }
+/* WCAG 2.2 AA 1.4.1 (Use of color): status carries a SHAPE too, not hue
+   alone — the sighted-but-colorblind case a colored dot alone fails,
+   independent of the aria-label already on the button (ux-qa finding §3.1). */
+.run-row-dot { width: 10px; height: 10px; flex: none; display: inline-block; }
+.run-row-dot-success { background: var(--status-success-solid); border-radius: 50%; }
+.run-row-dot-warn     { background: var(--status-warn-solid); border-radius: 2px; transform: rotate(45deg); }
+.run-row-dot-danger   { background: var(--status-danger-solid); border-radius: 0; clip-path: polygon(50% 0%, 0% 100%, 100% 100%); }
+.run-row-dot-neutral  { background: var(--status-neutral-solid); border-radius: 2px; }
+/* Run cards carry the shared .gl recipe (components.css), but .card's own
+   background there is declared after .gl in that same file and wins at
+   equal specificity. This file loads after components.css, so scoping the
+   override to .runs-list wins without touching the shared .card rule used
+   by agent/memory/cost cards elsewhere. */
+.runs-list .card.gl {
+  background: color-mix(in oklab, var(--glass-tint) calc(var(--a) * 100%), transparent);
+  -webkit-backdrop-filter: blur(var(--b)) saturate(var(--glass-sat));
+  backdrop-filter: blur(var(--b)) saturate(var(--glass-sat));
 }
 .run-time { font-size: var(--text-sm); color: var(--text-tertiary); }
 .run-brief {
@@ -1090,8 +1226,25 @@ body {
 .run-meta { display: flex; flex-wrap: wrap; gap: var(--space-1); }
 .run-meta-mono { font-family: var(--font-mono); }
 
+/* "Atividade relacionada" — compact, collapsible strip inside run-detail,
+   before the Trajectory Card (page-layout-redesign.md §1.3). */
+.related-activity { border: 1px solid var(--border-default); border-radius: var(--radius-md); margin-bottom: var(--space-4); overflow: hidden; }
+.related-activity-head {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 12px; border: none;
+  background: var(--surface-1); cursor: pointer; font: inherit; text-align: left; color: var(--text-primary);
+}
+.related-activity-head:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.related-activity-chev { margin-left: auto; width: 15px; height: 15px; transition: transform var(--dur-fast); }
+.related-activity-head[aria-expanded="true"] .related-activity-chev { transform: rotate(180deg); }
+.related-activity-body { padding: 6px 12px 10px; display: flex; flex-direction: column; gap: 6px; }
+.related-activity-row { display: flex; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.related-activity-time { font-family: var(--font-mono); flex: none; }
+.related-activity-empty { padding: 2px 0; }
+
+.run-detail, .run-detail-empty {
+  flex: 1; min-width: 0;
+}
 .run-detail {
-  background: var(--surface-1);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: var(--space-4);
@@ -1103,7 +1256,7 @@ body {
   opacity: 0.6;
 }
 .run-detail-head {
-  display: flex; gap: var(--space-3);
+  display: flex; flex-direction: column; gap: var(--space-3);
   margin-bottom: var(--space-4);
   padding-bottom: var(--space-3);
   border-bottom: 1px solid var(--border-default);
@@ -1721,6 +1874,56 @@ body {
 }
 .settings-footer-actions { display: flex; gap: 10px; }
 
+/* ── Settings modal: the engine section (nrv config), one control per key ── */
+.settings-tabs-nav { align-items: center; }
+.settings-tabs-nav .tab { white-space: nowrap; }
+.settings-tabs-source {
+  flex-shrink: 0; padding: 0 var(--space-2) 0 var(--space-1);
+  font-size: 10px; font-weight: var(--weight-semibold);
+  text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-tertiary); white-space: nowrap;
+}
+.settings-tabs-source + .tab { margin-left: 0; }
+.settings-engine-intro { margin: var(--space-2) 0 var(--space-3); line-height: 1.5; }
+.settings-engine-intro code, .settings-engine-scope code {
+  font-family: var(--font-mono); font-size: var(--text-xs);
+  background: var(--surface-3); padding: 1px 5px; border-radius: 3px;
+}
+.settings-engine-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.settings-engine-input { flex: 1 1 220px; min-width: 160px; font-family: var(--font-mono); }
+.settings-engine-scope { display: inline-flex; align-items: center; gap: var(--space-1); white-space: nowrap; }
+.settings-field-locked .settings-engine-row { opacity: 0.75; }
+.settings-engine-note  { color: var(--status-warn-fg);    margin-top: var(--space-1); line-height: 1.45; }
+.settings-engine-error { color: var(--status-danger-fg);  margin-top: var(--space-1); line-height: 1.45; }
+.settings-engine-ok    { color: var(--status-success-fg); margin-top: var(--space-1); line-height: 1.45; }
+
+/* A switch that says its state in words: the colour is never the only signal. */
+.switch {
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: 3px 12px 3px 3px;
+  font: inherit; font-size: var(--text-sm); font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border: 1px solid var(--border-default); border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+.switch-knob {
+  position: relative; width: 30px; height: 18px; border-radius: 9px;
+  background: var(--status-neutral-solid);
+  transition: background var(--dur-fast);
+}
+.switch-knob::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--text-inverse);
+  transition: transform var(--dur-fast);
+}
+.switch.on { color: var(--status-success-fg); }
+.switch.on .switch-knob { background: var(--status-success-solid); }
+.switch.on .switch-knob::after { transform: translateX(12px); }
+.switch:disabled { cursor: not-allowed; opacity: 0.6; }
+.switch:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+
 /* ═════════════ Lucide icons ═════════════ */
 [data-lucide],
 svg.lucide {
@@ -1750,6 +1953,21 @@ svg.icon-inline.lucide {
   vertical-align: -2px;
   margin-right: var(--space-1);
 }
+
+/* ─── Theme toggle icon — three permanent icons, one per [data-theme] value,
+   visibility alternated by CSS. Never re-set data-lucide via JS after Lucide
+   has already replaced the <i> with an <svg> — that swap silently stops
+   working once the element is no longer an <i>.
+   Selectors are qualified with .icon-btn (not just the bare .theme-icon-*
+   class) so they out-specify svg.lucide { display: inline-block } above,
+   which would otherwise win post-conversion and show all three at once. */
+.icon-btn .theme-icon-apple-dark, .icon-btn .theme-icon-awwwards { display: none; }
+html[data-theme="apple-dark"] .icon-btn .theme-icon-apple,
+html[data-theme="apple-dark"] .icon-btn .theme-icon-awwwards { display: none; }
+html[data-theme="apple-dark"] .icon-btn .theme-icon-apple-dark { display: inline-block; }
+html[data-theme="awwwards"] .icon-btn .theme-icon-apple,
+html[data-theme="awwwards"] .icon-btn .theme-icon-apple-dark { display: none; }
+html[data-theme="awwwards"] .icon-btn .theme-icon-awwwards { display: inline-block; }
 
 /* ═════════════ Setup view (kind=setup) ═════════════ */
 .setup-view {
@@ -2908,7 +3126,6 @@ svg.icon-inline.lucide {
   width: 100%;
   padding: 12px var(--space-3);
   border-radius: var(--radius-lg);
-  background: var(--surface-0);
   border: 1px solid var(--border-default);
   color: var(--text-primary);
   cursor: pointer; text-align: left;
@@ -3025,16 +3242,31 @@ svg.icon-inline.lucide {
 .chat-panel {
   position: fixed; top: 0; right: 0; bottom: 0;
   width: 460px; max-width: 92vw; z-index: 60;
-  display: flex; flex-direction: column;
-  background: var(--surface-1);
+  display: flex; flex-direction: row;
   border-left: 1px solid var(--border-default);
   box-shadow: -12px 0 40px rgba(0,0,0,0.16);
   transform: translateX(100%);
   transition: transform var(--dur-base) var(--ease-out);
 }
 .chat-panel.open { transform: translateX(0); }
+/* Resize handle: real drag AND ArrowLeft/ArrowRight keyboard, 460↔920px
+   (page-layout-redesign.md §2.2). The clickable hit area stays 24px even
+   though the visible bar is a slim 3px (WCAG 2.2 AA 2.5.8 — ux-qa finding
+   §3.1: the previous 8px-wide handle failed the target-size floor). */
+.chat-resize-handle {
+  flex: none; width: 24px; cursor: col-resize; background: transparent; border: none; padding: 0;
+  display: flex; align-items: center; justify-content: center; position: relative;
+}
+.chat-resize-handle::before { content: ''; width: 3px; height: 36px; border-radius: 3px; background: var(--border-strong); }
+.chat-resize-handle:hover::before, .chat-resize-handle:focus-visible::before { background: var(--accent); }
+.chat-resize-handle:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.chat-body { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+.chat-width-toggle { display: flex; border: 1px solid var(--border-default); border-radius: 8px; overflow: hidden; }
+.chat-width-toggle button { padding: 5px 10px; font-size: 11.5px; border: none; background: var(--surface-1); color: var(--text-secondary); cursor: pointer; font-family: inherit; }
+.chat-width-toggle button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.chat-width-toggle button:focus-visible { outline: none; box-shadow: var(--shadow-focus); position: relative; z-index: 1; }
 .chat-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--border-default);
 }
@@ -3084,10 +3316,77 @@ svg.icon-inline.lucide {
 .run-step.tone-ok .run-step-icon i, .run-step.tone-ok .run-step-icon svg { color: oklch(52% 0.15 155); opacity: 1; }
 .run-step.tone-fail .run-step-icon { background: oklch(58% 0.2 25 / 0.16); border-color: oklch(58% 0.2 25); }
 .run-step.tone-fail .run-step-icon i, .run-step.tone-fail .run-step-icon svg { color: oklch(55% 0.2 25); opacity: 1; }
+.run-infra-toggle { display: inline-block; margin: 4px 0 0 30px; padding: 0; border: none; background: none; color: var(--text-tertiary); font-size: 11px; cursor: pointer; text-decoration: underline dotted; }
+.run-infra-toggle:hover, .run-infra-toggle:focus-visible { color: var(--text-secondary); }
+
+/* ─── Cartão de Trajetória (trajectory-card.js) ───
+   Single organism shared by the Chat panel and the Runs tab. A plain `event`
+   row reuses `.run-step`/`.tone-*` above unchanged; this block only adds the
+   three molecules layered on top: the judgement strip, the delivery-nuance
+   badge and the runtime-health chip. */
+.trajectory-card { display: flex; flex-direction: column; gap: 2px; position: relative; }
+.trajectory-card::before { content: ''; position: absolute; left: 10px; top: 12px; bottom: 12px; width: 1px; background: var(--border-default); }
+.trajectory-row { position: relative; }
+
+.trajectory-judgement { margin: 4px 0 4px 30px; border-radius: var(--radius-md); overflow: hidden; box-shadow: var(--shadow-1); }
+.trajectory-judgement-head {
+  display: flex; align-items: center; gap: 7px; width: 100%; padding: 6px 10px;
+  border: none; background: none; color: var(--text-primary); font: inherit; text-align: left; cursor: pointer;
+}
+.trajectory-judgement-head:hover { background: color-mix(in oklab, var(--text-primary) 5%, transparent); }
+.trajectory-judgement-head:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.trajectory-judgement-head .icon-inline { width: 14px; height: 14px; opacity: 0.8; }
+.trajectory-judgement-title { font-size: 12.5px; font-weight: 600; }
+.trajectory-judgement-head .text-caption { margin-left: auto; }
+.trajectory-chevron { width: 14px; height: 14px; flex: none; transition: transform var(--dur-fast) var(--ease-out); }
+.trajectory-judgement.is-expanded .trajectory-chevron { transform: rotate(180deg); }
+.trajectory-judgement-body { padding: 2px 10px 8px 10px; }
+
+/* Selo de nuance de entrega: a clickable badge, tone AND text/icon together
+   (WCAG 2.2 AA 1.4.1 — never color alone), expanding a .kv-grid of detail. */
+.delivery-badge {
+  display: inline-flex; align-items: center; gap: 5px; margin-top: 3px; padding: 2px var(--space-2);
+  border-radius: var(--radius-pill); border: 1px solid transparent; font-size: var(--text-xs); font-weight: var(--weight-semibold);
+  cursor: pointer;
+}
+.delivery-badge .icon-inline { width: 12px; height: 12px; }
+.delivery-badge:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.delivery-badge-ok             { background: var(--status-success-bg); color: var(--status-success-fg); border-color: var(--status-success-border); }
+.delivery-badge-warn-detail    { background: var(--status-warn-bg);    color: var(--status-warn-fg);    border-color: var(--status-warn-border); }
+.delivery-badge-fail-reversible{ background: var(--status-danger-bg);  color: var(--status-danger-fg);  border-color: var(--status-danger-border); }
+.delivery-badge-detail { margin-top: 4px; }
+
+/* Chip de saúde de runtime: inline, not a separate banner — the hint is
+   visible without a click (runtime_auth_failed is the most actionable
+   event in the whole taxonomy per the Wave 1 inventory; it does not hide). */
+.runtime-health-chip {
+  display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 4px var(--space-2);
+  border-radius: var(--radius-sm); background: var(--status-danger-bg); border: 1px solid var(--status-danger-border);
+  color: var(--status-danger-fg); font-size: 11px;
+}
+.runtime-health-chip .icon-inline { width: 13px; height: 13px; flex: none; }
+.run-mt { margin-top: 8px; padding: 8px 10px; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); background: var(--surface-0); }
+.run-mt-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.run-mt-title { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; font-size: 12.5px; }
+.run-mt-title .icon-inline { width: 14px; height: 14px; opacity: 0.85; }
+.run-mt-reason { margin-bottom: 6px; }
+.run-mt-scroll { overflow-x: auto; }
+.run-mt-table { font-size: 11.5px; }
+.run-mt-table th, .run-mt-table td { padding: 4px 6px; white-space: nowrap; }
+.run-mt-table tbody th { font-weight: 550; font-size: 11.5px; text-transform: none; letter-spacing: normal; color: var(--text-primary); font-family: var(--font-mono, monospace); }
 .chat-thinking { color: var(--text-tertiary); font-size: 13px; }
 .chat-tools { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
 .chat-tool-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-family: var(--font-mono, monospace); color: var(--text-secondary); background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 2px 8px; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .chat-tool-chip .icon-inline { width: 12px; height: 12px; flex: none; opacity: 0.7; }
+/* Maestro turn: the Runs it opened, its state and cost, the session in the header, the cancel button */
+.chat-runs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.chat-run-link { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--accent); background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 2px 8px; cursor: pointer; }
+.chat-run-link .icon-inline { width: 12px; height: 12px; flex: none; }
+.chat-turn-meta { display: flex; gap: 10px; margin-top: 6px; color: var(--text-tertiary); }
+.chat-session { display: flex; align-items: center; gap: 4px; }
+.chat-session-id { font-family: var(--font-mono, monospace); font-size: 11px; }
+.chat-session-copy { font-size: 11px; color: var(--accent); background: none; border: none; padding: 0 0 0 4px; cursor: pointer; }
+.chat-cancel { flex: none; width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; background: var(--surface-2); border: 1px solid var(--border-default); color: var(--text-secondary); cursor: pointer; }
 .chat-dots { animation: chat-blink 1.2s steps(4) infinite; }
 @keyframes chat-blink { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
 .chat-composer { display: flex; gap: var(--space-2); align-items: flex-end; padding: var(--space-3) var(--space-4); border-top: 1px solid var(--border-default); }

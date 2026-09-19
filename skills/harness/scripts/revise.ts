@@ -29,6 +29,8 @@ import { runHeadless, runtimeAvailable, AUTONOMOUS_DIRECTIVE, type Runtime } fro
 import { runDelivery, deliverAfterRuntimeError, type DeliveryResult } from "../lib/delivery-pipeline.ts";
 import { loadHarnessConfig } from "../lib/harness-config.ts";
 import { harnessLogsDir } from "../../_shared/lib/log-paths.ts";
+import { scopeGuard } from "../../_shared/lib/scope-guard.ts";
+import { stamp } from "../../_shared/lib/audit-provenance.ts";
 
 const ANSI = { reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m", green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m", cyan: "\x1b[36m", lime: "\x1b[38;5;154m" };
 const noColor = process.argv.includes("--no-color") || !process.stdout.isTTY;
@@ -72,7 +74,7 @@ function appendAudit(payload: Record<string, any>, projectRoot?: string): void {
     const today = new Date().toISOString().slice(0, 10);
     const dir = path.join(harnessLogsDir({ cwd: projectRoot }), today);
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n");
+    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(stamp({ ts: new Date().toISOString(), ...payload })) + "\n");
   } catch { /* non-fatal */ }
 }
 
@@ -134,6 +136,7 @@ const revisePrompt = [
   change,
   "",
   `Reescreva/atualize os entregáveis como arquivos sob: ${oroot}`,
+  scopeGuard("pt-BR"),
   'Não imprima resumo: entregue os arquivos atualizados. Atualize a seção "## Premissas assumidas" se algo mudou.',
 ].join("\n");
 
@@ -142,13 +145,14 @@ appendAudit({ event: "revision_requested", trace_id: projectId, project_id: proj
 const res = runHeadless({
   runtime: rt,
   prompt: revisePrompt,
-  cwd: projDir,
-  addDirs: [projectRoot],
+  cwd: projectRoot,
+  addDirs: [projDir, oroot],
   sessionId,
   appendSystemPrompt: AUTONOMOUS_DIRECTIVE,
   maxBudgetUsd: maxBudget ? parseFloat(maxBudget) : undefined,
   timeoutMs: timeoutMin ? parseInt(timeoutMin, 10) * 60 * 1000 : undefined,
   yolo,
+  label: `revise ${projectId}`,
 });
 
 // claude --resume can mint a fresh session id; persist whatever we got back.
@@ -171,11 +175,12 @@ console.log(c("dim", `  ${res.durationMs}ms${res.costUsd != null ? ` · $${res.c
 //
 // Revision budget: `nrv revise` is the human's own iteration loop, so the
 // config budget applies — EXCEPT when the SUPERVISOR spawned us (NRV_IN_SWEEP=1,
-// set by supervisor.ts defaultResume). An unattended launchd sweep runs every
-// 120s; a revision loop there spends LLM money with nobody watching and can
-// re-trigger on the next sweep. There the gate verdict goes straight back to
-// the supervisor, which withholds and escalates to a human. Do NOT raise this
-// number to "make recovery work": deliberate iteration is the human's call.
+// set by supervisor.ts defaultResume). An unattended sweep (`watch`'s loop or
+// a lazy background trigger) runs with nobody watching; a revision loop there
+// spends LLM money and can re-trigger on the next sweep. There the gate
+// verdict goes straight back to the supervisor, which withholds and escalates
+// to a human. Do NOT raise this number to "make recovery work": deliberate
+// iteration is the human's call.
 const inSweep = process.env.NRV_IN_SWEEP === "1";
 const config = loadHarnessConfig();
 const zipWanted = Boolean(session.zip_path) || wantZip;

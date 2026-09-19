@@ -36,12 +36,14 @@
 // to do — by default the harness falls through to its currently-configured
 // runtime and lets it fail naturally).
 
+import { listRuntimes } from "../../_shared/lib/host-agent-driver.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { Runtime } from "./host-agent-driver.ts";
 import { isInCooldown, getCooldown } from "./cooldown-registry.ts";
 import { getSpend } from "./spend-tracker.ts";
+import { findProjectRoot } from "../../_shared/lib/project-root.js";
 
 export interface CascadeEntry {
   runtime: Runtime;
@@ -56,7 +58,11 @@ export interface CascadeEntry {
   budgetUsd: number | null;
 }
 
-const VALID_RUNTIMES: ReadonlyArray<Runtime> = ["claude-code", "codex", "gemini-cli", "antigravity-cli", "kimi-cli", "grok-cli", "pi"];
+// The roster, DERIVED. Three copies of this list lived in three files and all
+// three had stopped at seven names while the driver grew to nine, so a user who
+// wrote `qwen-code` or `opencode` had their entry dropped without a word. The
+// driver owns the list; everyone else asks it.
+const VALID_RUNTIMES: ReadonlyArray<Runtime> = listRuntimes().map((r) => r.name);
 
 function parseCascadeString(s: string): CascadeEntry[] {
   return s.split(",").map(tok => tok.trim()).filter(Boolean).map(tok => {
@@ -99,22 +105,41 @@ export function readEnvFile(envPath: string): Record<string, string> {
  * .nirvana/outputs/<id>/ for per-run logs/state) with the actual root.
  *  Pass 1: prefer .env or .git (distinctive root markers).
  *  Pass 2: fall back to .nirvana/ if pass 1 found nothing.
- *  Returns the original start if nothing matches. */
+ *  Returns the original start if nothing matches.
+ *
+ * The walk itself delegates to project-root.js (the one implementation):
+ * this used to compare `dir !== home` as a raw string against `os.homedir()`
+ * with no canonicalization — the exact shape that broke log-paths.ts on
+ * Windows (an 8.3 short path on one side, the long form on the other, never
+ * string-equal at the same physical directory). */
+/**
+ * The user-global `.env` files, in precedence order. One list, because three
+ * subsystems had three different answers and the disagreement was not academic:
+ * Glance reads and writes the user's global settings and runtime rules in
+ * `~/.env`, and nothing in the engine read that file — a `USE_CODEX` rule saved
+ * in the cockpit was written, shown back as saved, and never consulted by a
+ * single dispatch.
+ *
+ * The engine's own home leads, `~/.claude/.env` stays as the pre-migration
+ * fallback (a fresh install never needs a Claude Code directory), and `~/.env`
+ * closes the chain so what the cockpit writes is finally read. Only the keys
+ * each caller asks for are taken from these files; nothing else in them is
+ * touched.
+ */
+export function globalEnvFiles(): string[] {
+  const home = process.env.NIRVANA_HOME || os.homedir();
+  return [
+    path.join(home, ".nirvana", ".env"),
+    path.join(os.homedir(), ".claude", ".env"),
+    path.join(os.homedir(), ".env"),
+  ];
+}
+
 export function resolveCascadeRoot(start: string): string {
-  const home = os.homedir();
   const startAbs = path.resolve(start);
-  const fsRoot = path.parse(startAbs).root;
-  const walk = (markers: string[]): string | null => {
-    let dir = startAbs;
-    while (dir !== fsRoot && dir !== home) {
-      for (const m of markers) if (fs.existsSync(path.join(dir, m))) return dir;
-      const parent = path.dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-    return null;
-  };
-  return walk([".env", ".git"]) ?? walk([".nirvana"]) ?? startAbs;
+  return findProjectRoot(startAbs, { markers: [".env", ".git"] })
+    ?? findProjectRoot(startAbs, { markers: [".nirvana"] })
+    ?? startAbs;
 }
 
 /** Read LLM_CASCADE from disk. CRITICAL: we deliberately ignore
@@ -142,12 +167,7 @@ export function loadCascade(projectRoot: string | null): CascadeEntry[] {
     const resolvedEnv = path.join(resolved, ".env");
     if (!envFiles.includes(resolvedEnv)) envFiles.push(resolvedEnv);
   }
-  // User-global default: the engine's own home first. ~/.claude/.env stays in
-  // the chain as a legacy fallback so machines configured before the migration
-  // keep working, but a fresh install never needs a Claude Code directory.
-  const home = process.env.NIRVANA_HOME || os.homedir();
-  envFiles.push(path.join(home, ".nirvana", ".env"));
-  envFiles.push(path.join(os.homedir(), ".claude", ".env"));
+  envFiles.push(...globalEnvFiles());
 
   for (const f of envFiles) {
     const env = readEnvFile(f);

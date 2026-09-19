@@ -24,6 +24,7 @@
 // Test seams: parseAndValidate() is exported and pure; agenticRoute() accepts
 // runHeadlessImpl + registry/digest path overrides so tests run zero-token.
 
+import { listRuntimes } from "../../_shared/lib/host-agent-driver.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -33,8 +34,13 @@ import { harnessLogsDir } from "../../_shared/lib/log-paths.ts";
 import { BUN_BIN } from "../../_shared/lib/bun-helpers.ts";
 import { resolveRoutingArtifactPaths } from "../scripts/build-routing-digest.ts";
 import { formatRulesForRouterPrompt, type RuntimeRule } from "./runtime-rules.ts";
+import { stamp } from "../../_shared/lib/audit-provenance.ts";
 
-const EXEC_RUNTIMES: ReadonlyArray<string> = ["claude-code", "codex", "gemini-cli", "antigravity-cli", "kimi-cli", "grok-cli", "pi"];
+// The roster, DERIVED. Three copies of this list lived in three files and all
+// three had stopped at seven names while the driver grew to nine, so a user who
+// wrote `qwen-code` or `opencode` had their entry dropped without a word. The
+// driver owns the list; everyone else asks it.
+const EXEC_RUNTIMES: ReadonlyArray<string> = listRuntimes().map((r) => r.name);
 
 export type RouteKind = "decision" | "ambiguous" | "no_match";
 
@@ -71,7 +77,7 @@ function emitAudit(payload: Record<string, any>, cwd?: string): void {
     const today = new Date().toISOString().slice(0, 10);
     const dir = path.join(harnessLogsDir({ cwd }), today);
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify({ ts: new Date().toISOString(), ...payload }) + "\n");
+    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(stamp({ ts: new Date().toISOString(), ...payload })) + "\n");
   } catch { /* non-fatal */ }
 }
 
@@ -310,7 +316,8 @@ Examples:
 If a candidate business cannot deliver the OBJECT (e.g. a medical business does not build HTML/CSS/JS), it is WRONG even when the THEME matches.
 
 ## HARD RULES
-1. **An explicit target wins — and narrowly.** If the user names ONLY ONE SQUAD and no business (e.g. "use brandcraft", "create a PDF with brandcraft"): run ONLY that squad — put it in mandatory_squads, leave \`primary_business: null\`, and do NOT escalate to a business, UNLESS the OBJECT genuinely requires a multi-phase pipeline the squad alone cannot deliver (if so, justify it explicitly in the rationale). If the user names a BUSINESS, use that business. If NO target is named, survey the whole digest (businesses AND squads) and pick the best set — never force a business just because the slot exists.
+1. **An explicit target wins — and narrowly.** If the user names ONLY ONE SQUAD and no business (e.g. "use brandcraft", "create a PDF with brandcraft"): run ONLY that squad — put it in mandatory_squads, leave \`primary_business: null\`, and do NOT escalate to a business, UNLESS the OBJECT genuinely requires a multi-phase pipeline the squad alone cannot deliver (if so, justify it explicitly in the rationale). If the user names a BUSINESS, use that business. If NO target is named, survey the whole digest (businesses AND squads) and apply rule 1b.
+1b. **With no explicit target, the business is the default and the squad is the exception.** A squad is one team running one workflow: it produces, and nothing in it steps back to check the result against the brief. A business is an org chart — several specialties plus a seat that consolidates and answers for the whole. Prefer the business, and go straight to a squad only when ALL THREE hold: the OBJECT is a single artifact of a single specialty; exactly one squad's declared capability delivers the whole of it; and nothing in the brief needs judgment across specialties (research feeding copy, copy feeding design, a review of the result). Any doubt resolves to the business — a direct squad dispatch is faster, and speed is the wrong thing to optimize when the deliverable comes back thin. Say in the rationale which of the three failed when you escalate.
 2. **The user is in command.** If the brief says "use squad X" or "use business Y", they go into mandatory_squads / primary_business WITHOUT negotiation. If the user names an OBJECT squad (e.g. awwwards-singularity-studio for a landing page), it must be in the chain.
 3. **For software/web OBJECTS** (landing page, app, site, dashboard, SaaS): if a business is the primary, it must have design+frontend+backend capabilities/employees. Specialist OBJECT squads (e.g. landing-page specialists) go into mandatory_squads when applicable.
 4. **For deep textual OBJECTS** (book, legal opinion, technical report): primary is the business whose intake+synthesizer provide the authority — except when a single named squad already delivers the object (rule 1).
@@ -444,7 +451,54 @@ export async function agenticRoute(args: AgenticRouteArgs): Promise<AgenticRoute
   }
 
   const slugs = loadRegistrySlugs(routerPaths);
-  const parsed = parseAndValidate(res.result || "", slugs);
+  let parsed = parseAndValidate(res.result || "", slugs);
+
+  // The router runs with Read, Glob, Grep and Bash, because a decision over a
+  // large catalogue should be allowed to look things up. That grant has a cost
+  // the director seat pays too: an agent with tools treats its final message as
+  // a REPORT of the work it did, not as the payload.
+  //
+  // Observed on this machine, 2026-09-17: a real brief about a family holding
+  // answered "Routing decision: aurum-contabil + nirvana-societario-sucessao /
+  // I read the client brief ... and surveyed", spent 117 seconds, and failed to
+  // parse. It had decided correctly — a business AND a squad, both real slugs —
+  // and the brief still fell through to agent-x with "this brief got NO
+  // specialist". The cascade's own retry cannot help there: it replays the
+  // identical prompt, which answers the transport being flaky and not the
+  // envelope being missing.
+  //
+  // So ask once for the envelope alone, carrying the answer back to be
+  // transcribed rather than re-decided. No tools on the re-ask: there is no
+  // work left to report on, which is what produced the prose in the first
+  // place. The same shape the business director uses.
+  if (!parsed.ok) {
+    const narrated = (res.result || "").trim();
+    emitAudit({
+      event: "x_router_reask",
+      project_id: args.projectId ?? null,
+      error: parsed.error ?? null,
+      answer_chars: narrated.length,
+    }, args.cwd);
+    const reask = [
+      "You already made the routing decision. Below is your own answer. Transcribe the decision you ALREADY made into JSON. Do not decide again, do not change a target, do not explain.",
+      "",
+      "YOUR ANSWER:",
+      narrated.slice(0, 6000),
+      "",
+      "Your entire reply must be one JSON object and nothing else, in the shape the instructions gave you:",
+      '{"kind":"decision"|"ambiguous"|"no_match","primary_business":"<slug>"|null,"mandatory_squads":[],"optional_squads":[],"mind_clones":[],"rationale":"<one sentence>"}',
+      "No preamble, no summary of what you did, no markdown fences. The JSON object is the whole reply.",
+    ].join("\n");
+    const retry = runner({
+      runtime: args.runtime,
+      prompt: reask,
+      cwd: args.cwd,
+      maxBudgetUsd: args.maxBudgetUsd,
+      timeoutMs: 2 * 60 * 1000,
+    });
+    parsed = retry.ok ? parseAndValidate(retry.result || "", slugs) : parsed;
+  }
+
   if (!parsed.ok || !parsed.decision) {
     emitAudit({
       event: "agentic_route_failed",

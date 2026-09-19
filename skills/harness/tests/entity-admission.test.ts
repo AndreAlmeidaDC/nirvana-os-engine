@@ -19,6 +19,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 const REPO = join(import.meta.dir, "..", "..", "..");
 const GATE = join(REPO, "scripts", "check-entity-admission.ts");
@@ -44,7 +45,7 @@ function pack(mutate: (root: string) => void = () => {}): string {
   writeFileSync(join(clone, ".nirvana-surface.json"), "{}", "utf8");
   const squad = join(root, "squads", "one-squad");
   mkdirSync(squad, { recursive: true });
-  writeFileSync(join(squad, "squad.yaml"), "name: one-squad\nversion: 1.0.0\n", "utf8");
+  writeFileSync(join(squad, "squad.yaml"), "name: one-squad\nversion: 1.0.0\nprotocol: \"6.0\"\n", "utf8");
   writeFileSync(join(squad, ".nirvana-surface.json"), "{}", "utf8");
   mutate(root);
   return root;
@@ -69,7 +70,7 @@ describe("hard problems always fail", () => {
     const r = run(root, { baseline: {} });
     expect(r.code).toBe(1);
     expect(r.out).toContain("no routing.one_liner");
-  });
+  }, spawnBudgetMs(2));
 
   test("a numbered legacy category does not enter", () => {
     const root = pack((r) => {
@@ -84,14 +85,28 @@ describe("hard problems always fail", () => {
     const r = run(root, { baseline: {} });
     expect(r.code).toBe(1);
     expect(r.out).toContain("numbered legacy category");
-  });
+  }, spawnBudgetMs(2));
+
+  test("a squad below Protocol 6.0 does not enter", () => {
+    const root = pack((r) => {
+      writeFileSync(join(r, "squads", "one-squad", "squad.yaml"), "name: one-squad\nversion: 1.0.0\nprotocol: \"5.0\"\n", "utf8");
+    });
+    const r = run(root, { baseline: {} });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("protocol 5.0");
+    expect(r.out).toContain("Protocol 6.0 squads only");
+    const missing = pack((r) => {
+      writeFileSync(join(r, "squads", "one-squad", "squad.yaml"), "name: one-squad\nversion: 1.0.0\n", "utf8");
+    });
+    expect(run(missing, { baseline: {} }).code).toBe(1);
+  }, spawnBudgetMs(2));
 
   test("a missing surface file does not enter", () => {
     const root = pack((r) => rmSync(join(r, "squads", "one-squad", ".nirvana-surface.json")));
     const r = run(root, { baseline: {} });
     expect(r.code).toBe(1);
     expect(r.out).toContain("no .nirvana-surface.json");
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("metadata debt is baselined — shrink only, and new content enters complete", () => {
@@ -108,14 +123,14 @@ describe("metadata debt is baselined — shrink only, and new content enters com
     const r = run(root, { baseline: {} });
     expect(r.code).toBe(1);
     expect(r.out).toContain("new content enters complete");
-  });
+  }, spawnBudgetMs(2));
 
   test("the same gap on a BASELINED clone passes — recorded debt", () => {
     const root = pack(noVerdict);
     const r = run(root, { baseline: { "jane-doe": ["no_verdict"] } });
     expect(r.code).toBe(0);
     expect(r.out).toContain("recorded metadata debt");
-  });
+  }, spawnBudgetMs(2));
 
   test("a NEW gap on a baselined clone still fails", () => {
     const root = pack((r) =>
@@ -127,19 +142,19 @@ describe("metadata debt is baselined — shrink only, and new content enters com
     const r = run(root, { baseline: { "jane-doe": ["no_verdict"] } });
     expect(r.code).toBe(1);
     expect(r.out).toContain("NEW gap on a known entity");
-  });
+  }, spawnBudgetMs(2));
 
   test("--record refuses to add debt without --allow-regression", () => {
     const root = pack(noVerdict);
     const r = run(root, { baseline: {}, record: true });
     expect(r.code).toBe(1);
     expect(r.out).toContain("would gain NEW debt");
-  });
+  }, spawnBudgetMs(2));
 
   test("a clean pack passes, and no baseline at all refuses rather than approves", () => {
     expect(run(pack(), { baseline: {} }).code).toBe(0);
     const r = run(pack());
     expect(r.code).toBe(1);
     expect(r.out).toContain("No debt baseline recorded");
-  });
+  }, spawnBudgetMs(2));
 });

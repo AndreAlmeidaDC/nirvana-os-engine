@@ -41,7 +41,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { runHeadless, runtimeAvailable, AUTONOMOUS_DIRECTIVE, type Runtime } from "./host-agent-driver.ts";
+import { scopeGuard } from "../../_shared/lib/scope-guard.ts";
+import { isRunStatePath } from "../../_shared/lib/run-state.ts";
+import { detectKind } from "../../_shared/lib/surface.ts";
 import { GATEABLE_EXTS } from "../scripts/quality-gate.ts";
+import { harnessLogsDir } from "../../_shared/lib/log-paths.ts";
+import { resolveSetting } from "../../_shared/lib/settings.ts";
 import type { HarnessConfig } from "./harness-config.ts";
 import * as runLedger from "./run-ledger.ts";
 
@@ -84,12 +89,71 @@ export function nonStubText(dir: string, named: Set<string>): string[] {
   return listFiles(dir).filter(f => /\.(md|txt|json)$/i.test(f) && isDeliverable(f, named));
 }
 
+/**
+ * True when a path under an outputs root holds RUN STATE rather than work
+ * product. Two sources, neither of them a name list invented here:
+ *
+ *  - `isRunStatePath` (skills/_shared/lib/run-state.ts) — the canonical list
+ *    the installer, the uninstaller and the pack builder already read. An
+ *    outputs root may belong to a squad or to a business, so every kind is
+ *    asked. Asked ONE KIND AT A TIME, never kindless: the kindless branch
+ *    matches bare first segments, and run-state.ts documents what that cost
+ *    the last time — `memory/projects` collapsing to `memory` took
+ *    `memory/permanent.md` out of forty-six businesses.
+ *  - a DIRECTORY segment opening with `.` or `_` — the two namespaces the
+ *    engine reserves for itself. Only directories: the basename is never
+ *    tested, so `_SUMMARY.md` and `_QA-RESERVATIONS.md`, which the run really
+ *    does author, stay under judgement.
+ */
+const RUN_STATE_KINDS = ["squads", "businesses", "mind-clones"] as const;
+
+function isRunStateUnderOutputs(rel: string): boolean {
+  if (RUN_STATE_KINDS.some(kind => isRunStatePath(rel, kind))) return true;
+  const segs = rel.split(/[\\/]/).filter(Boolean);
+  return segs.slice(0, -1).some(s => s.startsWith(".") || s.startsWith("_"));
+}
+
+/**
+ * True when a path sits inside a CAPTURED ENTITY — a squad, business or
+ * mind-clone copied whole into the outputs root (`detectKind` finds its
+ * manifest there). The run put those bytes on disk; it did not write them.
+ *
+ * Why identity and not the name: in trace 70341260 the directory was called
+ * `backup-before`, so a reserved-prefix convention would have missed it — a
+ * rule that needs the offending agent's cooperation is a request, not a rule.
+ * A copied squad carries `squad.yaml` whatever the directory is called.
+ */
+function insideCapturedEntity(root: string, rel: string, memo: Map<string, boolean>): boolean {
+  const dirs = rel.split(/[\\/]/).filter(Boolean).slice(0, -1);
+  let acc = "";
+  for (const seg of dirs) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    let hit = memo.get(acc);
+    if (hit === undefined) {
+      hit = detectKind(path.join(root, acc)) !== null;
+      memo.set(acc, hit);
+    }
+    if (hit) return true;
+  }
+  return false;
+}
+
 /** The Phase 4 gate surface: every non-stub artifact whose extension the
  * quality gate knows how to judge (quality-gate.ts GATEABLE_EXTS — includes
- * .html, .yaml/.yml, code and images). */
+ * .html, .yaml/.yml, code and images), minus what the run did not write.
+ *
+ * Run state is dropped outright — it is never a deliverable, and if dropping
+ * it empties the surface the outcome is INDETERMINATE, which is the honest
+ * answer. A captured entity is dropped only while the run has work of its own
+ * left to judge: when the entity IS the deliverable (a run asked to build a
+ * squad) it stays, so this filter can narrow noise and never silence signal. */
 export function gateableFiles(dir: string, named: Set<string>): string[] {
-  return listFiles(dir).filter(f =>
+  const all = listFiles(dir).filter(f =>
     GATEABLE_EXTS.has(path.extname(f).toLowerCase()) && isDeliverable(f, named));
+  const own = all.filter(f => !isRunStateUnderOutputs(path.relative(dir, f)));
+  const memo = new Map<string, boolean>();
+  const authored = own.filter(f => !insideCapturedEntity(dir, path.relative(dir, f), memo));
+  return authored.length > 0 ? authored : own;
 }
 
 /** Non-stub artifacts under `outputsRoot` — the SAME discovery runDelivery
@@ -111,6 +175,25 @@ export interface GateRunOpts {
   produces?: string[];
   /** Env for the gate child (trace/project/business ids for its audit emit). */
   env?: Record<string, string | undefined>;
+}
+
+/**
+ * The `produces[]` slugs the judge's rubric selector receives.
+ *
+ * `deliveryArgs()` never passed `produces`, so `selectRubricsForProduces` was
+ * always called with `[]` and every deliverable — a landing page, a dataset, a
+ * video script — was judged by `prose_shortform`. The declaration exists on both
+ * sides (a squad capability's `produces`, a business manifest's), so the fix is
+ * to forward it; `delivery.produces_to_rubric` gates the forwarding because the
+ * rubrics cover roughly 45 of the 3.024 slugs the library declares, and a slug
+ * with no rubric must degrade to the fallback, never to a refusal.
+ *
+ * Off (the default) returns `[]` — bit for bit what the judge received before.
+ */
+export function producesForRubric(produces: readonly string[] | null | undefined, enabled: boolean): string[] {
+  if (!enabled) return [];
+  const slugs = (produces ?? []).map(slug => String(slug ?? "").trim()).filter(Boolean);
+  return [...new Set(slugs)];
 }
 
 /** Run the quality gate over each artifact; collect fix lists for failures.
@@ -171,6 +254,14 @@ export interface DeliveryArgs {
    * business slug exists), verification runs through verify-deliverable.ts
    * and its exit code is honored; otherwise the homegrown scan applies. */
   manifest?: string | null;
+  /**
+   * The business promised files through its roles' `acceptance[]` (Business Protocol
+   * 2.0 §11, businesses/lib/acceptance.ts). Those entries are a completeness proof the
+   * same way a manifest is, so verification runs through verify-deliverable.ts for them
+   * too — a business that never wrote a `deliverables.json` stops falling back to the
+   * output scan, which only knows whether SOMETHING was written.
+   */
+  acceptancePromisesPaths?: boolean;
   pid: string;
   /** Business slug; null for squad-only / agent-x paths. */
   slug: string | null;
@@ -238,7 +329,7 @@ export interface DeliveryResult {
   revisionsUsed: number;
   sessionId: string | null;
   zipPath: string | null;
-  verifySource: "manifest" | "scan";
+  verifySource: "manifest" | "acceptance" | "scan";
   /** Reason string when the completeness ceiling downgraded an otherwise
    * deliverable outcome to `withheld`; null when no cap bound the result. */
   ceilingApplied: string | null;
@@ -259,19 +350,37 @@ export function runDelivery(args: DeliveryArgs): DeliveryResult {
   const runHeadlessImpl = args.runHeadlessImpl ?? runHeadless;
   const verifyScript = args.verifyScript ?? path.join(SKILLS_DEFAULT, "businesses", "scripts", "verify-deliverable.ts");
   const gateScript = args.gateScript ?? path.join(SKILLS_DEFAULT, "harness", "scripts", "quality-gate.ts");
-  // Retry ceiling (owner policy, 2026-08-21): a QA loop must terminate. The
-  // default is 15 attempts, configurable via NIRVANA_MAX_GATE_RETRIES (Bun
-  // auto-loads .env, so a project .env entry works). An explicit
-  // args.maxRevisions always wins — the unattended sweep passes 0 on purpose.
+  // Retry ceiling (owner policy, 2026-08-21): a QA loop must terminate. It has
+  // ONE home now — `quality_gate.max_revisions`, default 2 — because it used to
+  // have two that disagreed by 7.5x: the scripted callers pass that setting
+  // (dispatch.ts, revise.ts), while a caller that passed nothing fell to a
+  // literal 15 here and the harness protocol told the orchestrating model 15 as
+  // well. Every round is a full child dispatch, so the gap was measured in wall
+  // clock, not in style. `NIRVANA_MAX_GATE_RETRIES` still overrides, and an
+  // explicit args.maxRevisions always wins — the unattended sweep passes 0 on
+  // purpose.
   const envCap = Number.parseInt(process.env.NIRVANA_MAX_GATE_RETRIES ?? "", 10);
-  const maxRevisions = args.maxRevisions ?? (Number.isFinite(envCap) && envCap >= 0 ? envCap : 15);
+  const settingCap = (() => {
+    try { return Number(resolveSetting("quality_gate.max_revisions").value); }
+    catch { return 2; }
+  })();
+  const maxRevisions = args.maxRevisions
+    ?? (Number.isFinite(envCap) && envCap >= 0 ? envCap : (Number.isFinite(settingCap) && settingCap >= 0 ? settingCap : 2));
   const led = args.ledger ?? null;
   const mark = (state: runLedger.RunState, extra?: runLedger.MarkStateExtra) => {
     if (led) ledgerTry(() => runLedger.markState(led.handle, led.runId, state, extra ?? {}), warn);
   };
+  // quality-gate.ts and verify-deliverable.ts each anchor their audit on the artifact they
+  // were handed. With an outputs root outside the project tree that walk finds no project and
+  // lands in `~/.harness-logs`, which is how one trace's `gate_passed` ended up in a different
+  // file from its own `dispatch_squad`. The run already knows which project it belongs to, so
+  // it says so — an explicit HARNESS_LOGS_DIR the caller can still override.
   const gateEnv = {
     NIRVANA_TRACE_ID: args.pid,
     NIRVANA_PROJECT_ID: args.pid,
+    // Resolved from the project root the same way the dispatch resolves its own — walking up
+    // from it — so the two answers cannot disagree even when the root carries no marker.
+    HARNESS_LOGS_DIR: harnessLogsDir({ cwd: args.projectRoot }),
     ...(args.slug ? { NIRVANA_BUSINESS_SLUG: args.slug } : {}),
   };
   let sessionId: string | null = args.sessionId ?? null;
@@ -291,27 +400,29 @@ export function runDelivery(args: DeliveryArgs): DeliveryResult {
   let verifySource: DeliveryResult["verifySource"] = "scan";
   let manifestVerified = false;
 
-  if (args.manifest && args.slug) {
-    // Manifest path: verify-deliverable.ts owns the disk-truth check and its
+  const promisedSource: "manifest" | "acceptance" | null = args.slug ? (args.manifest ? "manifest" : args.acceptancePromisesPaths ? "acceptance" : null) : null;
+  if (promisedSource) {
+    // Promised-paths path: verify-deliverable.ts owns the disk-truth check and its
     // exit code is honored (0 pass · 1 fail · 2 indeterminate → fall back to
-    // the scan below). It emits verify_passed/verify_failed itself.
+    // the scan below). It emits verify_passed/verify_failed itself. The promise comes
+    // from the run's manifest, or — with no manifest — from the roles' acceptance[].
     const v = spawnSync("bun", [verifyScript, args.pid, args.slug, "--outputs-root", args.outputsRoot], {
       encoding: "utf8",
       cwd: args.workingDir ?? process.cwd(),
       env: { ...process.env, ...gateEnv },
     });
     if (v.status === 0) {
-      verifySource = "manifest";
+      verifySource = promisedSource;
       manifestVerified = true;
-      log(`  verify (manifest): PASS`);
+      log(`  verify (${promisedSource}): PASS`);
     } else if (v.status === 1) {
-      warn(`  verify (manifest): FAIL — deliverables missing or stubbed`);
+      warn(`  verify (${promisedSource}): FAIL — deliverables missing or stubbed`);
       warn((v.stdout || v.stderr || "").trim().slice(0, 800));
       mark("failed", { error: "verify-deliverable: FAIL" });
-      return fail(1, "indeterminate", { verifySource: "manifest" });
+      return fail(1, "indeterminate", { verifySource: promisedSource });
     } else {
-      // exit 2 (indeterminate: no manifest markers) or spawn error → scan.
-      warn(`  verify (manifest): indeterminate (rc=${v.status}) — falling back to output scan`);
+      // exit 2 (indeterminate: no promised paths on either side) or spawn error → scan.
+      warn(`  verify (${promisedSource}): indeterminate (rc=${v.status}) — falling back to output scan`);
     }
   }
 
@@ -363,13 +474,15 @@ export function runDelivery(args: DeliveryArgs): DeliveryResult {
       ...fixLines,
       "",
       "Regra de hífen (a mais comum): use '-' só para palavras compostas; nunca para emendar orações nem como travessão — troque por vírgula, dois-pontos ou ponto.",
+      scopeGuard("pt-BR"),
       "Não imprima resumo: entregue os arquivos corrigidos.",
     ].join("\n");
     const rr = runHeadlessImpl({
-      runtime: args.runtime, prompt: fixPrompt, cwd: args.projectDir, addDirs: [args.projectRoot],
+      runtime: args.runtime, prompt: fixPrompt, cwd: args.projectRoot, addDirs: [args.projectDir, args.outputsRoot],
       sessionId: sessionId || undefined,
       appendSystemPrompt: AUTONOMOUS_DIRECTIVE + (args.rulesDirective ?? ""),
       maxBudgetUsd: args.maxBudgetUsd, timeoutMs: args.timeoutMs, yolo: args.yolo,
+      label: `revision ${revUsed}`,
       ...(led ? { ledger: { runId: led.runId, watchDir: args.outputsRoot } } : {}),
     });
     emit("revision_auto", { trace_id: args.pid, project_id: args.pid, business_slug: args.slug, attempt: revUsed, ok: rr.ok });
@@ -457,7 +570,16 @@ export function runDelivery(args: DeliveryArgs): DeliveryResult {
       `Iterate deliberately: nrv revise ${args.pid} "<fix instruction>" · strict mode: NIRVANA_GATE_EXHAUSTED=withhold`,
       "",
     ].join("\n");
-    try { fs.writeFileSync(path.join(args.outputsRoot, "_QA-RESERVATIONS.md"), reservations); }
+    // Preserve what is already there. The producer writes into this same file
+    // when it delivers with something missing — a chain seat that failed twice,
+    // for instance — and a plain `writeFileSync` erased that note in favour of
+    // the gate's. Both belong: one says the quality verdict is unresolved, the
+    // other says a piece of the work never arrived, and a reader who is handed
+    // only the second one concludes the first never happened.
+    const reservationsFile = path.join(args.outputsRoot, "_QA-RESERVATIONS.md");
+    let existing = "";
+    try { existing = fs.readFileSync(reservationsFile, "utf8").trim(); } catch { /* none yet */ }
+    try { fs.writeFileSync(reservationsFile, existing ? `${existing}\n\n---\n\n${reservations}` : reservations); }
     catch { /* outputs dir unwritable — the warn below still tells the story */ }
     warn(`  gate still FAIL after ${revUsed} revision(s) — ACCEPTED WITH RESERVATIONS (_QA-RESERVATIONS.md; NIRVANA_GATE_EXHAUSTED=withhold for strict mode)`);
     emit("x_delivered_with_reservations", {

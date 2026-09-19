@@ -24,6 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { decodeClaudeProjectDirName } from "../../harness/lib/glance/project-discovery.ts";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
 import { parseArgs, EXIT } from "../lib/bun-helpers.ts";
@@ -45,7 +46,7 @@ const PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
 
 function encodeProjectPath(absPath: string): string {
   // Claude Code encodes the absolute path by replacing slashes with hyphens
-  // and prefixing with a single dash. e.g. ~/foo → -Users-guto-foo.
+  // and prefixing with a single dash. e.g. ~/foo → -Users-alice-foo.
   return absPath.replace(/\//g, "-");
 }
 
@@ -103,7 +104,19 @@ const dirs = selectDirs();
 console.error(`[import] scanning ${dirs.length} project dir(s)…${dryRun ? " (dry-run)" : ""}`);
 
 for (const dir of dirs) {
-  const projectId = path.basename(dir).replace(/^-/, "").replace(/-/g, "/");
+  // Claude Code encodes a project path by replacing `/` with `-`. Undoing that
+  // by replacing every `-` with `/` destroys the hyphens that belong to the
+  // name: `my-mini-apps-project` came out as
+  // `Users/me/my/mini/apps/project`, a path that does not exist,
+  // and every cost event for that project was filed under it.
+  //
+  // `decodeClaudeProjectDirName` recovers the real path by walking the disk —
+  // preferring the longest run of tokens that names a real directory — and it
+  // already existed, one import away. When it cannot recover a path (the
+  // directory is gone), the encoded name is kept verbatim: an honest opaque id
+  // beats a confident wrong one.
+  const encoded = path.basename(dir);
+  const projectId = decodeClaudeProjectDirName(encoded) ?? encoded;
   for (const file of listJsonl(dir)) {
     let raw: string;
     try { raw = fs.readFileSync(file, "utf8"); }

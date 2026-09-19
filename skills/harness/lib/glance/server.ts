@@ -9,6 +9,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import {
   getScope,
   listSquads,
@@ -32,14 +34,48 @@ import {
   buildRuns,
   getRun,
   diagnoseMindClones,
+  updateEmployeePosition,
+  createEmployeeBelow,
 } from "./data-loader.ts";
 import { startJob, getJob, listJobs, streamJob, cancelJob, isMutatingActive } from "./action-runner.ts";
+import { orcaOpenUrl } from "../../../_shared/lib/orca.ts";
+import { listRuntimes, runtimeAvailable } from "../../../_shared/lib/host-agent-driver.ts";
 import { deriveAgentStates, summarizeStates } from "./agent-state.ts";
-import { paths, invalidatePathsCache } from "../../../_shared/lib/bun-helpers.ts";
+import { readSubsystems } from "./subsystems.ts";
+import { paths, invalidatePathsCache, overridePath } from "../../../_shared/lib/bun-helpers.ts";
 import { readEnvFile, writeEnvFile, setVar, deleteVar, getVar, toMap } from "../../../_shared/lib/env-file.ts";
 import { CONFIG_SCHEMA, getField, isEditableKey, maskSecret } from "./config-schema.ts";
+import {
+  SETTINGS_SCHEMA, SettingsError, engineConfigPath, globalConfigPath, projectConfigPath,
+  requireSpec, resolveAllSettings, resolveSetting, setSetting, settingInfo, unsetSetting,
+  type ResolveOptions, type ResolvedSetting, type SettingScope, type SettingsAudit, type SettingsErrorCode,
+} from "../../../_shared/lib/settings.ts";
 import { validateMindCloneFile, type ValidationResult } from "../../../_shared/lib/mindclone-validator.ts";
+import { mindCloneModule, verifyAll, verifyEntity, type VerifyReport } from "../../../_shared/lib/verify/index.ts";
 import { handleObservabilityRoute } from "./views/observability-handler.ts";
+import { discoverKnownProjects, validateProjectPath } from "./project-discovery.ts";
+import { AgentXCanaryQueue, ConversationService, MaestroTurnQueue, ProjectService, resumeCommand, type Conversation, type GlanceAgentXCanaryAdapter, type GlanceExecutionRunner, type MessageRouter, type TurnView } from "../control-plane/index.ts";
+import { createRun as createKernelRun, getRun as getKernelRun, listEvents as listKernelEvents, openKernel } from "../run-kernel/index.ts";
+import { getGauntlet, listCandidateRevisions, listScorecards, projectMultiTargetRun } from "../gauntlet/index.ts";
+// The same Bearer-token store `nrv serve` already ships (sha256-at-rest, timing-safe compare,
+// `nrv serve keygen`/`keys`) — one credential system for both HTTP surfaces of the engine,
+// never a second one invented here for the cockpit.
+import { authenticate as authenticateApiKey } from "../serve/auth.ts";
+
+/**
+ * A gate report in the shape the mind-clone validation routes have always
+ * answered in (`ok` / `errors` / `warnings`, each issue `{code, message,
+ * path?}`). Baselined findings are recorded debt, not a failure of this run.
+ */
+function gateIssues(r: VerifyReport): { ok: boolean; errors: ValidationResult["errors"]; warnings: ValidationResult["warnings"] } {
+  const issue = (f: VerifyReport["findings"][number]) => ({ code: f.id, message: f.message, ...(f.where ? { path: f.where } : {}) });
+  const live = r.findings.filter(f => !f.baselined);
+  return {
+    ok: r.exit_code === 0,
+    errors: live.filter(f => f.severity === "error").map(issue),
+    warnings: live.filter(f => f.severity === "warning").map(issue),
+  };
+}
 
 const VIEWS_DIR = path.dirname(import.meta.path) + "/views";
 // Runtime state lives in the engine's own home, never in a runtime's dir.
@@ -54,12 +90,23 @@ const STARTED_AT = Date.now();
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
 
-interface ServerOptions {
+export interface ServerOptions {
   port: number | "auto";
   open: boolean;
   idleMin: number;
   allowActions: boolean;  // future use; default false
   theme: "apple" | "apple-dark" | "awwwards";
+  agentXCanaryAdapter?: GlanceAgentXCanaryAdapter;
+  // Child-process execution of adopted-project Messages; wins over the in-process adapter.
+  executionRunner?: GlanceExecutionRunner;
+  // The agentic router a Message without an explicit target goes through before its Run is
+  // prepared (business, then squad, then agent-x); absent, such a Message stays on agent-x.
+  messageRouter?: MessageRouter;
+  // Bind address. Default (or any loopback spelling) keeps today's local, unauthenticated
+  // cockpit. Anything else is a served instance: every request needs a Bearer credential
+  // (`nrv serve keygen --glance`) and the process becomes bound to one tenant — see
+  // `isLoopback` below.
+  host?: string;
 }
 
 // ─── Setup copy helper (used by /api/setup/copy-batch and /api/setup/copy-stream) ───
@@ -204,6 +251,10 @@ function methodNotAllowed(): Response {
 }
 
 function openBrowser(url: string) {
+  // Inside Orca the cockpit opens in the app's embedded browser, scoped to the
+  // enclosing workspace; anywhere else (or if that tab cannot be created) the
+  // system browser is the same as always.
+  try { if (orcaOpenUrl(url)) return; } catch { /* fall through to the system browser */ }
   const platform = process.platform;
   const cmd = platform === "darwin" ? "open"
             : platform === "win32" ? "start ''"
@@ -228,9 +279,220 @@ function findFreePort(start = 3737, attempts = 50): number {
   return Math.floor(Math.random() * (65535 - 49152)) + 49152;
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
 export async function startServer(opts: ServerOptions) {
-  const port = opts.port === "auto" ? findFreePort() : opts.port;
-  const url = `http://localhost:${port}`;
+  const port = opts.port === "auto" || opts.port === 0 ? findFreePort() : opts.port;
+  const host = opts.host || "127.0.0.1";
+  // Loopback (the default) is the local, unauthenticated cockpit — unchanged from before this
+  // flag existed. Any other bind address is a *served* instance: the machine's local case must
+  // never become hostile, so the boundary that turns on authentication and tenant-scoped logs
+  // is exactly the boundary that already turns on network exposure, never a second flag to
+  // remember to set.
+  const isLoopback = LOOPBACK_HOSTS.has(host);
+  const url = `http://${isLoopback ? "localhost" : host}:${port}`;
+  const projectRoot = path.resolve(process.env.NIRVANA_PROJECT_ROOT || process.cwd());
+  // Live project root: reflects `POST /api/actions/switch-project` without a restart.
+  // `resolveScope()` (via `getScope()`) already re-reads `process.env.NIRVANA_PROJECT_ROOT`
+  // fresh on every call (scope.ts's own doc comment) — switching writes that env var, so this
+  // getter sees the new root on the very next call. The `projectRoot` const above stays frozen
+  // by closure at boot on purpose (it seeds controlPlaneDb/kernelDb/maestroTurns, which are NOT
+  // part of this cut — see the brief's explicit out-of-scope note); every request-handler call
+  // site that must reflect a live switch reads `currentProjectRoot()` instead. Falls back to the
+  // boot-time root on the same terms every other `scope.projectRoot || ...` site in this file
+  // already uses (global scope with no marker up the cwd tree).
+  const currentProjectRoot = (): string => getScope().projectRoot || projectRoot;
+  const controlPlaneDb = path.join(projectRoot, ".nirvana", "control-plane.sqlite");
+  const kernelDb = path.join(projectRoot, ".nirvana", "run-kernel.sqlite");
+  const projectService = new ProjectService();
+  let conversations: ConversationService | null = null;
+  let kernel: ReturnType<typeof openKernel> | null = null;
+  const conversationService = () => conversations ||= new ConversationService(controlPlaneDb);
+  const kernelService = () => kernel ||= openKernel(kernelDb);
+  let canaryQueue: AgentXCanaryQueue | null = null;
+  const agentXQueue = () => canaryQueue ||= new AgentXCanaryQueue(kernelService(), conversationService(), opts.agentXCanaryAdapter, opts.executionRunner, { router: opts.messageRouter });
+  const projectInspection = () => projectService.inspect(projectRoot);
+  // The maestro turns of the canonical chat (control-plane/maestro-turn.ts): a Message with
+  // `mode: "turn"` (the default) is one turn of the project's runtime session, not a Run.
+  let turnQueue: MaestroTurnQueue | null = null;
+  const maestroTurns = () => turnQueue ||= new MaestroTurnQueue(conversationService(), { projectRoot });
+  const turnPayload = (turn: TurnView) => ({ ...turn, events_url: `/api/v1/conversations/${encodeURIComponent(turn.conversation_id)}/turns/${encodeURIComponent(turn.turn_id)}/events` });
+  const sessionPayload = (conversation: Pick<Conversation, "session_id" | "session_runtime">) => ({
+    session_id: conversation.session_id ?? null, session_runtime: conversation.session_runtime ?? null,
+    resume_command: conversation.session_id && conversation.session_runtime ? resumeCommand(conversation.session_runtime as any, conversation.session_id) : null,
+  });
+  // The turn's events as SSE (`id: <sequence>`, `data: {t: tok|tool|run|done}`): a reconnection with
+  // Last-Event-ID replays from there; the stream closes after `done`.
+  const streamTurnEvents = (req: Request, turnId: string): Response => {
+    const after = Math.max(0, Number(req.headers.get("last-event-id") || "0"));
+    let unsubscribe: (() => void) | null = null;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        const close = () => { if (heartbeat) clearInterval(heartbeat); heartbeat = null; unsubscribe?.(); try { controller.close(); } catch {} };
+        heartbeat = setInterval(() => { try { controller.enqueue(encoder.encode(": heartbeat\n\n")); } catch { close(); } }, 5_000);
+        unsubscribe = maestroTurns().subscribe(turnId, after, (sequence, event) => {
+          try { controller.enqueue(encoder.encode(`id: ${sequence}\ndata: ${JSON.stringify(event)}\n\n`)); } catch {}
+          if (event.t === "done") close();
+        });
+      },
+      cancel() { if (heartbeat) clearInterval(heartbeat); unsubscribe?.(); },
+    });
+    return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+  };
+
+  const problem = (status: number, title: string, detail: string) => new Response(JSON.stringify({
+    type: "about:blank", title, status, detail, correlation_id: `cor_${crypto.randomUUID()}`,
+  }), { status, headers: { "content-type": "application/problem+json", "cache-control": "no-store" } });
+  /**
+   * `GET /api/v1/verify/<kind>/<slug>` — one entity's admission report.
+   *
+   * Read-only by construction: no `--fix`, no `--record`, and the self-
+   * retrieval axis is off (it needs the BM25 index and is the one axis that
+   * can take a second). Repair is a separate, mutating, confirmed action
+   * (`POST /api/actions/verify-fix`).
+   */
+  const verifyRead = async (kind: string, slug: string): Promise<Response> => {
+    const timeoutMs = Number(process.env.NIRVANA_GLANCE_VERIFY_TIMEOUT_MS || 20_000);
+    const script = path.join(SKILLS_ROOT, "_shared", "scripts", "verify.ts");
+    if (!fs.existsSync(script)) return problem(501, "Gate unavailable", `the admission gate is not installed at ${script}`);
+    let child: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      child = Bun.spawn([process.env.NIRVANA_BUN || "bun", script, kind, slug, "--json", "--no-retrieval"], {
+        env: { ...process.env, NO_COLOR: "1" }, stdout: "pipe", stderr: "pipe",
+      });
+      const proc = child;
+      const finished = (async () => ({ code: await proc.exited, out: await new Response(proc.stdout).text(), err: await new Response(proc.stderr).text() }))();
+      const timedOut = Symbol("timeout");
+      const timer = new Promise<typeof timedOut>((r) => setTimeout(() => r(timedOut), timeoutMs));
+      const outcome = await Promise.race([finished, timer]);
+      if (outcome === timedOut) {
+        try { proc.kill(); } catch { /* already gone */ }
+        return problem(504, "Verify timed out", `the admission gate did not finish in ${timeoutMs}ms for ${kind} ${slug}`);
+      }
+      const { code, out, err } = outcome as { code: number; out: string; err: string };
+      // 64 is the gate's EX_USAGE: an unknown entity, not a server fault.
+      if (code === 64) return problem(404, "Unknown entity", (err || out).trim().slice(0, 400) || `no ${kind} named ${slug}`);
+      try {
+        return json(JSON.parse(out));
+      } catch {
+        return problem(502, "Verify failed", (err || out).trim().slice(0, 400) || `the admission gate exited ${code} with no report`);
+      }
+    } catch (e) {
+      try { child?.kill(); } catch { /* already gone */ }
+      return problem(502, "Verify failed", (e as Error).message);
+    }
+  };
+
+  const validId = (value: string, prefix: string) => new RegExp(`^${prefix}_[A-Za-z0-9-]+$`).test(value);
+  const writeAuthorized = (req: Request): Response | null => {
+    if (!opts.allowActions) return problem(403, "Forbidden", "Glance actions are disabled");
+    const origin = req.headers.get("origin");
+    if (origin && origin !== url && origin !== `http://127.0.0.1:${port}`) return problem(403, "Forbidden", "Origin is not allowed");
+    if (!req.headers.get("idempotency-key")) return problem(400, "Missing idempotency key", "Idempotency-Key is required for writes");
+    return null;
+  };
+
+  // ─── Settings (the settings core, _shared/lib/settings.ts) ───
+  // The project layer is this server's projectRoot: the root the execution runner spawns
+  // children with, so what the panel shows is what the next child receives. The runner
+  // resolves at every spawn and the core invalidates its file cache on every write, so a
+  // change here holds for the next dispatch without a restart. Writes audit
+  // `x_settings_changed` with `actor: "glance"` through the same lib/audit.js the CLI uses,
+  // anchored on the project's harness log.
+  const settingsAudit: SettingsAudit = (event, payload) => {
+    try { createRequire(import.meta.url)("../audit.js").emit(event, { ...payload, actor: "glance" }, { cwd: projectRoot }); }
+    catch (error) { console.error(`[glance] audit not written (${(error as Error).message})`); }
+  };
+  const settingsResolveOptions = (): ResolveOptions => ({ env: process.env, projectRoot });
+  const settingValueView = (resolved: ResolvedSetting) => ({
+    value: resolved.value, source: resolved.source, path: resolved.path ?? null,
+    variable: resolved.variable ?? null, raw: resolved.raw ?? null, locked: resolved.source === "env",
+  });
+  const settingsPayload = () => {
+    const values: Record<string, ReturnType<typeof settingValueView>> = {};
+    for (const resolved of resolveAllSettings(settingsResolveOptions())) values[resolved.key] = settingValueView(resolved);
+    const fileInfo = (file: string | null) => ({ path: file, exists: !!file && fs.existsSync(file) });
+    return {
+      schema: SETTINGS_SCHEMA.map(settingInfo), values,
+      files: { project: fileInfo(projectConfigPath(projectRoot)), global: fileInfo(globalConfigPath(process.env)), engine: fileInfo(engineConfigPath(process.env)) },
+      allow_actions: opts.allowActions,
+    };
+  };
+  const SETTINGS_ERROR_STATUS: Record<SettingsErrorCode, [number, string]> = {
+    unknown_key: [404, "Unknown setting"], invalid_value: [400, "Invalid value"], scope: [400, "Scope not accepted"],
+    no_project: [400, "No project"], pinned_by_env: [409, "Setting pinned by the environment"],
+    invalid_file: [409, "Config file unreadable"], invalid_env: [409, "Environment variable invalid"],
+  };
+  const settingsProblem = (error: unknown): Response => {
+    if (!(error instanceof SettingsError)) throw error;
+    const [status, title] = SETTINGS_ERROR_STATUS[error.code];
+    return problem(status, title, error.message);
+  };
+  // Idempotency for settings writes: the same Idempotency-Key with the same request replays
+  // the stored response without a second write (or a second audit event); the same key with
+  // another request is refused. Only successful writes are stored: a refusal wrote nothing,
+  // so repeating it after fixing the cause must run again. In-memory, like the server.
+  const settingsReplays = new Map<string, { fingerprint: string; response: Response }>();
+  const settingsWrite = async (req: Request, fingerprint: string, run: () => Response): Promise<Response> => {
+    const key = req.headers.get("idempotency-key")!;
+    const stored = settingsReplays.get(key);
+    if (stored) {
+      if (stored.fingerprint === fingerprint) return stored.response.clone();
+      return problem(409, "Idempotency key reused", "Idempotency-Key was already used for a different settings request");
+    }
+    const response = run();
+    if (response.ok) {
+      if (settingsReplays.size >= 500) settingsReplays.delete(settingsReplays.keys().next().value!);
+      settingsReplays.set(key, { fingerprint, response: response.clone() });
+    }
+    return response;
+  };
+  const settingScope = (value: unknown): SettingScope | null => (value === "project" || value === "global" ? value : null);
+
+  // ─── Tenancy + retention (served instances only) ───────────────────────
+  // Tenant = the projectRoot this process is bound to (resolved once, above — already true
+  // structurally for controlPlaneDb/kernelDb). paths.js already project-scopes
+  // HARNESS_LOGS_DIR/MAESTRO_LOGS_DIR on its own WHEN a project root is present at the moment
+  // it first resolves (module load, before startServer runs) — but that resolution is a plain
+  // object computed ONCE at require time (paths.js's own comment says so) and never
+  // re-evaluated; a later process.env write plus invalidatePathsCache() does not reach it,
+  // because require() hands back the same frozen object out of the module cache (the trap
+  // skills/harness/tests/helpers/engine-log-dirs.ts documents and works around for tests).
+  // `overridePath()` is that same in-place-mutation technique, for a production caller: it pins
+  // this tenant's own project directory as the log root regardless of what was resolved before
+  // (covers the case where startServer's own projectRoot — process.env.NIRVANA_PROJECT_ROOT
+  // verbatim, no marker walk — disagrees with paths.js's cwd-walked one, e.g. launched from a
+  // project subdirectory). The env var is pinned too, for log-paths.ts/audit.js's readers,
+  // which DO re-check process.env on every call. Both restored on `close()` so a host starting
+  // several servers in one process never leaks one tenant's pin into the next.
+  const previousHarnessLogsDir = process.env.HARNESS_LOGS_DIR;
+  const previousMaestroLogsDir = process.env.MAESTRO_LOGS_DIR;
+  const previousPathsHarnessLogsDir = paths.HARNESS_LOGS_DIR;
+  const previousPathsMaestroLogsDir = paths.MAESTRO_LOGS_DIR;
+  if (!isLoopback) {
+    const tenantHarnessLogsDir = path.join(projectRoot, ".nirvana", "logs", "harness");
+    const tenantMaestroLogsDir = path.join(projectRoot, ".nirvana", "logs", "maestro");
+    process.env.HARNESS_LOGS_DIR = tenantHarnessLogsDir;
+    process.env.MAESTRO_LOGS_DIR = tenantMaestroLogsDir;
+    overridePath("HARNESS_LOGS_DIR", tenantHarnessLogsDir);
+    overridePath("MAESTRO_LOGS_DIR", tenantMaestroLogsDir);
+    // Retention: configurable (`audit.project_retention_days`, settings-schema.ts), default 365
+    // carried over from the declared-but-never-wired HarnessConfigSchema.audit default — not a
+    // new policy. Only the served case is auto-rotated here: deleting a laptop owner's own
+    // history as a side effect of an unrelated cut is exactly what "do not break the local
+    // case" warns against, and the brief's LGPD/filing-deadline scenario is about the served
+    // deployment. The owner sets the real value for their obligation via
+    // `nrv config set audit.project_retention_days <n> --scope project`; this default is a
+    // personal-use number, not a compliance recommendation.
+    try {
+      const days = resolveSetting("audit.project_retention_days", settingsResolveOptions()).value as number;
+      const { rotate } = createRequire(import.meta.url)("../audit.js");
+      const { deleted } = rotate(days);
+      if (deleted.length) settingsAudit("x_retention_rotated", { retention_days: days, deleted_count: deleted.length });
+    } catch (error) { console.error(`[glance] retention rotation skipped (${(error as Error).message})`); }
+  }
 
   // Write PID file (auto-cleanup on exit)
   try {
@@ -240,13 +502,237 @@ export async function startServer(opts: ServerOptions) {
 
   const server = Bun.serve({
     port,
-    // Bind to loopback only: the cockpit (with actions) stays restricted to this
-    // machine, never exposed to the LAN by default.
-    hostname: "127.0.0.1",
+    // Loopback by default: the cockpit (with actions) stays restricted to this machine, never
+    // exposed to the LAN unless `--host` says so explicitly (see `isLoopback` above).
+    hostname: host,
     async fetch(req) {
       bumpActivity();
+      // Authentication boundary = the bind host, not a separate flag: a served instance (any
+      // non-loopback host) refuses every request — API, static assets, SSE, everything — until
+      // it carries a valid credential. `authenticate()` is the exact function `nrv serve`'s job
+      // API already gates on; a key only clears this check when minted with `--glance`
+      // (`ApiKeyRecord.glance`, additive field in serve/auth.ts) — a job-API key does not
+      // silently become a cockpit key. Read vs. write inside Glance stays governed by the
+      // existing per-process `allowActions` (`--read-only`) flag, not per-key: Glance is one
+      // operator's own cockpit, not a multi-caller API, so a single access bit plus the
+      // existing process-level flag is enough; per-key read/write scoping is cut 7's problem,
+      // where many distinct external callers actually need different grants.
+      if (!isLoopback) {
+        const key = authenticateApiKey(req);
+        if (!key || !key.glance) {
+          return problem(401, "Unauthorized", "this Glance instance is bound beyond localhost; Authorization: Bearer <token from `nrv serve keygen --glance`> is required");
+        }
+      }
       const u = new URL(req.url);
       const p = u.pathname;
+
+      // Canonical project control plane. Legacy routes below remain available
+      // as read fallbacks while callers migrate projection by projection.
+      if (p.startsWith("/api/v1/")) {
+        if (req.method !== "GET") {
+          const denied = writeAuthorized(req);
+          if (denied) return denied;
+        }
+        if (p === "/api/v1/projects" && req.method === "GET") {
+          const inspection = projectInspection();
+          // `missing` means the root this Glance serves is not on disk: nothing was
+          // inspected, so neither list was measured and both answer `null`. A
+          // `directory` or a `legacy` root WAS inspected and holds no canonical
+          // project, which is a real zero and stays `[]`.
+          if (inspection.kind === "missing") return json({ projects: null, legacy: null });
+          return json({ projects: inspection.kind === "project" ? [inspection.project] : [], legacy: inspection.kind === "legacy" ? [inspection.plan] : [] });
+        }
+        if (p === "/api/v1/capabilities" && req.method === "GET") {
+          return json({ permissions: {
+            "project.read": true, "conversation.read": true, "run.read": true,
+            "project.create": opts.allowActions, "project.adopt": opts.allowActions,
+            "conversation.write": opts.allowActions, "run.prepare": opts.allowActions,
+            "tool.execute.shell": false,
+          } });
+        }
+        if (p === "/api/v1/projects/plan" && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          if (body.relative_root && (path.isAbsolute(body.relative_root) || body.relative_root.includes(".."))) return problem(400, "Invalid path", "relative_root must be confined to the Glance workspace");
+          const root = currentProjectRoot();
+          const target = path.resolve(root, body.relative_root || ".");
+          if (target !== root && !target.startsWith(root + path.sep)) return problem(400, "Invalid path", "project path escapes the workspace");
+          return json(projectService.planCreate({ projectRoot: target, displayName: body.display_name, scope: body.scope, orchestrationMode: body.orchestration_mode }));
+        }
+        if (p === "/api/v1/projects" && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          const relative = body.relative_root || ".";
+          if (path.isAbsolute(relative) || relative.includes("..")) return problem(400, "Invalid path", "relative_root must be confined to the Glance workspace");
+          const project = projectService.create({ projectRoot: path.resolve(currentProjectRoot(), relative), displayName: body.display_name, scope: body.scope, orchestrationMode: body.orchestration_mode }, body.plan_hash);
+          return json(project, 201);
+        }
+        if (p === "/api/v1/projects:adopt" && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          if (!body.plan_hash) return problem(400, "Missing plan hash", "Adoption requires a preview plan_hash");
+          const project = projectService.adopt({ projectRoot: currentProjectRoot(), displayName: body.display_name, scope: body.scope, orchestrationMode: body.orchestration_mode }, body.plan_hash);
+          return json(project, 201);
+        }
+        const projectMatch = p.match(/^\/api\/v1\/projects\/(prj_[A-Za-z0-9-]+)$/);
+        if (projectMatch && req.method === "GET") {
+          const inspection = projectInspection();
+          return inspection.kind === "project" && inspection.project?.project_id === projectMatch[1] ? json(inspection.project) : notFound("project not found");
+        }
+        const conversationsMatch = p.match(/^\/api\/v1\/projects\/(prj_[A-Za-z0-9-]+)\/conversations$/);
+        if (conversationsMatch && req.method === "GET") return json({ conversations: conversationService().list(conversationsMatch[1]) });
+        if (conversationsMatch && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          return json(conversationService().create(conversationsMatch[1], body.title), 201);
+        }
+        const conversationMatch = p.match(/^\/api\/v1\/conversations\/(cnv_[A-Za-z0-9-]+)$/);
+        if (conversationMatch && req.method === "GET") {
+          const conversation = conversationService().get(conversationMatch[1]);
+          if (!conversation) return notFound("conversation not found");
+          const active = maestroTurns().activeFor(conversationMatch[1]);
+          return json({ ...conversation, session: sessionPayload(conversation), active_turn: active ? turnPayload(active) : null, messages: conversationService().messages(conversationMatch[1]) });
+        }
+        const turnMatch = p.match(/^\/api\/v1\/conversations\/(cnv_[A-Za-z0-9-]+)\/turns\/(trn_[A-Za-z0-9-]+)(\/events|:cancel)?$/);
+        if (turnMatch) {
+          const turn = maestroTurns().get(turnMatch[2]);
+          if (!turn || turn.conversation_id !== turnMatch[1]) return notFound("turn not found");
+          if (turnMatch[3] === ":cancel" && req.method === "POST") {
+            const body = await req.json().catch(() => ({})) as any;
+            if (body.project_id !== turn.project_id) return problem(400, "Invalid project", "project_id must name the turn's project");
+            const result = maestroTurns().cancel(turn.project_id, turn.turn_id);
+            return result.accepted ? json(result, 202) : problem(409, "Cancellation not accepted", `Turn state is ${result.state}`);
+          }
+          if (turnMatch[3] === "/events" && req.method === "GET") return streamTurnEvents(req, turn.turn_id);
+          if (!turnMatch[3] && req.method === "GET") return json(turnPayload(turn));
+        }
+        const messagesMatch = p.match(/^\/api\/v1\/conversations\/(cnv_[A-Za-z0-9-]+)\/messages$/);
+        if (messagesMatch && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          if (!validId(body.project_id || "", "prj")) return problem(400, "Invalid project", "project_id is required");
+          try {
+            const idempotencyKey = req.headers.get("idempotency-key")!;
+            const messageId = `msg_${createHash("sha256").update(`${messagesMatch[1]}:${idempotencyKey}`).digest("hex").slice(0, 24)}`;
+            const message = conversationService().append({ conversationId: messagesMatch[1], projectId: body.project_id, role: body.role || "user", content: body.content || "", runId: body.run_id, messageId });
+            if ((body.role || "user") === "user" && body.prepare_run !== false) {
+              const inspection = projectInspection();
+              if (inspection.kind !== "project" || inspection.project?.project_id !== body.project_id) return problem(409, "Project not adopted", "Canonical dispatch requires an adopted project");
+              // `mode: "run"` keeps the Run path (API clients); `"turn"`, the default and what the UI
+              // sends, makes the Message one turn of the project's runtime session.
+              if (body.mode === "run") {
+                const receipt = await agentXQueue().submit({ projectId: body.project_id, conversationId: messagesMatch[1], messageId: message.message_id,
+                  brief: message.content, projectRoot: currentProjectRoot(), idempotencyKey });
+                return json({ message: receipt.message, run: receipt.run, queued: receipt.queued, capability: receipt.capability }, receipt.queued ? 202 : 200);
+              }
+              const receipt = maestroTurns().submit({ projectId: body.project_id, conversationId: messagesMatch[1], messageId: message.message_id, prompt: message.content });
+              const queued = receipt.turn.state !== "unavailable";
+              return json({ message, turn: turnPayload(receipt.turn), session: { ...receipt.session, resume_command: sessionPayload(receipt.session).resume_command },
+                queued, events_url: queued ? turnPayload(receipt.turn).events_url : null }, queued ? 202 : 200);
+            }
+            return json({ message }, 201);
+          }
+          catch (error) { return problem(409, "Message rejected", (error as Error).message); }
+        }
+        if (p === "/api/v1/runs" && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          if (!validId(body.project_id || "", "prj")) return problem(400, "Invalid project", "project_id is required");
+          const runId = body.run_id || `run_${crypto.randomUUID()}`;
+          const target = body.target;
+          if (!target || !["business", "squad", "agent-x"].includes(target.kind)) return problem(400, "Invalid target", "A typed target is required");
+          const run = createKernelRun(kernelService(), { projectId: body.project_id, runId, traceId: body.trace_id || runId, conversationId: body.conversation_id, planId: body.plan_id || `plan_${crypto.randomUUID()}`, target, policySnapshotRef: body.policy_snapshot_ref || "active", actor: { kind: "control-plane", id: "glance" }, correlationId: `cor_${crypto.randomUUID()}`, idempotencyKey: req.headers.get("idempotency-key")! });
+          return json(run, 201);
+        }
+        const runMatch = p.match(/^\/api\/v1\/runs\/(run_[A-Za-z0-9-]+)$/);
+        if (runMatch && req.method === "GET") {
+          const projectId = u.searchParams.get("project_id") || "";
+          const run = validId(projectId, "prj") ? getKernelRun(kernelService(), projectId, runMatch[1]) : null;
+          return run ? json(run) : notFound("run not found");
+        }
+        const cancelMatch = p.match(/^\/api\/v1\/runs\/(run_[A-Za-z0-9-]+):cancel$/);
+        if (cancelMatch && req.method === "POST") {
+          const body = await req.json().catch(() => ({})) as any;
+          if (!validId(body.project_id || "", "prj")) return problem(400, "Invalid project", "project_id is required");
+          const result = agentXQueue().cancel(body.project_id, cancelMatch[1]);
+          return result.accepted ? json(result, 202) : problem(result.state === "not_found" ? 404 : 409, "Cancellation not accepted", `Run state is ${result.state}`);
+        }
+        const gauntletMatch = p.match(/^\/api\/v1\/runs\/(run_[A-Za-z0-9-]+)\/gauntlet$/);
+        if (gauntletMatch && req.method === "GET") {
+          const projectId = u.searchParams.get("project_id") || "";
+          if (!validId(projectId, "prj") && !projectId.startsWith("proj-")) return problem(400, "Invalid project", "project_id is required");
+          const projection = getGauntlet(kernelService(), projectId, gauntletMatch[1]);
+          return projection ? json({ projection,
+            candidates: listCandidateRevisions(kernelService(), projectId, gauntletMatch[1]),
+            scorecards: listScorecards(kernelService(), projectId, gauntletMatch[1]) }) : notFound("gauntlet run not found");
+        }
+        const multiTargetMatch = p.match(/^\/api\/v1\/runs\/(run_[A-Za-z0-9-]+)\/multi-target$/);
+        if (multiTargetMatch && req.method === "GET") {
+          const projectId = u.searchParams.get("project_id") || "";
+          if (!validId(projectId, "prj") && !projectId.startsWith("proj-")) return problem(400, "Invalid project", "project_id is required");
+          if (!getKernelRun(kernelService(), projectId, multiTargetMatch[1])) return notFound("run not found");
+          return json({ projection: projectMultiTargetRun(kernelService(), projectId, multiTargetMatch[1]) });
+        }
+        const eventsMatch = p.match(/^\/api\/v1\/projects\/(prj_[A-Za-z0-9-]+)\/events$/);
+        if (eventsMatch && req.method === "GET") {
+          const after = Math.max(0, Number(u.searchParams.get("after") || "0"));
+          const limit = Math.min(500, Math.max(1, Number(u.searchParams.get("limit") || "100")));
+          const events = listKernelEvents(kernelService(), eventsMatch[1], after).slice(0, limit);
+          return json({ events, next_cursor: events.at(-1)?.sequence || after });
+        }
+        const streamMatch = p.match(/^\/api\/v1\/projects\/(prj_[A-Za-z0-9-]+)\/stream$/);
+        if (streamMatch && req.method === "GET") {
+          let cursor = Math.max(0, Number(req.headers.get("last-event-id") || u.searchParams.get("after") || "0"));
+          let timer: ReturnType<typeof setInterval>;
+          const stream = new ReadableStream({
+            start(controller) {
+              const encoder = new TextEncoder();
+              const pump = () => {
+                for (const event of listKernelEvents(kernelService(), streamMatch[1], cursor)) {
+                  controller.enqueue(encoder.encode(`id: ${event.sequence}\nevent: timeline\ndata: ${JSON.stringify(event)}\n\n`));
+                  cursor = event.sequence;
+                }
+                controller.enqueue(encoder.encode(": heartbeat\n\n"));
+              };
+              pump(); timer = setInterval(pump, 1000);
+            },
+            cancel() { clearInterval(timer); },
+          });
+          return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "connection": "keep-alive" } });
+        }
+        // Settings: GET the schema with the effective value, origin and lock of every key;
+        // PUT { value, scope } sets one key in the file of `scope`; DELETE ?scope= unsets it.
+        if (p === "/api/v1/settings" && req.method === "GET") {
+          const projectId = u.searchParams.get("project_id");
+          if (projectId !== null) {
+            const inspection = projectInspection();
+            if (inspection.kind !== "project" || inspection.project?.project_id !== projectId) return problem(404, "Project not found", "project_id does not name the project this Glance serves");
+          }
+          try { return json(settingsPayload()); } catch (error) { return settingsProblem(error); }
+        }
+        const settingMatch = p.match(/^\/api\/v1\/settings\/([A-Za-z0-9_.-]+)$/);
+        if (settingMatch && (req.method === "PUT" || req.method === "DELETE")) {
+          const key = settingMatch[1];
+          try { requireSpec(key); } catch (error) { return settingsProblem(error); }
+          const body = req.method === "PUT" ? await req.json().catch(() => null) as any : null;
+          if (req.method === "PUT" && (!body || typeof body !== "object" || body.value === undefined)) return problem(400, "Missing value", "PUT /api/v1/settings/<key> requires a JSON body { value, scope }");
+          const scope = settingScope(req.method === "PUT" ? body.scope : u.searchParams.get("scope"));
+          if (!scope) return problem(400, "Invalid scope", "scope must be project or global");
+          const fingerprint = req.method === "PUT" ? `PUT ${key} ${JSON.stringify({ value: body.value, scope })}` : `DELETE ${key} ${scope}`;
+          return settingsWrite(req, fingerprint, () => {
+            try {
+              const options = { ...settingsResolveOptions(), scope, audit: settingsAudit };
+              const change = req.method === "PUT" ? setSetting(key, body.value, options) : unsetSetting(key, options);
+              return json({ ...change, effective: settingValueView(resolveSetting(key, settingsResolveOptions())) });
+            } catch (error) { return settingsProblem(error); }
+          });
+        }
+        // The admission gate, read-only. It runs in a CHILD PROCESS with a
+        // wall-clock timeout, never in this event loop: a verify over a squad
+        // with 600 workflow steps is tens of milliseconds of synchronous fs
+        // work, and the cockpit is single-threaded — one slow entity would
+        // freeze every other panel while it ran. The child also means a crash
+        // in a kind module is a 502, not a dead server.
+        const verifyMatch = p.match(/^\/api\/v1\/verify\/(squad|business|mind-clone)\/([A-Za-z0-9][A-Za-z0-9._-]*)$/);
+        if (verifyMatch && req.method === "GET") return await verifyRead(verifyMatch[1], verifyMatch[2]);
+        if (verifyMatch) return methodNotAllowed();
+
+        return notFound("control-plane route not found");
+      }
 
       // ─── Project-scope filter (?project=<absolute_path>) ────────────────
       // Frontend sends this on Agents/Runs/Cost/Memory/Activity when the user
@@ -270,6 +756,22 @@ export async function startServer(opts: ServerOptions) {
           const pidN = normalizePath(String(ev.project_id));
           if (pidN === projectRootN || pidN.startsWith(projectRootN + "/")) return true;
         }
+        // Business/squad/agent-x dispatches (brief-business.ts / brief-squad.ts /
+        // dispatch.ts) have no "cwd" and their project_id IS the trace_id, not a
+        // filesystem path — so neither check above ever matches them, and every
+        // dispatch this project ever ran disappeared from its own Runs tab.
+        // outputs_dir/outputs_root would be the ideal filesystem signal, but in
+        // practice the emitters don't stamp it on every event. business_slug /
+        // squad_name / target are the fields ONLY a dispatch sets (a plain
+        // interactive-session event never has them) — trusting those is narrow
+        // enough to still exclude a genuinely different project's session (e.g.
+        // one the importer misfiled into this project's own log by running from
+        // the wrong cwd), which carries none of these fields either.
+        if (ev.outputs_dir || ev.outputs_root) {
+          const outN = normalizePath(String(ev.outputs_dir || ev.outputs_root));
+          if (outN === projectRootN || outN.startsWith(projectRootN + "/")) return true;
+        }
+        if (ev.business_slug || ev.squad_name || ev.target) return true;
         return false;
       };
       const filterEventsByProject = (events: any[]): any[] => {
@@ -293,9 +795,13 @@ export async function startServer(opts: ServerOptions) {
 
       // ─── ACTION endpoints (POST) — gated by --allow-actions ───
       if (req.method === "POST" && p.startsWith("/api/actions/")) {
+        if (p === "/api/actions/chat-shell") {
+          return problem(404, "Unsupported command", "The browser control plane does not expose arbitrary shell execution");
+        }
         if (!opts.allowActions) {
           return json({ error: "actions disabled; restart Glance with --allow-actions to enable", action: p }, 403);
         }
+        if (p === "/api/actions/switch-project") return await handleSwitchProject(req, isLoopback);
         return handleAction(req, p, opts);
       }
 
@@ -362,47 +868,59 @@ export async function startServer(opts: ServerOptions) {
         }
       }
 
-      // Validate one or all mind-clones against dna.schema.json + 10-section body rule.
-      // GET /api/mind-clones/validate?cat=01-marketing-copy-vendas&slug=alex-hormozi
-      //   → single-file validation
+      // Validate one or all mind-clones through the admission gate
+      // (skills/_shared/lib/verify — the same criteria `nrv validate
+      // mind-clone` applies). The response keeps `ok`, `errors` and
+      // `warnings` and gains `findings`; a clone the gate cannot resolve as a
+      // directory falls back to the legacy flat persona file.
+      //
+      // GET /api/mind-clones/validate?slug=alex-hormozi[&cat=01-marketing-copy-vendas]
+      //   → one clone
       // GET /api/mind-clones/validate-all
-      //   → batch audit; returns {total, ok, failed, results: [{cat, slug, ok, errors, warnings}]}
+      //   → batch audit; {total, ok, failed, results: [{cat, slug, ok, errors, warnings, findings}]}
       if (p === "/api/mind-clones/validate" && req.method === "GET") {
         const cat = u.searchParams.get("cat") || "";
         const slug = u.searchParams.get("slug") || "";
-        if (!cat || !slug) return json({ error: "cat and slug query params are required" }, 400);
-        const filePath = path.join(paths.DNA_LIBRARY, cat, `${slug}.md`);
-        const v = validateMindCloneFile(filePath);
-        return json({ cat, slug, path: filePath, ...v });
+        if (!slug) return json({ error: "the slug query param is required" }, 400);
+        const dir = mindCloneModule.resolveDir(cat ? path.join(paths.DNA_LIBRARY, cat, slug) : slug)
+          ?? mindCloneModule.resolveDir(path.join(paths.DNA_LIBRARY, slug));
+        if (!dir) {
+          // legacy flat persona file, the only shape the old route knew
+          const filePath = path.join(paths.DNA_LIBRARY, cat, `${slug}.md`);
+          if (!fs.existsSync(filePath)) return json({ error: `unknown mind-clone: ${slug}` }, 404);
+          const v = validateMindCloneFile(filePath);
+          return json({ cat, slug, path: filePath, ...v, findings: [] });
+        }
+        try {
+          const r = await verifyEntity("mind-clone", dir, { retrieval: false, stateDir: null });
+          return json({ cat: cat || path.basename(path.dirname(dir)), slug, path: dir, ...gateIssues(r), findings: r.findings, verdict: r.verdict, debt: r.summary.debt });
+        } catch (e: any) {
+          return json({ error: e?.message ?? String(e) }, 500);
+        }
       }
       if (p === "/api/mind-clones/validate-all" && req.method === "GET") {
         const root = paths.DNA_LIBRARY;
-        const results: any[] = [];
         if (!fs.existsSync(root)) return json({ total: 0, ok: 0, failed: 0, results: [] });
-        for (const cat of fs.readdirSync(root).filter(x => !x.startsWith("."))) {
-          const catDir = path.join(root, cat);
-          try { if (!fs.statSync(catDir).isDirectory()) continue; } catch { continue; }
-          try {
-            for (const f of fs.readdirSync(catDir)) {
-              if (!f.endsWith(".md") || f.startsWith(".")) continue;
-              if (/\.[a-z]{2}(?:-[A-Z]{2})?\.md$/.test(f)) continue;
-              const slug = f.replace(/\.md$/, "");
-              const v = validateMindCloneFile(path.join(catDir, f));
-              results.push({
-                cat, slug,
-                ok: v.ok,
-                error_count: v.errors.length,
-                warning_count: v.warnings.length,
-                errors: v.errors.slice(0, 3),  // truncate for response size
-              });
-            }
-          } catch {}
-        }
-        const okCount = results.filter(r => r.ok).length;
+        // Self-retrieval is off: it would build a BM25 index over the whole
+        // library inside one request. `nrv validate mind-clone --all` covers it.
+        const batch = await verifyAll("mind-clone", { roots: [root], retrieval: false, stateDir: null, emit: null });
+        const results = batch.reports.map((r) => {
+          const g = gateIssues(r);
+          return {
+            cat: path.dirname(r.dir) === root ? "" : path.basename(path.dirname(r.dir)),
+            slug: r.slug,
+            ok: g.ok,
+            error_count: g.errors.length,
+            warning_count: g.warnings.length,
+            errors: g.errors.slice(0, 3),  // truncate for response size
+            findings: r.findings.filter(f => !f.baselined && f.severity !== "info").slice(0, 8),
+          };
+        });
         return json({
           total: results.length,
-          ok: okCount,
-          failed: results.length - okCount,
+          ok: batch.summary.admitted,
+          failed: batch.summary.rejected,
+          debt: batch.summary.debt,
           results,
         });
       }
@@ -863,7 +1381,16 @@ export async function startServer(opts: ServerOptions) {
         return json({
           project: readRules(path.join(projectDir, ".env")),
           global: readRules(path.join(os.homedir(), ".env")),
-          runtimes: ["claude-code", "codex", "gemini-cli", "antigravity-cli", "hermes"],
+          // Derived: this list drives the rules editor's runtime picker and the
+          // chat runtime override. Hand-written, it had four of the nine the
+          // driver ships, so a user on pi/kimi/grok/qwen/opencode could neither
+          // write a USE_ rule for their own CLI nor pick it in the UI.
+          runtimes: [...listRuntimes().map((r) => r.name), "hermes"],
+          // Which of those are actually on this machine. A rule may name a CLI
+          // the user plans to install; an OVERRIDE may not — naming a runtime
+          // that is not here is refused rather than served by another vendor,
+          // so the picker that sets one offers only what is green.
+          runtimes_installed: listRuntimes().map((r) => r.name).filter((n) => runtimeAvailable(n)),
           allow_actions: opts.allowActions,
         });
       }
@@ -980,6 +1507,49 @@ export async function startServer(opts: ServerOptions) {
           return json({ error: e.message }, 400);
         }
       }
+
+      // POST /api/businesses/:slug/employees — add a new position below reportsTo (gated).
+      // Must live above the blanket "non-GET/HEAD -> 405" gate a few lines down, same as
+      // every other mutating route on this page.
+      if (req.method === "POST") {
+        const m = /^\/api\/businesses\/([^/]+)\/employees$/.exec(p);
+        if (m) {
+          if (!opts.allowActions) return json({ error: "actions disabled; restart Glance with --allow-actions to enable" }, 403);
+          try {
+            const body = await req.json() as any;
+            if (!body || typeof body !== "object" || !body.role || !body.reportsTo) {
+              return json({ error: "POST .../employees requires {role, reportsTo, description?}" }, 400);
+            }
+            const r = createEmployeeBelow(decodeURIComponent(m[1]), {
+              role: String(body.role),
+              description: body.description != null ? String(body.description) : undefined,
+              reportsTo: String(body.reportsTo),
+            });
+            return json(r, 201);
+          } catch (e: any) { return json({ error: e.message }, 400); }
+        }
+      }
+      // PUT /api/businesses/:slug/employees/:employeeSlug — edit an existing position's
+      // title/description/DNA/squads, and reparent (reportsTo) when it names a new manager.
+      if (req.method === "PUT") {
+        const m = /^\/api\/businesses\/([^/]+)\/employees\/([^/]+)$/.exec(p);
+        if (m) {
+          if (!opts.allowActions) return json({ error: "actions disabled; restart Glance with --allow-actions to enable" }, 403);
+          try {
+            const body = await req.json() as any;
+            if (!body || typeof body !== "object") return json({ error: "PUT .../employees/:slug requires a JSON body" }, 400);
+            const patch: any = {};
+            if (body.role !== undefined) patch.role = String(body.role);
+            if (body.description !== undefined) patch.description = String(body.description);
+            if (body.reportsTo !== undefined) patch.reportsTo = String(body.reportsTo);
+            if (body.assignedMindClones !== undefined) patch.assignedMindClones = (Array.isArray(body.assignedMindClones) ? body.assignedMindClones : []).map(String);
+            if (body.squadsAuthorized !== undefined) patch.squadsAuthorized = (Array.isArray(body.squadsAuthorized) ? body.squadsAuthorized : []).map(String);
+            const r = updateEmployeePosition(decodeURIComponent(m[1]), decodeURIComponent(m[2]), patch);
+            return json(r);
+          } catch (e: any) { return json({ error: e.message }, 400); }
+        }
+      }
+
       // GET on action endpoints (SSE stream + listing)
       if (req.method === "GET" && p.startsWith("/api/actions/")) {
         if (p === "/api/actions/jobs") return json({ jobs: listJobs(), allow_actions: opts.allowActions, mutating_active: isMutatingActive() });
@@ -1013,6 +1583,12 @@ export async function startServer(opts: ServerOptions) {
         "/components.css": "text/css",
         "/glance.css": "text/css",
         "/glance.js": "application/javascript",
+        "/run-event-labels.js": "application/javascript",
+        "/trajectory-card.js": "application/javascript",
+        "/settings-panel.js": "application/javascript",
+        "/absence.js": "application/javascript",
+        "/subsystem-row.js": "application/javascript",
+        "/panel-layout.js": "application/javascript",
         "/dag-renderer.js": "application/javascript",
         "/org-chart-renderer.js": "application/javascript",
         "/graph-renderer.js": "application/javascript",
@@ -1025,6 +1601,29 @@ export async function startServer(opts: ServerOptions) {
         return new Response(readView(p.slice(1)), { headers: { "content-type": STATIC_ASSETS[p], "cache-control": "no-store" } });
       }
 
+      // ─── Prototype sandbox (owner request, 2026-09-01) ───
+      // Preact + Signals + htm, via an import map, no build step — testing
+      // whether that stack organizes better than the monolithic glance.js
+      // while staying zero-build. Purely additive: never linked from the
+      // real index.html, not part of any shipped release. Same-origin, so
+      // its fetch()/EventSource calls hit the real /api/* routes below with
+      // no CORS setup — this doubles as the answer to "would Bun work fine
+      // as a pure API for a different frontend": yes, unchanged.
+      if (p === "/prototype" || p === "/prototype/" || p === "/prototype/index.html") {
+        const html = readView("prototype/index.html").replaceAll("__ASSET_VER__", assetVersion());
+        return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+      }
+      const PROTOTYPE_ASSETS: Record<string, string> = {
+        "/prototype/app.js": "application/javascript",
+        "/prototype/panel.js": "application/javascript",
+        "/prototype/businesses-panel.js": "application/javascript",
+        "/prototype/agents-panel.js": "application/javascript",
+        "/prototype/debug-hud.js": "application/javascript",
+      };
+      if (PROTOTYPE_ASSETS[p]) {
+        return new Response(readView(p.slice(1)), { headers: { "content-type": PROTOTYPE_ASSETS[p], "cache-control": "no-store" } });
+      }
+
       // ─── API ───
       if (p === "/api/health") {
         return json({
@@ -1032,12 +1631,22 @@ export async function startServer(opts: ServerOptions) {
           version: "1.0.0",
           uptime_ms: Date.now() - STARTED_AT,
           idle_ms: Date.now() - lastActivity,
-          idle_timeout_ms: opts.idleMin * 60_000,
+          idle_timeout_ms: opts.idleMin > 0 ? opts.idleMin * 60_000 : null,
           allow_actions: opts.allowActions,
           scope: getScope(),
         });
       }
       if (p === "/api/scope") return json(getScope());
+
+      // Other Nirvana projects on this machine — for the topnav project switcher.
+      // Read-only (no allowActions gate; discovery has no side effects), same
+      // `.nirvana/`-marker bar `POST /api/actions/switch-project` validates against.
+      if (p === "/api/known-projects" && req.method === "GET") return json({ projects: discoverKnownProjects() });
+
+      // Which engine subsystems are standing. Read-only, no spawn, no network;
+      // a subsystem whose health cannot be determined answers `status: null` and
+      // the view renders `—` rather than a green light nobody measured.
+      if (p === "/api/subsystems") return json({ subsystems: readSubsystems(currentProjectRoot()) });
 
       if (p === "/api/audit/report") {
         const sc = getScope();
@@ -1099,7 +1708,10 @@ export async function startServer(opts: ServerOptions) {
 
       if (p === "/api/projects") {
         let projects = listProjects();
-        if (projectRootN) {
+        // `null` travels: a list that could not be determined cannot be filtered
+        // into an empty one. Filtering it would recreate the very "Projects 0"
+        // this route used to report while runs were executing.
+        if (projects && projectRootN) {
           const lastSeg = (s: string) => (s || "").split("/").filter(Boolean).slice(-1)[0] || s;
           const projectBasename = lastSeg(projectParam).toLowerCase();
           projects = (projects || []).filter((p: any) => {
@@ -1125,8 +1737,8 @@ export async function startServer(opts: ServerOptions) {
         const days = Number(u.searchParams.get("days") || "7");
         const limit = Number(u.searchParams.get("limit") || "100");
         const result = buildRuns({ days, limit });
-        if (projectRootN) {
-          const runs = (result.runs || []).filter((r: any) => eventMatchesProject(r));
+        if (result.runs && projectRootN) {
+          const runs = result.runs.filter((r: any) => eventMatchesProject(r));
           return json({ runs, total: runs.length });
         }
         return json(result);
@@ -1157,7 +1769,7 @@ export async function startServer(opts: ServerOptions) {
                   const events = readTrace(50);
                   const fresh = events.filter((e: any) => (e.id || 0) > lastId).sort((a: any, b: any) => (a.id || 0) - (b.id || 0));
                   for (const ev of fresh) {
-                    controller.enqueue(encoder.encode(`event: event\ndata: ${JSON.stringify(ev)}\n\n`));
+                    controller.enqueue(encoder.encode(`event: timeline\ndata: ${JSON.stringify(ev)}\n\n`));
                     if ((ev.id || 0) > lastId) lastId = ev.id;
                     if (ev.event === "delivered" || ev.event === "cascade_exhausted") {
                       controller.enqueue(encoder.encode(`event: done\ndata: ${JSON.stringify({ final: ev.event })}\n\n`));
@@ -1259,7 +1871,7 @@ export async function startServer(opts: ServerOptions) {
                 const events = readEvents(50);
                 const fresh = events.filter((e: any) => e.id > lastId).reverse();
                 for (const ev of fresh) {
-                  controller.enqueue(encoder.encode(`event: event\ndata: ${JSON.stringify(ev)}\n\n`));
+                  controller.enqueue(encoder.encode(`event: timeline\ndata: ${JSON.stringify(ev)}\n\n`));
                   if (ev.id > lastId) lastId = ev.id;
                 }
                 // heartbeat to keep connection alive
@@ -1315,9 +1927,11 @@ export async function startServer(opts: ServerOptions) {
                 const events = filterEventsByProject(tailJsonlEvents(500));
                 const states = deriveAgentStates(events);
                 const summary = summarizeStates(states);
-                // emit full snapshot every tick (UI re-syncs from this)
+                // The periodic aggregate, not the opening state: `pulse` says which
+                // one this is, so a client can take the first picture without
+                // subscribing to the beat. The UI re-syncs from every pulse.
                 controller.enqueue(encoder.encode(
-                  `event: snapshot\ndata: ${JSON.stringify({ agents: states, summary })}\n\n`
+                  `event: pulse\ndata: ${JSON.stringify({ agents: states, summary })}\n\n`
                 ));
                 // emit delta events for status flips
                 for (const s of states) {
@@ -1536,23 +2150,56 @@ export async function startServer(opts: ServerOptions) {
   });
 
   console.error(`[glance] up on ${url}  (scope=${getScope().mode}, allow_actions=${opts.allowActions}, theme=${opts.theme})`);
-  console.error(`[glance] auto-shutdown after ${opts.idleMin}min idle  ·  Ctrl+C to exit`);
-  if (opts.open) openBrowser(url);
+  console.error(opts.idleMin > 0 ? `[glance] auto-shutdown after ${opts.idleMin}min idle  ·  Ctrl+C to exit` : `[glance] no idle shutdown (--idle-min 0)  ·  Ctrl+C to exit`);
+  if (!isLoopback) console.error(`[glance] served on ${host} — authentication required (Authorization: Bearer <token from \`nrv serve keygen --glance\`>); tenant = ${currentProjectRoot()}`);
+  // A served instance is a VPS process with no display attached to it, most of the time; even
+  // when one exists, opening a browser aimed at a bare non-TLS network address is not this
+  // cut's call to make. Loopback keeps today's behavior unchanged.
+  if (opts.open && isLoopback) openBrowser(url);
 
-  // Idle watchdog
-  const watchdog = setInterval(() => {
-    if (Date.now() - lastActivity > opts.idleMin * 60_000) {
+  // Detaches the queue from its children (tests stop servers without exiting the process;
+  // shutdown() runs it before the server stops, so a child still running is left to the next
+  // server's recovery instead of being settled by a dying one).
+  // The maestro turns have no recovery: a dying server signals them (Ctrl+C in a terminal session).
+  const detach = () => { canaryQueue?.shutdown(); turnQueue?.shutdown(); };
+
+  // Idle watchdog (a running maestro turn keeps the server up; the tab may be closed meanwhile).
+  // Not armed at all when idleMin is 0: a cockpit meant to stay up all day.
+  const watchdog: ReturnType<typeof setInterval> | null = opts.idleMin > 0 ? setInterval(() => {
+    if (Date.now() - lastActivity > opts.idleMin * 60_000 && !turnQueue?.hasActive()) {
       console.error(`[glance] idle ${opts.idleMin}min — shutting down`);
-      shutdown(server, watchdog);
+      shutdown(server, watchdog, detach);
     }
-  }, 30_000);
+  }, 30_000) : null;
 
   // SIGINT cleanup
-  const onSignal = () => { console.error("\n[glance] SIGINT — shutting down"); shutdown(server, watchdog); };
+  const onSignal = () => { console.error("\n[glance] SIGINT — shutting down"); shutdown(server, watchdog, detach); };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
-  return { server, url, port };
+  const inspection = projectInspection();
+  const recovery = inspection.kind === "project" && inspection.project
+    ? agentXQueue().recover(inspection.project.project_id, currentProjectRoot())
+    : { enqueued: [], reattached: [], redispatched: [], skipped: [] };
+
+  // Releases what an embedding host or a test holds through this instance: the queue detaches,
+  // the listener stops, then the kernel and conversation handles close. `server.stop()` alone
+  // leaves both SQLite files open, and an open file cannot be deleted on Windows.
+  const close = () => {
+    try { detach(); } catch {}
+    try { server.stop(true); } catch {}
+    try { kernel?.close(); } catch {}
+    try { conversations?.close(); } catch {}
+    kernel = null; conversations = null;
+    if (!isLoopback) {
+      if (previousHarnessLogsDir === undefined) delete process.env.HARNESS_LOGS_DIR; else process.env.HARNESS_LOGS_DIR = previousHarnessLogsDir;
+      if (previousMaestroLogsDir === undefined) delete process.env.MAESTRO_LOGS_DIR; else process.env.MAESTRO_LOGS_DIR = previousMaestroLogsDir;
+      overridePath("HARNESS_LOGS_DIR", previousPathsHarnessLogsDir);
+      overridePath("MAESTRO_LOGS_DIR", previousPathsMaestroLogsDir);
+    }
+  };
+
+  return { server, url, port, recovery, detach, close };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1607,6 +2254,20 @@ const ACTIONS: Record<string, ActionDef> = {
       return [`${SKILLS}/squads/scripts/activate-squad.ts`, "activate", slug, "--dry-run", "--verbose"];
     },
     mutating: false,
+  },
+  // The repair half of the gate. Mutating (it writes into the entity, with a
+  // backup and an automatic rollback when a fixer makes things worse), so the
+  // panel asks for confirmation before it is ever sent.
+  "verify-fix": {
+    command: "bun",
+    mutating: true,
+    argsBuilder: (b) => {
+      const kind = (b?.kind || "").toString();
+      const slug = (b?.slug || "").toString();
+      if (!["squad", "business", "mind-clone"].includes(kind)) throw new Error("kind must be squad, business or mind-clone");
+      if (!/^[a-z0-9][a-z0-9._-]*$/i.test(slug)) throw new Error("invalid or missing slug");
+      return [`${SKILLS}/_shared/scripts/verify.ts`, kind, slug, "--fix", "--no-retrieval"];
+    },
   },
   "index-squads": {
     command: "bun",
@@ -1717,6 +2378,82 @@ const ACTIONS: Record<string, ActionDef> = {
   },
 };
 
+/**
+ * POST /api/actions/switch-project — live-rebinds this LOOPBACK Glance
+ * instance to a different Nirvana project, no restart required. Local case
+ * only: a served instance (`--host`, `isLoopback === false`) is pinned to
+ * one tenant for its whole life by the tenancy block near the top of
+ * `startServer` — that pin is the isolation guarantee a served,
+ * authenticated, potentially multi-caller instance relies on, so this
+ * action refuses outright when it isn't loopback.
+ *
+ * Mutates `NIRVANA_PROJECT_ROOT` and overrides every `paths.js` key that
+ * resolves under `<project>/.nirvana/` via the exact same `overridePath()`
+ * technique the served-tenancy block already uses
+ * (skills/_shared/lib/bun-helpers.ts:73), just triggered by this user
+ * action instead of at boot. `getScope()`/`resolveScope()` re-read
+ * `process.env.NIRVANA_PROJECT_ROOT` fresh on every call, so `scope.
+ * projectRoot`/`squadDirs`/`businessDirs` (the GLOBAL capability
+ * libraries, e.g. `~/squads`) are live immediately with no extra work —
+ * but `paths.js` resolves its OWN properties once at require time (its own
+ * comment says so) and hands back that frozen object forever after, so
+ * every key `paths.js` derives from `projectPath(sub)` — the registries/
+ * state/logs that live INSIDE a project's own `.nirvana/`, a different
+ * thing from the global capability directories — needs its own
+ * `overridePath()` call or it silently keeps pointing at the OLD project.
+ * This list must stay in sync with every `projectPath(...)` call in
+ * `skills/_shared/lib/paths.js` — verified against it directly while
+ * writing this (2026-08-30): HARNESS_LOGS_DIR, MAESTRO_LOGS_DIR,
+ * BUSINESSES_REGISTRY_PATH, SQUADS_REGISTRY_PATH, ROUTING_DIGEST_PATH,
+ * KEYWORD_ALIASES_PATH, SQUADS_STATE_DIR, STATE_DB, PROJECTS_OUTPUT_DIR.
+ * An earlier version of this fix only overrode the first two — found live,
+ * by switching for real and reading `/api/scope`'s `registries`/`state`
+ * fields back, not by re-reading the diff.
+ */
+async function handleSwitchProject(req: Request, isLoopback: boolean): Promise<Response> {
+  if (!isLoopback) {
+    return json({ error: "switch-project is a local (loopback) action; a served instance is pinned to its tenant for its whole life" }, 403);
+  }
+  let body: any = {};
+  try { body = await req.json(); } catch { /* empty/invalid body — validateProjectPath rejects it below */ }
+
+  const validated = validateProjectPath(body?.project_root);
+  if (!validated.ok) return json({ error: validated.error }, 400);
+
+  const from = getScope().projectRoot;
+  const to = validated.path;
+  const dotNirvana = path.join(to, ".nirvana");
+  // sub-path per key, mirroring paths.js's own `projectPath(sub)` calls exactly.
+  const PROJECT_SCOPED_PATHS: Record<string, string> = {
+    HARNESS_LOGS_DIR: "logs/harness",
+    MAESTRO_LOGS_DIR: "logs/maestro",
+    BUSINESSES_REGISTRY_PATH: ".businesses-registry.json",
+    SQUADS_REGISTRY_PATH: ".squads-registry.json",
+    ROUTING_DIGEST_PATH: ".routing-digest.md",
+    KEYWORD_ALIASES_PATH: ".keyword-aliases.json",
+    SQUADS_STATE_DIR: "state/squads",
+    STATE_DB: "state.db",
+    PROJECTS_OUTPUT_DIR: "outputs",
+  };
+  process.env.NIRVANA_PROJECT_ROOT = to;
+  for (const [key, sub] of Object.entries(PROJECT_SCOPED_PATHS)) {
+    const value = path.join(dotNirvana, sub);
+    // audit.js/log-paths.ts re-check these two specific env vars on every call; everything
+    // else (including these same two, for OTHER readers) reads the frozen `paths.js` object
+    // overridePath() mutates in place — set both so no reader is left on the old project.
+    if (key === "HARNESS_LOGS_DIR" || key === "MAESTRO_LOGS_DIR") process.env[key] = value;
+    overridePath(key, value);
+  }
+
+  try {
+    createRequire(import.meta.url)("../audit.js").emit("x_glance_project_switched", { from, to, actor: "glance" }, { cwd: to });
+  } catch (error) {
+    console.error(`[glance] audit not written (${(error as Error).message})`);
+  }
+
+  return json({ ok: true, from, to, scope: getScope() });
+}
+
 async function handleAction(req: Request, p: string, opts: any): Promise<Response> {
   const name = p.replace(/^\/api\/actions\//, "");
   if (name === "jobs") return methodNotAllowed();
@@ -1787,9 +2524,13 @@ function streamJobSSE(req: Request, id: string): Response {
   });
 }
 
-function shutdown(server: any, watchdog: ReturnType<typeof setInterval>) {
-  clearInterval(watchdog);
+/** Orderly stop: the execution queue detaches first, then the server, the pid file and the process.
+ * `exit` and `pidFile` are seams for the unit test; production passes only the first three. */
+export function shutdown(server: { stop(closeActiveConnections?: boolean): void }, watchdog: ReturnType<typeof setInterval> | null,
+  detach: () => void = () => {}, exit: (code: number) => void = code => process.exit(code), pidFile: string = PID_FILE): void {
+  if (watchdog) clearInterval(watchdog);
+  try { detach(); } catch {}
   try { server.stop(true); } catch {}
-  try { fs.unlinkSync(PID_FILE); } catch {}
-  process.exit(0);
+  try { fs.unlinkSync(pidFile); } catch {}
+  exit(0);
 }

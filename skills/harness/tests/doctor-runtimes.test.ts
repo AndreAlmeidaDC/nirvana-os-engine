@@ -36,7 +36,10 @@ describe("listRuntimes is the roster, verbatim", () => {
       // runtimeAvailable resolves through RUNTIME_BINS; the probe command it
       // builds must target the same binary the adapter declares. Read the
       // mapping straight from the source to compare without exporting it.
-      const src = readFileSync(join(import.meta.dir, "..", "..", "_shared", "lib", "host-agent-driver.ts"), "utf8");
+      const whole = readFileSync(join(import.meta.dir, "..", "..", "_shared", "lib", "host-agent-driver.ts"), "utf8");
+      // Anchor on the literal itself: other Record<Runtime, …> tables (the
+      // directory-grant flags) use the same key spelling and sit earlier.
+      const src = whole.slice(whole.indexOf("const RUNTIME_BINS"));
       const m = src.match(new RegExp(`"${rt.name}":\\s*"([^"]+)"`));
       expect(m, `RUNTIME_BINS has no entry for ${rt.name}`).toBeTruthy();
       expect(m![1]).toBe(rt.cli);
@@ -48,7 +51,11 @@ describe("the doctor consumes the roster instead of copying it", () => {
   const src = readFileSync(DOCTOR, "utf8");
 
   test("it imports and iterates listRuntimes", () => {
-    expect(src).toContain('import { listRuntimes }');
+    // Matched as a named import rather than as an exact line: the doctor also
+    // pulls `whichSync` from the same module (its own `which` used the POSIX-only
+    // binary and reported every runtime missing on Windows), and pinning the
+    // literal made an unrelated import look like roster drift.
+    expect(src).toMatch(/import \{[^}]*\blistRuntimes\b[^}]*\} from "\.\.\/\.\.\/_shared\/lib\/host-agent-driver\.ts"/);
     expect(src).toContain("for (const rt of listRuntimes())");
   });
 

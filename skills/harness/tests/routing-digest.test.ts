@@ -12,9 +12,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
+import { getSettingSpec, resolveSetting } from "../../_shared/lib/settings.ts";
 import {
   buildDigest, buildKeywordAliases, splitKeywordGroups, foldKey, detectLang,
-  estimateTokens, trunc, TOKEN_BUDGET, loadDigestInput,
+  estimateTokens, trunc, TOKEN_BUDGET, loadDigestInput, configuredTokenBudget,
   type DigestInput,
 } from "../scripts/build-routing-digest.ts";
 
@@ -34,6 +36,9 @@ function fixtureInput(): DigestInput {
           "Quero uma página de vendas para meu curso de fotografia",
         ],
         keywords: ["landing page", "página de destino", "pagina de destino", "sales page", "página de vendas"],
+        // Business-level not_for (Business Protocol 2.0 §6.9). The registry now
+        // carries it, so the digest's `not:` segment finally has an input.
+        not_for: ["fiction ghostwriting", "video promocional"],
       },
       "acme-books": {
         name: "Acme Books",
@@ -48,6 +53,10 @@ function fixtureInput(): DigestInput {
     squads: {
       "squad-a": {
         description: "Delivers landing pages end to end and runs SEO audits on existing pages.",
+        // 11 domains and 7 produces: the digest caps them at 10 and 6, the same
+        // way the business line does.
+        domains: ["design", "engineering", "seo", "copywriting", "analytics", "conversion", "frontend", "content", "research", "accessibility", "extra-domain"],
+        produces: ["landing-page", "seo-report", "copy-deck", "style-guide", "analytics-setup", "sitemap", "extra-artifact"],
         capabilities: ["web.landing.build", "seo.audit.run"],
         example_briefs: ["Preciso de uma landing page premium", "Audit my page for SEO issues"],
       },
@@ -106,6 +115,30 @@ function sectionLines(text: string, section: string): string[] {
   return out;
 }
 
+describe("routing digest — the budget is a knob, and 0 means none", () => {
+  // The budget used to be a constant with no knob. A library that outgrew it
+  // degraded to the last rung in silence, and the only way to keep the digest
+  // whole was to edit the installed file, which the next update reverted.
+  test("an explicit budget is walked and echoed on the result", () => {
+    const tight = buildDigest(fixtureInput(), { budgetTokens: 1, generatedAt: "2026-01-01T00:00:00.000Z" });
+    expect(tight.budget).toBe(1);
+    expect(tight.degradationLevel).toBe(4);
+    expect(tight.overBudget).toBe(true);
+  });
+  test("budget 0 never degrades and is never over budget", () => {
+    const open = buildDigest(fixtureInput(), { budgetTokens: 0, generatedAt: "2026-01-01T00:00:00.000Z" });
+    expect(open.budget).toBe(0);
+    expect(open.degradationLevel).toBe(0);
+    expect(open.overBudget).toBe(false);
+  });
+  test("the configured budget comes from settings, and the default is none", () => {
+    // The default is pinned on the schema, not on this machine's config: an
+    // owner who set a ceiling must not turn this test red.
+    expect(getSettingSpec("routing.digest_token_budget").default).toBe(0);
+    expect(configuredTokenBudget()).toBe(Number(resolveSetting("routing.digest_token_budget").value));
+  });
+});
+
 describe("routing digest — format grammar", () => {
   const r = buildDigest(fixtureInput(), { generatedAt: "2026-01-01T00:00:00.000Z" });
 
@@ -146,10 +179,44 @@ describe("routing digest — format grammar", () => {
     expect(jane).not.toContain("extra-domain"); // 8 declared, 6 kept
   });
 
+  test("business not_for renders as the not: segment (Business Protocol 2.0)", () => {
+    const acme = sectionLines(r.text, "businesses").find((l) => l.startsWith("acme-web"))!;
+    expect(acme).toContain("not: fiction ghostwriting; video promocional");
+    // A business without fences gains no empty segment.
+    const books = sectionLines(r.text, "businesses").find((l) => l.startsWith("acme-books"))!;
+    expect(books).not.toContain("not:");
+  });
+
   test("business produces are capped at top 6", () => {
     const acme = sectionLines(r.text, "businesses").find((l) => l.startsWith("acme-web"))!;
     expect(acme).toContain("analytics-setup");
     expect(acme).not.toContain("extra-artifact"); // 7 declared, 6 kept
+  });
+
+  // The router's own prompt says the OBJECT of a brief — what the entry
+  // produces — decides most of the call, and businesses had been carrying both
+  // segments since Phase 3.1 while squads carried neither. The registry has
+  // aggregated them at squad level all along.
+  test("squad domains are capped at top 10", () => {
+    const squadA = sectionLines(r.text, "squads").find((l) => l.startsWith("squad-a"))!;
+    expect(squadA).toContain("domains: design,engineering,seo,copywriting,analytics,conversion,frontend,content,research,accessibility");
+    expect(squadA).not.toContain("extra-domain"); // 11 declared, 10 kept
+  });
+
+  test("squad produces are capped at top 6", () => {
+    const squadA = sectionLines(r.text, "squads").find((l) => l.startsWith("squad-a"))!;
+    expect(squadA).toContain("produces: landing-page,seo-report,copy-deck,style-guide,analytics-setup,sitemap");
+    expect(squadA).not.toContain("extra-artifact"); // 7 declared, 6 kept
+  });
+
+  test("a squad declaring neither gains no empty segment", () => {
+    const squadB = sectionLines(r.text, "squads").find((l) => l.startsWith("squad-b"))!;
+    expect(squadB).not.toContain("domains:");
+    expect(squadB).not.toContain("produces:");
+  });
+
+  test("the squads section header announces both new segments", () => {
+    expect(r.text).toContain("## squads (slug | description | domains: | produces: top 6 | caps: id — one-liner | ex: briefs | not:)");
   });
 
   test("token estimate is chars/4 and reported", () => {
@@ -233,6 +300,30 @@ describe("routing digest — budget degradation ladder", () => {
     expect(jane.split(" | ")[1].length).toBeLessThanOrEqual(100);
   });
 
+  test("L3 additionally cuts squad produces from 6 to 3 (domains stay)", () => {
+    const l1 = buildDigest(input, { budgetTokens: l0.tokens });
+    const l2 = buildDigest(input, { budgetTokens: l1.tokens });
+    const r = buildDigest(input, { budgetTokens: l2.tokens });
+    expect(r.degradationLevel).toBe(3);
+    const squadA = sectionLines(r.text, "squads").find((l) => l.startsWith("squad-a"))!;
+    expect(squadA).toContain("produces: landing-page,seo-report,copy-deck");
+    expect(squadA).not.toContain("style-guide");
+    expect(squadA).toContain("domains: design,engineering,seo");
+  });
+
+  // The two squad segments cost more than the last rung had left on the
+  // owner's library, so one of them yields there: `produces` is the OBJECT of
+  // the brief and stays, `domains` averages 3.5 labels the description already
+  // implies and goes, the same trade the rung already makes for clones.
+  test("L4 drops squad domains and keeps produces — the entry is never dropped", () => {
+    const r = buildDigest(input, { budgetTokens: 1 });
+    expect(r.degradationLevel).toBe(4);
+    const squadA = sectionLines(r.text, "squads").find((l) => l.startsWith("squad-a"))!;
+    expect(squadA).not.toContain("domains:");
+    expect(squadA).toContain("produces: landing-page,seo-report,copy-deck");
+    expect(squadA).toContain("caps: web.landing.build; seo.audit.run");
+  });
+
   test("entries are NEVER dropped, even hopelessly over budget", () => {
     const r = buildDigest(input, { budgetTokens: 1 });
     expect(r.overBudget).toBe(true);
@@ -245,7 +336,7 @@ describe("routing digest — budget degradation ladder", () => {
   });
 
   test("default budget is the documented 50k", () => {
-    expect(TOKEN_BUDGET).toBe(50_000);
+    expect(TOKEN_BUDGET).toBe(0);
   });
 });
 
@@ -338,7 +429,7 @@ describe("routing digest — CLI against fixture registry files", () => {
       BUILDER, "--businesses", biz, "--squads", sq, "--clones", cl, "--out", out, "--check-budget", "--quiet",
     ], { encoding: "utf8" });
     expect(check.status).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 
   test("fails loudly when no registry is readable", () => {
     const r = spawnSync(process.execPath, [
@@ -349,7 +440,7 @@ describe("routing digest — CLI against fixture registry files", () => {
       "--out", path.join(tmp, "digest.md"),
     ], { encoding: "utf8" });
     expect(r.status).toBe(1);
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("trunc", () => {
@@ -389,7 +480,7 @@ describe("empty library vs unreadable registry", () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("library is empty");
     expect(fs.existsSync(out)).toBe(true);
-  });
+  }, spawnBudgetMs(2));
 
   test("registries that cannot be read still fail, exit 1", () => {
     const r = run([
@@ -400,7 +491,7 @@ describe("empty library vs unreadable registry", () => {
     ]);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("no registry could be read");
-  });
+  }, spawnBudgetMs(2));
 
   test("loadDigestInput reports WHICH registries parsed", () => {
     const input = loadDigestInput({

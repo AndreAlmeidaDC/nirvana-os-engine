@@ -1,0 +1,442 @@
+// verify-fixture.ts — complete entities in a temp root for the admission-gate
+// tests. Every fixture is admitted as built; a test breaks exactly one thing.
+// Nothing here touches the installed library: every path is under mkdtemp and
+// the CLI env redirects HOME-derived roots, state, logs and baselines there.
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
+import { extractSurface, writeSurface, type ArtifactKind } from "../../lib/surface.ts";
+
+export const REPO = path.resolve(import.meta.dir, "..", "..", "..", "..");
+export const VERIFY_CLI = path.join(REPO, "skills", "_shared", "scripts", "verify.ts");
+
+/**
+ * A path as these tests compare it. Windows joins with a backslash, so a suffix
+ * written `<slug>/MANIFEST.yaml` never matches a native path there — the shape
+ * that failed on the Windows runner. Compare through this, never on raw
+ * `path.join` output.
+ */
+export const posixPath = (p: string): string => p.split(path.win32.sep).join(path.posix.sep);
+
+/**
+ * Source text with the line endings the matchers assume. Git for Windows
+ * checks out CRLF by default, and every `\n`-anchored pattern over a repo file
+ * has to survive that.
+ */
+export const lf = (s: string): string => s.replace(/\r\n/g, "\n");
+
+/** The same text as a Windows checkout would hold it. */
+export const crlf = (s: string): string => lf(s).replace(/\n/g, "\r\n");
+
+export function tempRoot(prefix = "nrv-verify-"): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  for (const d of ["home", "state", "logs", "dna", "squads", "businesses", "cwd"]) fs.mkdirSync(path.join(root, d), { recursive: true });
+  return root;
+}
+
+export function cliEnv(root: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    NIRVANA_HOME: path.join(root, "home"),
+    NIRVANA_STATE_DIR: path.join(root, "state"),
+    HARNESS_LOGS_DIR: path.join(root, "logs"),
+    DNA_LIBRARY: path.join(root, "dna"),
+    SQUADS_DIR: path.join(root, "squads"),
+    BUSINESSES_DIR: path.join(root, "businesses"),
+    NIRVANA_SKILLS_DIR: path.join(REPO, "skills"),
+    NIRVANA_NO_UPDATE_CHECK: "1",
+    NIRVANA_SCOPE: "global",
+    ...extra,
+  };
+}
+
+export function runCli(root: string, args: string[], extra: NodeJS.ProcessEnv = {}) {
+  const r = spawnSync(process.execPath, [VERIFY_CLI, ...args], { cwd: path.join(root, "cwd"), env: cliEnv(root, extra), encoding: "utf8" });
+  let json: any = null;
+  if (args.includes("--json")) { try { json = JSON.parse(r.stdout); } catch { json = null; } }
+  return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "", json };
+}
+
+export function writeSurfaceFor(dir: string, kind: ArtifactKind): void {
+  writeSurface(dir, extractSurface(dir, kind));
+}
+
+const DOMAINS = [
+  "tom de voz de marca", "brand tone of voice", "narrativa de marca", "brand narrative", "manifesto de marca", "brand manifesto",
+  "posicionamento", "positioning", "arquétipo de marca", "brand archetype", "slogan", "tagline", "identidade verbal", "verbal identity",
+  "storytelling corporativo", "corporate storytelling", "marca confusa", "ninguém entende o que a empresa faz", "reposicionar a marca",
+  "rebranding", "brand voice guidelines", "guia de voz",
+];
+
+export interface CloneOpts {
+  name?: string;
+  category?: string;
+  routing?: Record<string, unknown> | null;
+  verdict?: string | null;
+  sourceMaterial?: boolean;
+  dnaLayers?: Record<string, number> | null;
+  fonte?: boolean;
+  artifacts?: Array<{ path: string; status?: string }>;
+  surface?: boolean;
+  scores?: Record<string, number> | null;
+  extraManifest?: string;
+}
+
+function yamlList(items: string[], indent = "    "): string {
+  return items.map((d) => `${indent}- ${JSON.stringify(d)}`).join("\n");
+}
+
+/** A complete, admitted mind-clone at <root>/dna/<slug>. */
+export function cloneFixture(root: string, slug: string, o: CloneOpts = {}): string {
+  const dir = path.join(root, "dna", slug);
+  fs.mkdirSync(path.join(dir, "agent"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "dna"), { recursive: true });
+  const routing = o.routing === null ? null : {
+    one_liner: "Jane Doe — the choice for brand tone of voice and verbal identity",
+    domains: DOMAINS,
+    serves: "Choose Jane Doe when a brand needs a verbal identity: tone of voice, manifesto, positioning language.",
+    not_for: "Visual identity and logo design (see a design clone).",
+    refuses: ["logo design"],
+    ...(o.routing ?? {}),
+  };
+  const dnaLayers = o.dnaLayers === null ? null : { L1_philosophies: 3, L2_mental_models: 4, L3_heuristics: 5, L4_frameworks: 3, L5_methodologies: 1, ...(o.dnaLayers ?? {}) };
+  const artifacts = o.artifacts ?? [
+    { path: "agent/AGENT.md", status: "present" }, { path: "agent/SOUL.md", status: "present" },
+    { path: "agent/DNA-CONFIG.yaml", status: "present" }, { path: "dna/dna-schema.md", status: "present" },
+  ];
+  const scores = o.scores === null ? null : { template_compliance: 1.0, source_coverage: 0.9, coherence: 0.85, completeness: 1.0, ...(o.scores ?? {}) };
+  const lines: string[] = [];
+  lines.push("# fixture manifest — this comment must survive a --fix");
+  lines.push("manifest:");
+  lines.push(`  name: ${o.name ?? slug}`);
+  lines.push(`  display_name: "Jane Doe"`);
+  lines.push("  version: 1.0.0");
+  lines.push(`  category: ${o.category ?? "marketing"}`);
+  lines.push("  tags: [brand, voice, storytelling]");
+  lines.push("  compiled_at: \"2026-08-26\"");
+  if (routing) {
+    lines.push("");
+    lines.push("routing:");
+    for (const [k, v] of Object.entries(routing)) {
+      if (v === undefined) continue;
+      if (Array.isArray(v)) { lines.push(`  ${k}:`); lines.push(v.map((x) => `    - ${typeof x === "string" ? JSON.stringify(x) : x}`).join("\n")); }
+      else lines.push(`  ${k}: ${JSON.stringify(v)}`);
+    }
+  }
+  lines.push("");
+  lines.push("artifacts:");
+  for (const a of artifacts) { lines.push(`  - path: ${a.path}`); if (a.status) lines.push(`    status: ${a.status}`); }
+  if (o.sourceMaterial !== false) {
+    lines.push("");
+    lines.push("source_material:");
+    lines.push("  primary:");
+    lines.push(yamlList(["Jane Doe, Brand Voice (2019)", "Jane Doe, talks 2020-2024"]));
+  }
+  if (scores) {
+    lines.push("");
+    lines.push("scores:");
+    for (const [k, v] of Object.entries(scores)) lines.push(`  ${k}: ${v}`);
+  }
+  if (o.verdict !== null) lines.push("", `validation_verdict: ${o.verdict ?? "APPROVED"}`);
+  if (dnaLayers) {
+    lines.push("", "dna_layers:");
+    for (const [k, v] of Object.entries(dnaLayers)) lines.push(`  ${k}: ${v}`);
+  }
+  if (o.extraManifest) lines.push("", o.extraManifest);
+  fs.writeFileSync(path.join(dir, "MANIFEST.yaml"), lines.join("\n") + "\n", "utf8");
+
+  fs.writeFileSync(path.join(dir, "agent", "AGENT.md"), [
+    "---",
+    `name: ${slug}`,
+    'description: "Use quando precisar de identidade verbal de marca. Invocar para: tom de voz, manifesto. NÃO usar para: identidade visual."',
+    "---",
+    "",
+    "# Jane Doe — Mind-Clone",
+    "",
+    "## Identity", "", "A brand voice strategist.", "",
+    "## How You Think", "", "Voice before visuals.", "",
+    "## Frameworks", "", "The verbal identity ladder.", "",
+    "## Limitations", "", "No logo design.", "",
+  ].join("\n"), "utf8");
+  fs.writeFileSync(path.join(dir, "agent", "SOUL.md"), "# SOUL\n\nVoice: warm, precise.\n", "utf8");
+  fs.writeFileSync(path.join(dir, "agent", "DNA-CONFIG.yaml"), "voice:\n  tone: warm\n", "utf8");
+
+  const tag = o.fonte === false ? "" : " ^[FONTE:SOUL.md#V1]";
+  const li = (n: number) => Array.from({ length: n }, (_, i) => `${i + 1}. **Item ${i + 1}.** Statement ${i + 1}.${tag}`).join("\n");
+  const h3 = (n: number, label: string) => Array.from({ length: n }, (_, i) => `### ${label} ${i + 1} — Name\n\nBody ${i + 1}.${tag}`).join("\n\n");
+  fs.writeFileSync(path.join(dir, "dna", "dna-schema.md"), [
+    "# DNA Schema — Jane Doe", "",
+    "## L1 — Philosophies", "", li(3), "",
+    "## L2 — Mental Models", "", li(4), "",
+    "## L3 — Heuristics", "", li(5), "",
+    "## L4 — Frameworks", "", h3(3, "Framework"), "",
+    "## L5 — Methodologies", "", h3(1, "Method"), "",
+  ].join("\n") + "\n", "utf8");
+
+  if (o.surface !== false) writeSurfaceFor(dir, "mind-clone");
+  return dir;
+}
+
+export interface SquadOpts {
+  surface?: boolean;
+  /** Replaces squad.yaml wholesale (the malformed-manifest cases). */
+  manifest?: string;
+  protocol?: string;
+  /** Workflow file name → content. Default: one canonical `main.yaml`. */
+  workflows?: Record<string, string>;
+  /** As authored in `components.workflows` and `invoke.ref`. */
+  workflowComponent?: string;
+  invokeRef?: string;
+  /** Extra YAML lines under the single capability, already indented by 4. */
+  capabilityExtra?: string[];
+}
+
+/** The canonical graph: `steps[]` with `requires`, both refs resolving. */
+export const CANONICAL_WORKFLOW = [
+  "name: main",
+  "description: Plan the artifact, then build it",
+  "steps:",
+  "  - id: plan",
+  "    agent: planner",
+  "    task: plan",
+  "    creates: [plan.md]",
+  "  - id: build",
+  "    agent: builder",
+  "    task: build",
+  "    requires: [plan]",
+  "    on_failure: abort",
+  "success_indicators:",
+  "  - the artifact exists and the build step reports success",
+  "",
+].join("\n");
+
+const squadAgent = (name: string) => [
+  "---", `name: ${name}`, `description: ${name} of the fixture squad`, "maxTurns: 12",
+  "tools: [Read, Write, Edit]", "---", "", `# ${name}`, "", `The ${name} owns one step.`, "",
+].join("\n");
+
+const squadTask = (name: string) => [
+  `# ${name}`, "", `Perform the ${name} step.`, "", "## Acceptance Criteria", "", `- [ ] the ${name} output exists`, "",
+].join("\n");
+
+/** A complete, admitted squad at <root>/squads/<slug>. */
+export function squadFixture(root: string, slug: string, o: SquadOpts = {}): string {
+  const dir = path.join(root, "squads", slug);
+  for (const sub of ["agents", "tasks", "workflows"]) fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  for (const a of ["planner", "builder"]) fs.writeFileSync(path.join(dir, "agents", `${a}.md`), squadAgent(a), "utf8");
+  for (const t of ["plan", "build"]) fs.writeFileSync(path.join(dir, "tasks", `${t}.md`), squadTask(t), "utf8");
+  for (const [file, content] of Object.entries(o.workflows ?? { "main.yaml": CANONICAL_WORKFLOW })) {
+    fs.writeFileSync(path.join(dir, "workflows", file), content, "utf8");
+  }
+  fs.writeFileSync(path.join(dir, "README.md"), `# ${slug}\n\nFixture squad that plans and builds one artifact.\n`, "utf8");
+  fs.writeFileSync(path.join(dir, "dependencies.yaml"), "self_contained: true\n", "utf8");
+  fs.writeFileSync(path.join(dir, "squad.yaml"), o.manifest ?? [
+    `name: ${slug}`,
+    "version: 1.0.0",
+    `protocol: "${o.protocol ?? "5.0"}"`,
+    "description: Fixture squad that plans and builds one artifact",
+    "experimental_domains: true",
+    "components:",
+    "  agents: [planner, builder]",
+    "  tasks: [plan, build]",
+    `  workflows: [${o.workflowComponent ?? "main.yaml"}]`,
+    "capabilities:",
+    "  - id: fixture.artifact.build",
+    "    description: Plans and builds the fixture artifact end to end",
+    "    domains: [fixture_domain]",
+    "    produces: [fixture_artifact]",
+    '    examples: ["build the fixture artifact from a brief"]',
+    '    keywords: [fixture, artifact, build, construir]',
+    "    example_briefs:",
+    '      - "build the fixture artifact from this brief"',
+    '      - "preciso construir o artefato de fixture a partir deste brief"',
+    '      - "make the fixture artifact for our team"',
+    '    not_for: ["logo design", "tax filing", "video editing"]',
+    "    invoke:",
+    "      type: workflow",
+    `      ref: ${o.invokeRef ?? "workflows/main.yaml"}`,
+    ...(o.capabilityExtra ?? []),
+    "",
+  ].join("\n"), "utf8");
+  if (o.surface !== false) writeSurfaceFor(dir, "squad");
+  return dir;
+}
+
+export interface BusinessOpts {
+  surface?: boolean;
+  /** Replaces business.yaml wholesale (the malformed-manifest cases). */
+  manifest?: string;
+  /** Extra YAML appended to business.yaml, already at column 0. */
+  manifestExtra?: string;
+  protocol?: string;
+  /** Seat file name → content. Default: one intake seat, `ceo.md`. */
+  employees?: Record<string, string>;
+  /** Written when given; a business needs no routing.yaml to be admitted. */
+  routing?: string;
+  /** Replaces the derived org-chart.yaml; `null` leaves the file out. */
+  orgChart?: string | null;
+  readme?: string | null;
+  memory?: boolean;
+}
+
+/**
+ * A seat body the sufficiency scorer accepts: headings plus decision lines.
+ * `seat_thin` fires on a body without them, which is a different test.
+ */
+export const SEAT_BODY = [
+  "## Method",
+  "",
+  "- Read the brief twice before writing anything, and name what is missing.",
+  "- Decide the artifact type first; the format follows the decision, never leads it.",
+  "- When two readings of the brief are possible, state both and pick one out loud.",
+  "",
+  "## Thresholds",
+  "",
+  "- Reject a draft whose sources are not named and dated in the text itself.",
+  "- Escalate when the run would cost more than the budget the brief declared.",
+  "- Hand off only when every acceptance criterion of this seat is satisfied.",
+  "",
+].join("\n");
+
+/** The intake seat of the fixture: acceptance, a real body, protocol 2.0 shape. */
+export const INTAKE_SEAT = [
+  "---",
+  "name: ceo",
+  "role: Chief executive of the fixture business",
+  "description: Receives every brief, decides the artifact and hands the work to the seat that owns it.",
+  "type: orchestrator",
+  "is_brief_intake: true",
+  "acceptance:",
+  "  - id: brief_understood",
+  "    description: the deliverable answers the brief that was actually written",
+  "    blocking: true",
+  "    minimum_score: 0.8",
+  "---",
+  "",
+  `# CEO`,
+  "",
+  SEAT_BODY,
+].join("\n");
+
+/** A complete, admitted business at <root>/businesses/<slug>. */
+export function businessFixture(root: string, slug: string, o: BusinessOpts = {}): string {
+  const dir = path.join(root, "businesses", slug);
+  fs.mkdirSync(path.join(dir, "employees"), { recursive: true });
+  const employees = o.employees ?? { "ceo.md": INTAKE_SEAT };
+  for (const [file, content] of Object.entries(employees)) fs.writeFileSync(path.join(dir, "employees", file), content, "utf8");
+
+  fs.writeFileSync(path.join(dir, "business.yaml"), o.manifest ?? [
+    `name: ${slug}`,
+    "version: 1.0.0",
+    `protocol: "${o.protocol ?? "2.0"}"`,
+    "description: Fixture business that turns a written brief into one artifact, decides the format from the brief and hands it back reviewed.",
+    "domains: [fixture_domain]",
+    "produces: [fixture-report]",
+    "keywords: [fixture, report, relatorio, relatório, brief]",
+    "example_briefs:",
+    '  - "turn this brief into the fixture report our team can read"',
+    '  - "preciso do relatório de fixture a partir deste brief"',
+    '  - "write the fixture report and review it before delivery"',
+    'not_for: ["logo design", "tax filing"]',
+    "run_budget_usd: 0",
+    "operation_mode: zero_human",
+    "runtime_requirements:",
+    "  policy: active",
+    ...(o.manifestExtra ? [o.manifestExtra] : []),
+    "",
+  ].join("\n"), "utf8");
+
+  if (o.orgChart !== null) {
+    fs.writeFileSync(path.join(dir, "org-chart.yaml"), o.orgChart ?? [
+      "chart:",
+      ...Object.keys(employees).flatMap((f, i) => {
+        const name = /^name:\s*(\S+)/m.exec(employees[f])?.[1] ?? f.replace(/\.md$/, "");
+        const root_ = i === 0;
+        const children = Object.keys(employees).slice(1).map((c) => /^name:\s*(\S+)/m.exec(employees[c])?.[1] ?? c.replace(/\.md$/, ""));
+        return [
+          `  - employee: ${name}`,
+          `    reports: [${root_ ? "" : (/^name:\s*(\S+)/m.exec(employees[Object.keys(employees)[0]])?.[1] ?? "ceo")}]`,
+          `    direct_reports: [${root_ ? children.join(", ") : ""}]`,
+          "    is_antagonist: false",
+        ];
+      }),
+      "",
+    ].join("\n"), "utf8");
+  }
+  if (o.routing) fs.writeFileSync(path.join(dir, "routing.yaml"), o.routing, "utf8");
+  if (o.readme !== null) {
+    fs.writeFileSync(path.join(dir, "README.md"), o.readme ?? [
+      `# ${slug}`,
+      "",
+      "Fixture business. It exists so the admission gate has something complete to",
+      "compare a broken business against.",
+      "",
+      "## Description",
+      "",
+      "Turns a written brief into one artifact and hands it back reviewed.",
+      "",
+      "## Employees",
+      "",
+      ...Object.keys(employees).map((f) => `- \`${f.replace(/\.md$/, "")}\``),
+      "",
+      "## Usage",
+      "",
+      "```bash",
+      `nrv validate business ${slug} --strict`,
+      "```",
+      "",
+      "## Domain",
+      "",
+      "One fixture domain, one produces slug, three example briefs.",
+      "",
+      "## Memory",
+      "",
+      "`memory/permanent.md` holds the curated facts every seat reads.",
+      "",
+      "## Notes",
+      "",
+      "Everything here is deliberately boring: the tests break one thing at a time.",
+      "",
+      "## History",
+      "",
+      "Created by the fixture builder, never by hand.",
+      "",
+      "## Contact",
+      "",
+      "Nobody: this business has no owner outside the test run.",
+      "",
+      "## License",
+      "",
+      "MIT, like the engine.",
+      "",
+    ].join("\n"), "utf8");
+  }
+  if (o.memory !== false) {
+    fs.mkdirSync(path.join(dir, "memory"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "memory", "permanent.md"), "# Permanent memory\n\n- The fixture business delivers one artifact per brief.\n", "utf8");
+  }
+  if (o.surface !== false) writeSurfaceFor(dir, "business");
+  return dir;
+}
+
+/** sha of every file under dir, for byte-identical assertions. */
+export function treeDigest(dir: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (rel: string) => {
+    for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(r);
+      else out[r] = Bun.hash(fs.readFileSync(path.join(dir, r))).toString(16);
+    }
+  };
+  walk("");
+  return out;
+}
+
+export function rmrf(dir: string): void {
+  for (let i = 0; i < 10; i++) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); return; }
+    catch (e: any) { if (!["EBUSY", "EPERM", "EACCES", "ENOTEMPTY"].includes(e?.code) || i === 9) throw e; Bun.sleepSync(100); }
+  }
+}

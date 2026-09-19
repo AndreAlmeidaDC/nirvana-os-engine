@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────
 # Capability Block — snippet para colar dentro de capabilities[] em squad.yaml
-# Squad Protocol v5 §22. Schema: capability.schema.json.
+# Squad Protocol v5 §22 / v6 §29-§33. Schema: capability.schema.json (generated).
 # ─────────────────────────────────────────────────────────────────────
 
   - id: {{CAPABILITY_ID}}
@@ -10,7 +10,7 @@
 
     description: >
       {{CAPABILITY_DESCRIPTION}}
-    # ^^^ 20-500 chars. Diga o que entrega em termos concretos. Esta string
+    # ^^^ 20-1500 chars (LIMITS.capability_description_max). Diga o que entrega em termos concretos. Esta string
     # alimenta o BM25 da discovery — escreva como se fosse buscar você mesmo.
 
     domains: [{{DOMAIN_1}}, {{DOMAIN_2}}]
@@ -100,5 +100,7 @@
     estimated_cost_usd: 0.50
     # ^^^ self-reported, opcional. Harness usa p/ budget pre-flight.
 
-    # humanize: true                        # opcional, default true em capability humana-facing.
-                                            # Defina false p/ outputs técnicos (json/binary).
+    # acceptance:                          # opcional (v6 §29): como o output é julgado.
+    #   - id: offer_stated                  # Sem ele, o juiz cai nos "## Acceptance Criteria"
+    #     description: ...                  # da task invocada.
+    #     blocking: true

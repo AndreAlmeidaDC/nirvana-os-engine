@@ -13,6 +13,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { TEARDOWN_BUDGET_MS } from "./helpers/test-budgets.ts";
+
+/** Seeding three registries with the real indexers, on the slowest runner. */
+const SEED_BUDGET_MS = 300_000;
 
 const REPO_SKILLS = path.join(import.meta.dir, "..", "..");
 const INDEX_TS = path.join(import.meta.dir, "..", "scripts", "index.ts");
@@ -88,9 +92,19 @@ beforeAll(() => {
   ].join("\n"));
 
   // Seed all three registries once with the real indexers.
+  // Three real indexers over a seeded library. 120 s was enough until a slow
+  // windows-latest runner took longer and the failure read as "index failed"
+  // with an empty stderr — `spawnSync` returns status null when it kills the
+  // child, and nothing here said so. Both halves are fixed: a budget sized like
+  // every other one in this suite, and an error that distinguishes a timeout
+  // from an exit code, because the two need opposite responses.
   const seed = spawnSync(process.execPath, [INDEX_TS, "--quiet"], {
-    encoding: "utf8", env: fixtureEnv(), cwd: work, timeout: 120_000,
+    encoding: "utf8", env: fixtureEnv(), cwd: work, timeout: SEED_BUDGET_MS,
   });
+  if (seed.status === null) {
+    throw new Error(`fixture seed index TIMED OUT after ${SEED_BUDGET_MS} ms `
+      + `(the runner was slower than the budget, not a broken index): ${seed.stderr || "(no stderr)"}`);
+  }
   if (seed.status !== 0) {
     throw new Error(`fixture seed index failed (exit ${seed.status}): ${seed.stderr}`);
   }
@@ -103,7 +117,7 @@ afterAll(() => {
   for (const d of [home, work]) {
     try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ }
   }
-});
+}, TEARDOWN_BUDGET_MS);
 
 describe("route-entrypoint pre-flight (routing-360 Phase 2.5)", () => {
   test("fresh registries: no reindex, check under the 50ms budget", () => {

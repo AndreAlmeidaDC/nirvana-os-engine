@@ -53,15 +53,17 @@ switch (cmd) {
   case "use-squads": case "squad": case "squads":
     runScript(join(H, "route.ts"), [...rest, "--prefer", "squad"]);
   case "find": runScript(join(H, "find.ts"), rest);
-  case "validate": runScript(join(H, "validate.ts"), rest);
+  case "validate": case "verify": runScript(join(S, "verify.ts"), rest);
   case "watch": case "tail": runScript(join(H, "watch.ts"), rest);
   case "watch-fs": case "fswatch": runScript(join(H, "watch-fs.ts"), rest);
   case "index": runScript(join(H, "index.ts"), rest);
+  case "config": runScript(join(H, "config.ts"), rest);
+  case "deps": runScript(join(S, "deps.ts"), rest);
   case "pack-manifest": case "gen-pack-manifest": runScript(join(S, "gen-pack-manifest.ts"), rest);
   case "init": case "init-project": runScript(join(S, "init-project.ts"), rest);
   case "install": {
     const f = rest[0] ?? "";
-    if (["--bootstrap", "--check", "--starter", "--no-starter", "--dry"].includes(f)) runScript(join(S, "install.ts"), rest);
+    if (["--bootstrap", "--check", "--starter", "--no-starter", "--dry", "--repair-path"].includes(f)) runScript(join(S, "install.ts"), rest);
     runScript(join(S, "install-asset.ts"), rest);
   }
   case "setup": runScript(join(S, "install.ts"), rest);
@@ -83,6 +85,7 @@ switch (cmd) {
   case "validate-trace": case "trace-validate": runScript(join(H, "validate-trace.ts"), rest);
   case "guard": runScript(join(H, "guard.ts"), rest);
   case "fix-squad": case "doctor-squad": runScript(join(SKILLS, "squads", "scripts", "fix-squad.ts"), rest);
+  case "migrate": case "migrate-squad": runScript(join(SKILLS, "squads", "scripts", "migrate-squad.ts"), rest);
   case "memory": case "mem": runScript(join(H, "memory.ts"), rest);
   case "baseline": runScript(join(H, "baseline.ts"), rest);
   case "improver": runScript(join(H, "improver.ts"), rest);
@@ -97,11 +100,15 @@ switch (cmd) {
     if (["--capability", "capability"].includes(sub)) runScript(join(S, "capability-doctor.ts"), rest.slice(1));
     runScript(join(H, "doctor-system.ts"), (sub === "--system" || sub === "system") ? rest.slice(1) : rest);
   }
+  case "audit-where": runScript(join(H, "audit-where.ts"), rest);
+  case "audit-tail": runScript(join(H, "audit-tail.ts"), rest);
+  case "team": runScript(join(H, "chain.ts"), rest);
   case "dispatch": runScript(join(H, "dispatch.ts"), rest);
   case "run": case "autopilot": runScript(join(H, "dispatch.ts"), [...rest, "--exec"]);
   case "auto": runScript(join(H, "dispatch.ts"), [...rest, "--exec", "--auto"]);
   case "revise": runScript(join(H, "revise.ts"), rest);
   case "run-track": runScript(join(H, "run-track.ts"), rest);
+  case "multi-target": case "mt": runScript(join(H, "multi-target.ts"), rest);
   case "supervisor": runScript(join(H, "supervisor.ts"), rest);
   case "clean": case "clean-project": case "purge": runScript(join(H, "clean-project.ts"), rest);
   case "update": case "self-update": case "upgrade": {
@@ -112,11 +119,17 @@ switch (cmd) {
   case "pack": runScript(join(H, "pack.ts"), rest);
   case "audit-view": case "audit": {
     if (rest[0] === "emit") runScript(join(H, "audit-emit.ts"), rest.slice(1));
+    // The 0.13.0 notes said `nrv audit where` / `nrv audit tail`; the CLI only
+    // knew the hyphenated names. Both spellings now reach the same script.
+    if (rest[0] === "where") runScript(join(H, "audit-where.ts"), rest.slice(1));
+    if (rest[0] === "tail") runScript(join(H, "audit-tail.ts"), rest.slice(1));
     runScript(join(H, "audit-view.ts"), rest);
   }
   case "search": runScript(join(H, "search.ts"), rest);
   case "export": runScript(join(H, "export.ts"), rest);
   case "ask": runScript(join(H, "ask.ts"), rest);
+  case "exec": runScript(join(H, "exec.ts"), rest);
+  case "mine-briefs": runScript(join(H, "mine-real-briefs.ts"), rest);
   case "launch": runScript(join(H, "launch.ts"), rest);
   case "tui": case "cockpit-tui": runScript(join(H, "tui.ts"), rest);
   case "activate": case "activate-squad": case "squad-activate": runScript(join(H, "activate.ts"), rest);

@@ -16,6 +16,75 @@ import { RunQueue } from "./queue.ts";
 import { listArtifacts, resolveArtifact, contentTypeFor } from "./artifacts.ts";
 import { todayAuditFile } from "../../../_shared/lib/log-paths.ts";
 import { listRuntimes } from "../../../_shared/lib/host-agent-driver.ts";
+import { parseAuditLine } from "../../../_shared/lib/cloudevents.js";
+import * as outbox from "./webhook-outbox.ts";
+import { runOutputsRoot } from "./runs.ts";
+import { buildRunArchive } from "./archive.ts";
+
+/** Text artifacts go out redacted (known secret values, credential-shaped
+ *  content); binaries go out as they are. */
+function artifactResponse(abs: string, contentType: string, sessionDir: string, h: Record<string, string>): Response {
+  const textual = /^(text\/|application\/(json|x-yaml|yaml|xml|javascript|typescript))/.test(contentType) || /\.(md|txt|json|ya?ml|html|css|ts|js|py|csv|tsv|xml|svg)$/i.test(abs);
+  if (!textual) {
+    return new Response(Bun.file(abs), { headers: { "Content-Type": contentType, "Content-Disposition": `attachment; filename="${path.basename(abs)}"`, ...h } });
+  }
+  const { text, redactions } = runsLib.redactForClient(fs.readFileSync(abs, "utf8"), sessionDir);
+  return new Response(text ?? "", { headers: { "Content-Type": contentType, "Content-Disposition": `attachment; filename="${path.basename(abs)}"`, ...(redactions ? { "X-Nirvana-Redactions": String(redactions) } : {}), ...h } });
+}
+
+/**
+ * The whole delivery of one run, as a zip.
+ *
+ * Refuses while the run is still going, for the same reason `/result` does:
+ * an archive of a half-written tree is a bundle that looks complete and is not.
+ * A finished run that produced nothing still gets a valid zip — MANIFEST.json
+ * inside says so — because "the work is empty" and "the run does not exist" are
+ * different answers and a 404 conflates them.
+ */
+function archiveResponse(memo: NonNullable<ReturnType<typeof runsLib.get>>, url: URL, h: Record<string, string>): Response {
+  if (memo.state === "queued" || memo.state === "running") {
+    return json({ error: "job_not_finished", state: memo.state, hint: "poll GET /v1/jobs/{id} or subscribe to /events" }, 409, h);
+  }
+  const includeAudit = ["1", "true", "yes"].includes((url.searchParams.get("include_audit") ?? "").toLowerCase());
+  const env = runsLib.envelope(memo);
+  let built;
+  try {
+    built = buildRunArchive({
+      outputsRoot: memo.outputs_root,
+      sessionDir: memo.session.dir,
+      rootName: memo.trace_id,
+      includeAudit,
+      manifest: {
+        trace_id: memo.trace_id,
+        session_id: memo.session.id,
+        state: env.state,
+        gate: env.gate,
+        runtime_errored: env.runtime_errored,
+        brief: memo.brief,
+        summary: env.summary,
+        reservations: env.reservations,
+        created_at: memo.created_at,
+        finished_at: memo.finished_at,
+        engine: ENGINE_VERSION,
+        includes_audit: includeAudit,
+      },
+    });
+  } catch (e) {
+    // The zip ceilings (65,535 files, 4 GiB) are the only way this throws, and
+    // a client deserves the real reason rather than a 500 with no name on it.
+    return json({ error: e instanceof Error ? e.message.split(":")[0] : "archive_failed", detail: e instanceof Error ? e.message : String(e) }, 413, h);
+  }
+  return new Response(built.zip, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${memo.trace_id}.zip"`,
+      "Content-Length": String(built.zip.length),
+      "X-Nirvana-Artifacts": String(built.files.length),
+      ...(built.redactions ? { "X-Nirvana-Redactions": String(built.redactions) } : {}),
+      ...h,
+    },
+  });
+}
 
 export interface ServeOpts {
   port: number;
@@ -44,6 +113,12 @@ const ENGINE_VERSION = (() => {
 export function startServer(opts: ServeOpts) {
   const queue = new RunQueue({ maxConcurrent: opts.maxConcurrent });
   const adopted = runsLib.adoptOrphans();
+  outbox.adoptPending(sessionsRoot());
+  // The retry schedule for webhook deliveries. A sweep, not a timer per
+  // delivery: N pending deliveries must not become N setTimeout handles that
+  // vanish with the process exactly like the thing this cut replaced.
+  const sweepMs = Number(process.env.NIRVANA_SERVE_WEBHOOK_SWEEP_MS) || 5000;
+  const sweepTimer = setInterval(() => { void outbox.sweepOnce(); }, sweepMs);
 
   const cors = (req: Request): Record<string, string> => {
     const origin = req.headers.get("origin");
@@ -81,6 +156,7 @@ export function startServer(opts: ServeOpts) {
           runtimes,
           queue: queue.stats,
           adopted_runs: adopted,
+          webhook_outbox: { pending: outbox.pendingCount() },
           licensing: {
             model: "per-machine",
             seats_consumed_by_this_host: 1,
@@ -116,10 +192,14 @@ export function startServer(opts: ServeOpts) {
       if (mBriefs && req.method === "POST") {
         const session = getSession(mBriefs[1], key.id);
         if (!session) return json({ error: "session_not_found" }, 404, h);
-        let body: { brief?: string } = {};
-        try { body = await req.json() as { brief?: string }; } catch { /* validated below */ }
+        let body: { brief?: string; deliver?: string } = {};
+        try { body = await req.json() as { brief?: string; deliver?: string }; } catch { /* validated below */ }
         const brief = (body.brief || "").trim();
         if (!brief) return json({ error: "brief_required" }, 400, h);
+        // How the client wants the finished work back. Unlike a budget, this is
+        // the caller's to choose: it decides the SHAPE of a response, not what
+        // the run is allowed to spend. Anything but "zip" is the artifact default.
+        const deliver = body.deliver === "zip" ? "zip" as const : "artifact" as const;
         // Money and limits are attributes of the KEY. A client-supplied
         // budget/limit is ignored on purpose (never trust the caller with
         // its own ceiling).
@@ -132,11 +212,26 @@ export function startServer(opts: ServeOpts) {
           session,
           key_id: key.id,
           brief,
-          outputs_root: path.join(session.dir, ".nirvana", "outputs", traceId),
+          // The canonical run root, the one `outputsDir()` returns and every
+          // other layer computes for itself. serve used to force the legacy
+          // `.nirvana/outputs`, which split a single run across two
+          // directories: the deliverables landed here and the report builder,
+          // pointed at the canonical path exactly as SKILL.md documents, found
+          // only the employee prompt and rendered THAT as the client's report.
+          outputs_root: runOutputsRoot(session.dir, traceId),
           created_at: new Date().toISOString(),
+          deliver,
         });
         queue.submit({ memo, budgetUsd: key.budget_usd, webhook: key.webhook });
-        return json({ trace_id: traceId, session_id: session.id, state: "queued" }, 202, h);
+        return json({
+          trace_id: traceId,
+          session_id: session.id,
+          state: "queued",
+          deliver,
+          job_url: `/v1/jobs/${traceId}`,
+          events_url: `/v1/jobs/${traceId}/events`,
+          archive_url: `/v1/jobs/${traceId}/archive`,
+        }, 202, h);
       }
 
       // ── runs ────────────────────────────────────────────────────────────
@@ -167,6 +262,89 @@ export function startServer(opts: ServeOpts) {
         if (!memo || memo.session.id !== mArt[1] || memo.key_id !== key.id) return json({ error: "run_not_found" }, 404, h);
         const abs = resolveArtifact(memo.outputs_root, decodeURIComponent(mArt[3]));
         if (!abs) return json({ error: "artifact_not_found" }, 404, h);
+        return artifactResponse(abs, contentTypeFor(abs), memo.session.dir, h);
+      }
+
+      const mRunArchive = /^\/v1\/sessions\/([^/]+)\/runs\/([^/]+)\/archive$/.exec(p);
+      if (mRunArchive && req.method === "GET") {
+        const memo = runsLib.get(mRunArchive[2], sessionsRoot());
+        if (!memo || memo.session.id !== mRunArchive[1] || memo.key_id !== key.id) return json({ error: "run_not_found" }, 404, h);
+        return archiveResponse(memo, url, h);
+      }
+
+      // ── jobs (session-agnostic — the polling floor) ──────────────────────
+      // A consumer that only kept the job id (the case one webhook told it
+      // about, or one it lost the webhook for) never needs to know which
+      // session produced it. `runsLib.get` already rehydrates from disk by
+      // trace_id alone; ownership is the same key check every session route
+      // already makes, just without the session_id in the path.
+      const mJob = /^\/v1\/jobs\/([^/]+)$/.exec(p);
+      if (mJob && req.method === "GET") {
+        const memo = runsLib.get(mJob[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        return json(runsLib.envelope(memo), 200, h);
+      }
+
+      // Stopping a run is a verb the API did not have: an expensive one could
+      // only be ended by SSH. DELETE on the job, because that is what the
+      // client is asking to end — the session keeps its other runs.
+      if (mJob && req.method === "DELETE") {
+        const memo = runsLib.get(mJob[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        const before = memo.state;
+        const { memo: after, signalled } = runsLib.cancel(memo);
+        // Idempotent: cancelling a finished run is not an error, it is a no-op
+        // that reports what the run actually became. `signalled` says whether a
+        // process was actually reached, which a client cannot infer from the state.
+        return json({ ...runsLib.envelope(after), cancelled: before !== after.state, signalled }, 200, h);
+      }
+      const mJobEvents = /^\/v1\/jobs\/([^/]+)\/events$/.exec(p);
+      if (mJobEvents && req.method === "GET") {
+        const memo = runsLib.get(mJobEvents[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        return sseAuditStream(memo, h);
+      }
+
+      const mJobResult = /^\/v1\/jobs\/([^/]+)\/result$/.exec(p);
+      if (mJobResult && req.method === "GET") {
+        const memo = runsLib.get(mJobResult[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        if (memo.state === "queued" || memo.state === "running") return json({ error: "job_not_finished", state: memo.state }, 409, h);
+        // A brief submitted with {"deliver":"zip"} said once how it wants the
+        // result, so a webhook consumer that only follows result_url gets the
+        // complete bundle without having to know a second URL exists.
+        if (memo.deliver === "zip") return archiveResponse(memo, url, h);
+        const artifacts = listArtifacts(memo.outputs_root);
+        if (artifacts.length === 1) {
+          const abs = resolveArtifact(memo.outputs_root, artifacts[0].path);
+          if (abs) {
+            return artifactResponse(abs, artifacts[0].content_type, memo.session.dir, h);
+          }
+        }
+        return json({
+          artifacts,
+          archive_url: `/v1/jobs/${mJobResult[1]}/archive`,
+          hint: artifacts.length
+            ? `all of it at once: GET /v1/jobs/${mJobResult[1]}/archive · one file: GET /v1/jobs/${mJobResult[1]}/artifacts/{path}`
+            : "no artifacts produced",
+        }, 200, h);
+      }
+
+      // The whole delivery, in one call. Placed before /artifacts/{path} only
+      // for reading order; the patterns do not overlap.
+      const mJobArchive = /^\/v1\/jobs\/([^/]+)\/archive$/.exec(p);
+      if (mJobArchive && req.method === "GET") {
+        const memo = runsLib.get(mJobArchive[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        return archiveResponse(memo, url, h);
+      }
+
+      const mJobArt = /^\/v1\/jobs\/([^/]+)\/artifacts\/(.+)$/.exec(p);
+      if (mJobArt && req.method === "GET") {
+        const memo = runsLib.get(mJobArt[1], sessionsRoot());
+        if (!memo || memo.key_id !== key.id) return json({ error: "job_not_found" }, 404, h);
+        const abs = resolveArtifact(memo.outputs_root, decodeURIComponent(mJobArt[2]));
+        if (!abs) return json({ error: "artifact_not_found" }, 404, h);
         return new Response(Bun.file(abs), {
           headers: { "Content-Type": contentTypeFor(abs), "Content-Disposition": `attachment; filename="${path.basename(abs)}"`, ...h },
         });
@@ -186,6 +364,15 @@ export function startServer(opts: ServeOpts) {
       return json({ error: "not_found" }, 404, h);
     },
   });
+
+  // The sweep timer must not outlive the server it retries deliveries for —
+  // a test that stops one server and starts the next must not keep the
+  // previous sweep firing against a torn-down fixture.
+  const originalStop = server.stop.bind(server);
+  server.stop = ((...args: Parameters<typeof originalStop>) => {
+    clearInterval(sweepTimer);
+    return originalStop(...args);
+  }) as typeof server.stop;
 
   return server;
 }
@@ -207,10 +394,23 @@ function sseAuditStream(memo: ReturnType<typeof runsLib.get> & {}, extraHeaders:
     todayAuditFile({ projectRoot: memo.session.dir }),
   ])];
   const offsets = new Map<string, number>(candidates.map((f) => [f, 0]));
+  let timer: ReturnType<typeof setInterval> | undefined;
   const stream = new ReadableStream({
     start(controller) {
       const enc = new TextEncoder();
-      const send = (obj: unknown) => controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      // A client that disconnects mid-stream (abort, or `.cancel()` on the
+      // body reader) leaves the controller in a non-writable state without
+      // `cancel()` below ever firing — the CI crash this comment replaces
+      // was exactly that: the interval kept polling, `enqueue()` threw on
+      // the dead controller, and an uncaught exception inside a bare
+      // `setInterval` callback took down the whole test process, not just
+      // this one request.
+      // Events are text an agent wrote (tool output, summaries): a secret value
+      // in them is masked before it leaves, like an artifact.
+      const send = (obj: unknown) => {
+        try { controller.enqueue(enc.encode(`data: ${runsLib.redactForClient(JSON.stringify(obj), memo.session.dir).text}\n\n`)); }
+        catch { if (timer) clearInterval(timer); }
+      };
       const pump = () => {
         for (const file of candidates) {
         try {
@@ -225,7 +425,9 @@ function sseAuditStream(memo: ReturnType<typeof runsLib.get> & {}, extraHeaders:
             for (const line of buf.toString("utf8").split("\n")) {
               if (!line.trim()) continue;
               try {
-                const ev = JSON.parse(line);
+                // Flat shape on the wire, whichever form the line was
+                // written in — the envelope reaches this feed in cut 7.
+                const ev = parseAuditLine(line);
                 // ONLY this run's events. The audit file can be shared —
                 // HARNESS_LOGS_DIR may point elsewhere, and CI proved it:
                 // the stream carried another test's judge events. A client
@@ -245,7 +447,7 @@ function sseAuditStream(memo: ReturnType<typeof runsLib.get> & {}, extraHeaders:
       // inside the first second). One final pump AFTER the run is terminal
       // also matters: the child writes its last audit lines as it exits.
       let sawTerminal = false;
-      const timer = setInterval(() => {
+      timer = setInterval(() => {
         pump();
         const m = runsLib.get(memo.trace_id);
         const terminal = m && m.state !== "queued" && m.state !== "running";
@@ -258,8 +460,14 @@ function sseAuditStream(memo: ReturnType<typeof runsLib.get> & {}, extraHeaders:
         pump();
         send({ event: "run.finished", state: m!.state, exit_code: m!.exit_code });
         clearInterval(timer);
-        controller.close();
+        try { controller.close(); } catch { /* the client may have closed it first */ }
       }, 150);
+    },
+    // A client that disconnects (abort, or `.cancel()` on the body reader)
+    // must stop the polling immediately rather than waiting for the next
+    // `enqueue()` to fail and clean up reactively.
+    cancel() {
+      if (timer) clearInterval(timer);
     },
   });
   return new Response(stream, {

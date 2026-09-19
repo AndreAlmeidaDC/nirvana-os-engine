@@ -28,7 +28,9 @@ process.env.NIRVANA_RUN_LEDGER_DB = path.join(TMP, "default.sqlite");
 process.env.NIRVANA_NO_DESKTOP_NOTIFY = "1";
 
 import { sweep, type RecoveryResult, type SalvageVerdict } from "../scripts/supervisor.ts";
-import { openLedger, openAgenticRun, openRun, getRun, markState, findNonTerminal, type LedgerHandle, type RunRow } from "../lib/run-ledger.ts";
+import { openLedger, openAgenticRun, openRun, getRun, markState, findNonTerminal, normalizeRoot, type LedgerHandle, type RunRow } from "../lib/run-ledger.ts";
+import { SCOPE_GUARD_PT_BR } from "../../_shared/lib/scope-guard.ts";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 let dbSeq = 0;
 function freshLedger(): LedgerHandle {
@@ -120,8 +122,18 @@ describe("brief-squad opens the ledger run by itself", () => {
     });
     expect(r.status).toBe(0);
 
-    const rows = findNonTerminal(openLedger(ledger));
+    // The brief file the executor is handed carries the scope guard.
+    const briefFile = r.stdout.match(/Brief file:\s+(.+)/)?.[1]?.trim();
+    expect(briefFile).toBeTruthy();
+    expect(fs.readFileSync(briefFile!, "utf8")).toContain(SCOPE_GUARD_PT_BR);
+
+    // Scoped to the child's project, not to this test process's own: the
+    // ledger file is shared, the visibility is not.
+    const rows = findNonTerminal(openLedger(ledger), { projectRoot });
     expect(rows.length).toBe(1);
+    // normalizeRoot, not fs.realpathSync: the latter leaves a Windows 8.3 short
+    // path short, and the stored root is the long form.
+    expect(rows[0].project_root).toBe(normalizeRoot(projectRoot));
     const row = rows[0];
     expect(row.state).toBe("running");
     expect(row.target_kind).toBe("squad");
@@ -144,7 +156,36 @@ describe("brief-squad opens the ledger run by itself", () => {
     // The agent is told how to close it, in the output it already reads.
     expect(r.stdout).toContain("nrv run-track close");
     expect(r.stdout).toContain(row.run_id);
-  });
+  }, spawnBudgetMs(1));
+
+  test("under a scripted dispatch (NIRVANA_DISPATCH_TRACKS_RUN=1) the prep step opens no row: the dispatch tracks its own", () => {
+    // `nrv dispatch --exec` spawns brief-squad only to scaffold and opens its own ledger row.
+    // The agentic row it used to leave here had no owner: still `running` after the dispatch
+    // delivered, escalated as stalled once its lease expired (smoke-judge-squad, 2026-08-26).
+    const scriptedLedger = path.join(TMP, "brief-squad-scripted.sqlite");
+    const r = spawnSync(process.execPath, [
+      path.join(SKILLS, "squads", "scripts", "brief-squad.ts"),
+      "fixture-squad", "Uma landing page para uma clínica veterinária", "--project", "projeto-scriptado",
+    ], {
+      encoding: "utf8",
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        SQUADS_DIR: path.join(home, "squads"),
+        NIRVANA_HOME: home,
+        NIRVANA_PROJECT_ROOT: projectRoot,
+        NIRVANA_RUN_LEDGER_DB: scriptedLedger,
+        NIRVANA_SKILLS_DIR: SKILLS,
+        NIRVANA_DISPATCH_TRACKS_RUN: "1",
+      },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("tracked by the dispatch that spawned this step");
+    expect(r.stdout).not.toContain("nrv run-track close");
+    // No row at all, not a closed one: the dispatch's own row is the run's only record.
+    const count = openLedger(scriptedLedger).db.query("SELECT COUNT(*) AS n FROM runs").get() as { n: number };
+    expect(count.n).toBe(0);
+  }, spawnBudgetMs(1));
 });
 
 // ── 2. the supervisor's agentic door ──────────────────────────────────────
@@ -177,7 +218,7 @@ describe("supervisor — agentic runs", () => {
     // clock exists only to age the row) — so the check is simply that the lease
     // is no longer expired.
     expect(Date.parse(after.lease_expires_at!)).toBeGreaterThan(Date.now());
-  });
+  }, spawnBudgetMs(2));
 
   test("expired lease and nothing moving → escalates on the FIRST sweep, human notified", () => {
     const h = freshLedger();
@@ -208,7 +249,7 @@ describe("supervisor — agentic runs", () => {
     expect(after.state).toBe("stalled");
     // Escalation is immediate: retries are for recoveries that could work.
     expect(after.retries).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 
   test("a scripted run is untouched by the agentic door", () => {
     const h = freshLedger();
@@ -229,7 +270,7 @@ describe("supervisor — agentic runs", () => {
 
     expect(resumed.length).toBe(1);
     expect(getRun(h, row.run_id)!.state).toBe("delivered");
-  });
+  }, spawnBudgetMs(2));
 });
 
 // ── 3. periodic status ────────────────────────────────────────────────────
@@ -258,7 +299,7 @@ describe("supervisor — progress ping", () => {
 
     // The run is not disturbed by being reported on.
     expect(getRun(h, row.run_id)!.state).toBe("running");
-  });
+  }, spawnBudgetMs(2));
 
   test("a run younger than the interval stays quiet", () => {
     const h = freshLedger();
@@ -269,7 +310,7 @@ describe("supervisor — progress ping", () => {
     const pings: number[] = [];
     sweep({ handle: h, pingImpl: (_r, m) => pings.push(m), notifyImpl: noNotify, salvageImpl: noSalvage });
     expect(pings.length).toBe(0);
-  });
+  }, spawnBudgetMs(2));
 });
 
 // ── 4. the close door ─────────────────────────────────────────────────────
@@ -294,7 +335,7 @@ describe("nrv run-track", () => {
     const closed = runTrack(["close", runId, "--state", "delivered"]);
     expect(closed.status).toBe(0);
     expect(getRun(h, runId)!.state).toBe("delivered");
-  });
+  }, spawnBudgetMs(2));
 
   test("a run the supervisor already escalated can still be closed truthfully", () => {
     // The realistic late finish: the sweep gave up at the lease, the human was
@@ -309,13 +350,13 @@ describe("nrv run-track", () => {
 
     expect(runTrack(["close", runId, "--state", "delivered"]).status).toBe(0);
     expect(getRun(h, runId)!.state).toBe("delivered");
-  });
+  }, spawnBudgetMs(1));
 
   test("closing an unknown run warns instead of failing the caller's work", () => {
     const r = runTrack(["close", "run-does-not-exist", "--state", "delivered"]);
     expect(r.status).toBe(0);
     expect(r.stderr).toContain("not found");
-  });
+  }, spawnBudgetMs(1));
 
   test("a failed close records why", () => {
     const outputs = path.join(TMP, "rt-outputs-2");
@@ -325,7 +366,7 @@ describe("nrv run-track", () => {
     const row = getRun(openLedger(ledger), runId)!;
     expect(row.state).toBe("failed");
     expect(row.last_error).toContain("cota");
-  });
+  }, spawnBudgetMs(2));
 });
 
 // ── 5. the lib door ───────────────────────────────────────────────────────

@@ -54,35 +54,40 @@ export type GateVerdict = {
 export const GATEABLE_EXTS: ReadonlySet<string> = new Set([
   ".md", ".txt", ".json", ".yaml", ".yml",
   ".png", ".jpg", ".jpeg", ".webp",
-  ".html", ".ts", ".js", ".py",
+  ".html", ".css", ".ts", ".js", ".py",
   ".pdf",
 ]);
 
 export function rubricsForExt(ext: string): string[] {
   switch (ext.toLowerCase()) {
+    // secret-leak rides every text artifact: a deliverable never carries the
+    // value of a credential this machine holds (withheld), and credential-shaped
+    // content is flagged for redaction on the way out.
     case ".md":
     case ".txt":
-      return ["correctness", "structure-bounds", "wiki-lint"];
+      return ["correctness", "structure-bounds", "wiki-lint", "secret-leak"];
     case ".json":
-      return ["json-valid"];
+      return ["json-valid", "secret-leak"];
     case ".yaml":
     case ".yml":
-      return ["yaml-valid"];
+      return ["yaml-valid", "secret-leak"];
     case ".png":
     case ".jpg":
     case ".jpeg":
     case ".webp":
       return ["brief-fidelity"];
     case ".html":
-      return ["html-valid"];
+      return ["html-valid", "secret-leak"];
+    case ".css":
+      return ["css-composite-alpha", "secret-leak"];
     case ".pdf":
       return ["pdf-valid"];
     case ".ts":
     case ".js":
     case ".py":
-      return ["correctness"];
+      return ["correctness", "secret-leak"];
     default:
-      return ["correctness"];
+      return ["correctness", "secret-leak"];
   }
 }
 
@@ -200,7 +205,8 @@ async function runWithRevisions(artifact: string, content: string, args: string[
     const today = new Date().toISOString().slice(0, 10);
     const dir = path.join(require(path.join(SKILLS_ROOT, "_shared/lib/log-paths.ts")).harnessLogsDir({ cwd: path.dirname(path.resolve(artifact)) }), today);
     fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify({
+    const _stamp = require(path.join(SKILLS_ROOT, "_shared/lib/audit-provenance.ts")).stamp;
+    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(_stamp({
       ts: out.timestamp,
       event: result.verdict === "pass" ? "gate_passed" : "gate_failed",
       mode: "with-revisions",
@@ -209,7 +215,7 @@ async function runWithRevisions(artifact: string, content: string, args: string[
       business_slug: process.env.NIRVANA_BUSINESS_SLUG || null,
       artifact, rubric: rubric.name, score: out.total_score,
       judge_runtime: out.judge_runtime,
-    }) + "\n");
+    })) + "\n");
   } catch { /* non-fatal */ }
 
   return result.verdict === "pass" ? 0 : 1;
@@ -298,7 +304,16 @@ async function main() {
       score_avg: verdict.score,
       failed_rubrics: results.filter(r => !r.passed && !r.skipped).map(r => r.name),
     };
-    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(event) + "\n");
+    const _stamp = require(path.join(SKILLS_ROOT, "_shared/lib/audit-provenance.ts")).stamp;
+    fs.appendFileSync(path.join(dir, "audit.jsonl"), JSON.stringify(_stamp(event)) + "\n");
+    // A verdict nobody can join to a run is a verdict nobody can act on. The
+    // delivery pipeline exports these; an agent invoking the gate by hand does
+    // not, and on 2026-09-04 ten of twelve gate verdicts in a live run carried
+    // trace_id: null. Silence made that invisible, so it says so now.
+    if (!event.trace_id) {
+      console.error("[gate] WARNING: no trace_id — this verdict cannot be joined to a run. "
+        + "Export NIRVANA_TRACE_ID, NIRVANA_PROJECT_ID and NIRVANA_BUSINESS_SLUG before calling the gate.");
+    }
   } catch {
     // non-fatal
   }

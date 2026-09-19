@@ -14,7 +14,7 @@
 //
 // Usage:
 //   bun verify-deliverable.ts <project_id> <business_slug>
-//   bun verify-deliverable.ts <project_id> <business_slug> --outputs-root /path
+//   bun verify-deliverable.ts <project_id> <business_slug> [--outputs-root <dir>] [--min-bytes N] [--employee <slug>]
 //   bun verify-deliverable.ts <project_id> <business_slug> --min-bytes 200
 //
 // Exit codes:
@@ -25,6 +25,39 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { businessDirFor, readAcceptance } from "../lib/acceptance.ts";
+import { resolveSetting } from "../../_shared/lib/settings.ts";
+
+// Run plumbing the harness writes next to the deliverables. Never a deliverable.
+// One list: the API and the report builder read the same one.
+import { RUN_PLUMBING } from "../../_shared/lib/run-plumbing.ts";
+
+/**
+ * Outcome altitude: the brief names no paths on purpose (the executor decides
+ * the artifact layout), so "no path declared" is not indeterminate — whatever
+ * the run wrote under its outputs root is the deliverable set. Dotfiles,
+ * `node_modules`, `scratch/` and the plumbing above are skipped.
+ */
+function scanOutputsForDeliverables(root: string, maxDepth = 6): string[] {
+  const found: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "scratch") continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full, depth + 1); continue; }
+      if (entry.isFile() && !RUN_PLUMBING.has(entry.name)) found.push(full);
+    }
+  };
+  walk(root, 0);
+  return found.sort();
+}
+
+function briefAltitude(): string {
+  try { return String(resolveSetting("briefing.altitude").value ?? "outcome"); } catch { return "outcome"; }
+}
 
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
@@ -40,8 +73,26 @@ export type DeliverableReport = {
   empty_or_stub: string[];
   delta_pct: number;
   min_bytes_threshold: number;
+  /** The run directory the check resolved (nested `outputs/<project_id>/` or the
+   *  flat chain root). The CLI files the verdict beside the run; recomputing the
+   *  root there is how a verdict once went nowhere. Absent when indeterminate. */
+  project_dir?: string;
+  /** The seat the check was scoped to, when `--employee` narrowed it. */
+  employee?: string;
+  /** A declared `min_bytes` per promised file (absolute path), whichever list
+   *  named the file. The global `min_bytes_threshold` is the CLI default. */
+  min_bytes_by_path?: Record<string, number>;
   reason?: string;
 };
+
+/** One spelling per file, so a manifest path and an acceptance path that name
+ *  the same file meet in the same map key: a symlinked temp dir or a `..` in
+ *  one of them used to make the declared floor miss the file it was declared
+ *  for. A file that does not exist keeps its resolved spelling, which is the
+ *  one the report names as missing. */
+function canonical(p: string): string {
+  try { return fs.realpathSync.native(p); } catch { return p; }
+}
 
 // Pure disk-truth check. No console, no audit emit, no exit — returns a report
 // the caller acts on. Indeterminate (project/brief/markers absent) is a status,
@@ -49,10 +100,10 @@ export type DeliverableReport = {
 export function verifyDeliverableOnDisk(
   projectId: string,
   businessSlug: string,
-  opts: { outputsRoot?: string; minBytes?: number } = {}
+  opts: { outputsRoot?: string; minBytes?: number; businessDir?: string | null; employee?: string | null } = {}
 ): DeliverableReport {
   const minBytes = opts.minBytes ?? 200;
-  const outputsRoot = opts.outputsRoot;
+  let resolvedProjectDir: string | undefined;
 
   const base = (
     status: DeliverableReport["status"],
@@ -68,6 +119,7 @@ export function verifyDeliverableOnDisk(
     empty_or_stub: [],
     delta_pct: 100,
     min_bytes_threshold: minBytes,
+    ...(resolvedProjectDir ? { project_dir: resolvedProjectDir } : {}),
     ...extra,
   });
 
@@ -77,12 +129,29 @@ export function verifyDeliverableOnDisk(
     path.join(process.cwd(), ".nirvana/outputs"),   // compat: runs antigos
     path.join(os.homedir(), ".nirvana/outputs"),
   ];
+  // Two layouts, both legitimate. The scripted path nests a run under
+  // `outputs/<project_id>/`; `nrv team` writes a chain into a FLAT outputs root
+  // with `_team/<seat>/` beside the finals. This checker knew only the first, so
+  // it answered FAIL_INDETERMINATE for a chain run whose files were on disk —
+  // "project not found" for work that was right there. `projectDir` is whichever
+  // one actually holds the run.
   const projectsRoot = projectRootCandidates.find(p => fs.existsSync(path.join(p, projectId)));
-  if (!projectsRoot) {
-    return base("FAIL_INDETERMINATE", { reason: `project not found in ${projectRootCandidates.join(" or ")}` });
+  const flatRoot = !projectsRoot
+    ? projectRootCandidates.find(p => fs.existsSync(path.join(p, "brief.md")) || fs.existsSync(path.join(p, "_team")))
+    : null;
+  if (!projectsRoot && !flatRoot) {
+    return base("FAIL_INDETERMINATE", { reason: `project not found in ${projectRootCandidates.join(" or ")} (neither nested nor flat layout)` });
   }
+  const projectDir = projectsRoot ? path.join(projectsRoot, projectId) : flatRoot!;
+  resolvedProjectDir = projectDir;
+  // A relative `--outputs-root` is relative to the run, not to wherever the
+  // shell happens to be: resolved against the cwd it answered PASS from one
+  // directory and FAIL from its subdirectory, over the same files.
+  const outputsRoot = opts.outputsRoot
+    ? (path.isAbsolute(opts.outputsRoot) ? opts.outputsRoot : path.resolve(projectDir, opts.outputsRoot))
+    : undefined;
 
-  const briefPath = path.join(projectsRoot, projectId, "brief.md");
+  const briefPath = path.join(projectDir, "brief.md");
   if (!fs.existsSync(briefPath)) {
     return base("FAIL_INDETERMINATE", { reason: `brief not found: ${briefPath}` });
   }
@@ -92,12 +161,17 @@ export function verifyDeliverableOnDisk(
   // --manifest). It's authoritative; brief.md regex is best-effort fallback.
   let expectedPathsRaw: string[] = [];
   let manifestSource = "brief-regex";
-  const deliverablesPath = path.join(projectsRoot, projectId, "businesses", businessSlug, "deliverables.json");
-  const deliverablesPathAlt = path.join(projectsRoot, projectId, "deliverables.json"); // project-level fallback
-
-  let manifestFile: string | null = null;
-  if (fs.existsSync(deliverablesPath)) manifestFile = deliverablesPath;
-  else if (fs.existsSync(deliverablesPathAlt)) manifestFile = deliverablesPathAlt;
+  // A run files its manifest under the target that produced it: `businesses/<slug>/`
+  // for a business, `squads/<slug>/` for a squad, or at the run root. This check
+  // knew the first and the last. On 2026-09-04 a squad run had two manifests under
+  // `squads/`, every promised file on disk, and got FAIL_INDETERMINATE "no
+  // deliverables.json" — a verdict about where the tool looked, not about the work.
+  const manifestCandidates = [
+    path.join(projectDir, "businesses", businessSlug, "deliverables.json"),
+    path.join(projectDir, "squads", businessSlug, "deliverables.json"),
+    path.join(projectDir, "deliverables.json"), // run-level fallback
+  ];
+  const manifestFile: string | null = manifestCandidates.find(p => fs.existsSync(p)) ?? null;
 
   if (manifestFile) {
     try {
@@ -110,6 +184,29 @@ export function verifyDeliverableOnDisk(
       manifestSource = `brief-regex (manifest parse failed: ${e.message})`;
     }
   }
+
+  // Business Protocol 2.0 §11: an `acceptance[]` entry that names a `path` is a
+  // promise the disk can be checked against — the same completeness proof a
+  // deliverables.json gives, declared by the role instead of written per run.
+  // The manifest is the run's own list and wins as the list of files; the
+  // declared `min_bytes` applies whichever list named the file, because a
+  // manifest used to switch the declared floor off and the report still
+  // printed the default as if it were in force. `--employee` narrows the
+  // promises to one seat: the whole business's promises charged every step of
+  // a chain, so a seat that delivered its own file failed for its colleagues'.
+  const acceptanceMinBytes: Map<string, number> = new Map();
+  const bizDir = opts.businessDir ?? businessDirFor(businessSlug);
+  const promised = bizDir ? readAcceptance(bizDir, opts.employee ? [opts.employee] : undefined).paths : [];
+  const promiseRoot = outputsRoot ?? projectDir;
+  const resolveEntry = (p: string) => canonical(path.isAbsolute(p) ? p : path.resolve(promiseRoot, p));
+  if (expectedPathsRaw.length === 0 && promised.length > 0) {
+    expectedPathsRaw = promised.map(entry => resolveEntry(entry.path));
+    manifestSource = "acceptance";
+  }
+  for (const entry of promised) {
+    if (typeof entry.minBytes === "number") acceptanceMinBytes.set(resolveEntry(entry.path), entry.minBytes);
+  }
+  expectedPathsRaw = expectedPathsRaw.map(canonical);
 
   // Fallback: scan brief.md for explicit absolute paths
   if (expectedPathsRaw.length === 0) {
@@ -126,17 +223,28 @@ export function verifyDeliverableOnDisk(
     }
   }
 
+  // Outcome / guided altitude: the run's own outputs are the promise.
+  if (expectedPathsRaw.length === 0 && briefAltitude() !== "prescriptive") {
+    const scanned = scanOutputsForDeliverables(promiseRoot).map(canonical);
+    if (scanned.length > 0) {
+      expectedPathsRaw = scanned;
+      manifestSource = `outputs-scan (briefing.altitude=${briefAltitude()})`;
+    }
+  }
+
   if (expectedPathsRaw.length === 0) {
     return base("FAIL_INDETERMINATE", {
       manifest_source: manifestSource,
-      reason: "no deliverables.json and brief.md has no /path markers",
+      reason: `no deliverables.json (looked in ${manifestCandidates.map(p => path.relative(projectDir, p)).join(", ")}), no acceptance[] entry with a path, brief.md has no /path markers, and nothing but run plumbing under ${promiseRoot}`,
     });
   }
 
   const results = expectedPathsRaw.map(p => {
     const exists = fs.existsSync(p);
     const bytes = exists ? fs.statSync(p).size : 0;
-    return { path: p, exists, bytes, isStub: exists && bytes < minBytes };
+    // An acceptance entry may declare its own `min_bytes`; otherwise the run's threshold.
+    const threshold = acceptanceMinBytes.get(p) ?? minBytes;
+    return { path: p, exists, bytes, isStub: exists && bytes < threshold };
   });
 
   const found = results.filter(r => r.exists).length;
@@ -157,36 +265,52 @@ export function verifyDeliverableOnDisk(
     empty_or_stub: empty,
     delta_pct: deltaPct,
     min_bytes_threshold: minBytes,
+    project_dir: projectDir,
+    ...(opts.employee ? { employee: opts.employee } : {}),
+    ...(acceptanceMinBytes.size ? { min_bytes_by_path: Object.fromEntries(acceptanceMinBytes) } : {}),
   };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 if (import.meta.main) {
-  const argFlag = (name: string, fallback?: string): string | undefined => {
-    const i = process.argv.indexOf(name);
-    if (i === -1) return fallback;
-    const next = process.argv[i + 1];
-    if (!next || next.startsWith("--")) return fallback;
-    return next;
-  };
-
-  const positional = process.argv.slice(2).filter(a => !a.startsWith("--"));
+  const USAGE = "Usage: bun verify-deliverable.ts <project_id> <business_slug> [--outputs-root <dir>] [--min-bytes N] [--employee <slug>]";
+  // `--flag value` and `--flag=value` both count, and a flag this script does
+  // not know is a usage error, not a silent drop: `--outputs-root=/x` used to
+  // vanish without a word and the verdict came back FAIL over intact work.
+  const KNOWN = new Set(["--outputs-root", "--min-bytes", "--employee"]);
+  const flags: Record<string, string> = {};
+  const positional: string[] = [];
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) { positional.push(a); continue; }
+    const eq = a.indexOf("=");
+    const name = eq === -1 ? a : a.slice(0, eq);
+    if (!KNOWN.has(name)) { console.error(`Unknown flag: ${a}\n${USAGE}`); process.exit(2); }
+    let value = eq === -1 ? argv[i + 1] : a.slice(eq + 1);
+    if (eq === -1) {
+      if (value === undefined || value.startsWith("--")) { console.error(`${name} needs a value\n${USAGE}`); process.exit(2); }
+      i++;
+    }
+    flags[name] = value;
+  }
   const projectId = positional[0];
   const businessSlug = positional[1];
-  const outputsRoot = argFlag("--outputs-root");
-  const minBytes = parseInt(argFlag("--min-bytes", "200") || "200", 10);
+  const outputsRoot = flags["--outputs-root"];
+  const minBytes = parseInt(flags["--min-bytes"] ?? "200", 10);
+  const employee = flags["--employee"];
 
-  if (!projectId || !businessSlug) {
-    console.error("Usage: bun verify-deliverable.ts <project_id> <business_slug> [--outputs-root <dir>] [--min-bytes N]");
+  if (!projectId || !businessSlug || !Number.isFinite(minBytes)) {
+    console.error(USAGE);
     process.exit(2);
   }
 
-  const r = verifyDeliverableOnDisk(projectId, businessSlug, { outputsRoot, minBytes });
+  const r = verifyDeliverableOnDisk(projectId, businessSlug, { outputsRoot, minBytes, employee });
 
   if (r.status === "FAIL_INDETERMINATE") {
     console.error(`WARN: ${r.reason || "indeterminate"}`);
     if (r.reason && r.reason.startsWith("no deliverables.json")) {
-      console.error("To fix: register the project with `brief-business.ts --manifest <paths.json>` next time.");
+      console.error("To fix: write the run's manifest next time — `brief-business.ts --manifest <paths.json>` for a business, or `squads/<slug>/deliverables.json` beside a squad's outputs.");
     }
   }
 
@@ -201,6 +325,8 @@ if (import.meta.main) {
     empty_or_stub: r.empty_or_stub,
     delta_pct: r.delta_pct,
     min_bytes_threshold: r.min_bytes_threshold,
+    ...(r.min_bytes_by_path ? { min_bytes_by_path: r.min_bytes_by_path } : {}),
+    ...(r.employee ? { employee: r.employee } : {}),
     status: r.status,
     timestamp: new Date().toISOString(),
     ...(r.reason ? { reason: r.reason } : {}),
@@ -211,13 +337,13 @@ if (import.meta.main) {
   // silent in the audit (matches the original, which exited before emit).
   if (r.status === "PASS" || r.status === "FAIL") {
     try {
-      const projectsRoot = [
-        path.join(process.cwd(), "outputs"),
-        path.join(process.cwd(), ".nirvana/outputs"),
-        path.join(os.homedir(), ".nirvana/outputs"),
-      ].find(p => fs.existsSync(path.join(p, projectId)))!;
-      const projectDir = path.join(projectsRoot, projectId, "businesses", businessSlug);
-      fs.mkdirSync(projectDir, { recursive: true });
+      // The check already resolved the run directory (nested or flat); the
+      // verdict is filed beside that run. This block once recomputed the root
+      // and shadowed its own variable, and the verdict never reached the audit.
+      if (!r.project_dir) throw new Error("verdict without a resolved run directory");
+      const projectDir = r.project_dir;
+      const businessOutDir = path.join(projectDir, "businesses", businessSlug);
+      fs.mkdirSync(businessOutDir, { recursive: true });
       const auditEntry = JSON.stringify({
         ts: report.timestamp,
         event: r.status === "PASS" ? "verify_passed" : "verify_failed",
@@ -230,7 +356,7 @@ if (import.meta.main) {
         stub_count: r.empty_or_stub.length,
         delta_pct: r.delta_pct,
       });
-      fs.appendFileSync(path.join(projectDir, "audit.jsonl"), auditEntry + "\n");
+      fs.appendFileSync(path.join(businessOutDir, "audit.jsonl"), auditEntry + "\n");
 
       // Also emit to harness daily audit (per-project when inside a project, else $HOME)
       const { harnessLogsDir } = require(path.join(SKILLS_ROOT, "_shared/lib/log-paths.ts"));

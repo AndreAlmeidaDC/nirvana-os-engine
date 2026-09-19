@@ -46,7 +46,7 @@ invocation:
   # CLI flags, env vars, sample commands
 ```
 
-The manifest validates against `schemas/adapter-schema.json`.
+The manifest is read and validated by `skills/squads/lib/adapter-loader.js`.
 
 ## Required Documentation Sections
 
@@ -72,6 +72,34 @@ When a squad declares a feature under `features_optional` and the adapter lists 
 3. Execution continues.
 
 When a squad declares a feature under `features_required` and the adapter lacks it:
+
+## Active runtime policy
+
+`runtime_requirements.policy` controls runtime selection:
+
+```yaml
+runtime_requirements:
+  policy: active
+  incompatible: []
+```
+
+- `active` is the default (since 6.1.2): the run follows the runtime hosting
+  the session, on that runtime's own model and effort. `minimum` and
+  `compatible` may be omitted and do not act as an allowlist.
+- `declared` is explicit, for a squad built around one runtime's tools (an
+  image generator that lives inside Codex, a video generator that lives inside
+  Grok). The active runtime must occur in `minimum` or `compatible`, and
+  `minimum` must contain at least one entry.
+- A registered adapter is preferred. If none exists, activation must pass an
+  explicit runtime bridge with `protocolVersion` and `featuresSupported`.
+- Required features fail closed. Unsupported optional features emit auditable
+  degradation warnings. `incompatible` is a hard denial under both policies.
+- Selection never installs, starts, or switches to another runtime.
+
+A manifest without `policy` follows the session (`active`). Until 6.1.1 it was
+read as `declared`, and a fixer pinned `minimum: claude-code` on every squad
+that declared nothing, so a user working in another runtime was refused by
+squads that had no reason to care.
 
 1. Harness refuses to load the squad.
 2. Error message points to the adapter's Feature Support Matrix.
@@ -105,13 +133,13 @@ Citations live in each adapter's §14 Source References. This discipline keeps t
 
 1. Copy `adapters/_template-adapter.md`.
 2. Fill in all required sections.
-3. Create the YAML manifest conforming to `schemas/adapter-schema.json`.
+3. Create the YAML manifest in the shape `skills/squads/lib/adapter-loader.js` reads.
 4. Declare `features_supported` and `features_unsupported` honestly.
 5. Populate `concept_mapping` for every Core concept your runtime supports.
 6. Document `numeric_values` with actual verified values.
 7. Add validators for runtime-specific rules.
 8. List Known Limitations honestly.
-9. Validate the manifest: `ajv validate -s schemas/adapter-schema.json -d adapters/{runtime_id}.yaml`.
+9. Validate the manifest: `nrv validate squad <dir>` (the loader rejects an adapter it cannot read).
 10. Test with a known squad: `squads run ./examples/cc-code-review --runtime {runtime_id}`.
 
 See `references/11-adapters-guide.md` for the complete authoring guide.

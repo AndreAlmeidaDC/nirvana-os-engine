@@ -13,7 +13,7 @@
  * snapshotted and block the update before the first write.
  *
  * Usage:
- *   bun install-content.ts <contentDir> --slug <slug> [--dry]
+ *   bun install-content.ts <contentDir> --slug <slug> [--dry] [--skip-validate]
  *
  * <contentDir> = the pack's `starter-pack` dir (squads/ businesses/ mind-clones/).
  */
@@ -42,14 +42,31 @@ function auditEmit(event: string, payload: Record<string, unknown>): void {
   } catch { /* audit unavailable (partial install) — installing still wins */ }
 }
 
-const HOME = homedir();
-const SQUADS_DIR = join(HOME, "squads");
-const BUSINESSES_DIR = join(HOME, "businesses");
-const DNA_DIR = join(BUSINESSES_DIR, "_library/dna");
-const PACKS_DIR = join(HOME, ".nirvana", "packs");
+// Lazy, env-aware roots — the same resolution `installer.ts` and `paths.js` use.
+// These used to be `homedir()` joins fixed at module scope, so a machine with
+// NIRVANA_HOME or SQUADS_DIR set got the engine in one place and the paid
+// content in another. It also made the overlay untestable by environment:
+// `os.homedir()` follows `$HOME` on macOS and Linux but `%USERPROFILE%` on
+// Windows, which is why a test that redirected only `HOME` passed on two
+// platforms and wrote into the real profile on the third (PR #133).
+function nirvanaHome(): string { return process.env.NIRVANA_HOME ?? homedir(); }
+function squadsDir(): string { return process.env.SQUADS_DIR ?? join(nirvanaHome(), "squads"); }
+function businessesDir(): string { return process.env.BUSINESSES_DIR ?? join(nirvanaHome(), "businesses"); }
+function dnaDir(): string { return process.env.DNA_LIBRARY ?? join(businessesDir(), "_library", "dna"); }
+function packsDir(): string { return join(nirvanaHome(), ".nirvana", "packs"); }
 
 const argv = process.argv.slice(2);
 const DRY = argv.includes("--dry");
+const SKIP_VALIDATE = argv.includes("--skip-validate");
+const NO_INDEX = argv.includes("--no-index");
+// --keep-clones (also --keep-squads / --keep-businesses): components of that
+// kind already on disk are neither replaced nor removed by this overlay; new
+// ones still arrive. For a buyer who edited a clone, this is how an update
+// stops being a choice between "new pack" and "my work".
+const KEEP = new Set<string>();
+if (argv.includes("--keep-clones") || argv.includes("--keep-mind-clones")) KEEP.add("mind-clones");
+if (argv.includes("--keep-squads")) KEEP.add("squads");
+if (argv.includes("--keep-businesses")) KEEP.add("businesses");
 const slugIdx = argv.indexOf("--slug");
 const SLUG = slugIdx >= 0 ? (argv[slugIdx + 1] ?? "") : "";
 const verIdx = argv.indexOf("--version");
@@ -89,7 +106,7 @@ function requiresEngine(): string | null {
 }
 function engineVersion(): string | null {
   // This script lives at <skills>/_shared/scripts/; the engine VERSION at <skills>/VERSION.
-  for (const p of [join(import.meta.dir, "..", "..", "VERSION"), join(HOME, ".nirvana", "skills", "VERSION")]) {
+  for (const p of [join(import.meta.dir, "..", "..", "VERSION"), join(homedir(), ".nirvana", "skills", "VERSION")]) {
     try { const v = readFileSync(p, "utf8").trim(); if (v) return v; } catch { /* next */ }
   }
   return null;
@@ -171,7 +188,7 @@ function recordInstall(m: Manifest): void {
     const items = ([["squad", m.squads], ["business", m.businesses], ["mind-clone", m["mind-clones"]]] as const)
       .flatMap(([kind, hashes]) => Object.keys(hashes ?? {}).map((slug) => ({
         kind, name: slug, slug,
-        path: join(kind === "squad" ? SQUADS_DIR : kind === "business" ? BUSINESSES_DIR : DNA_DIR, slug),
+        path: join(kind === "squad" ? squadsDir() : kind === "business" ? businessesDir() : dnaDir(), slug),
       })));
     new InstallManifest().append({
       ts: new Date().toISOString(),
@@ -194,13 +211,17 @@ function recordInstall(m: Manifest): void {
   }
 }
 
-const manifestPath = join(PACKS_DIR, `${SLUG}.json`);
+const manifestPath = join(packsDir(), `${SLUG}.json`);
 const man: Manifest = (() => { try { return JSON.parse(readFileSync(manifestPath, "utf8")); } catch { return {}; } })();
 
 const availableIn = (dir: string, marker: string): string[] =>
   existsSync(dir) ? readdirSync(dir).filter((e) => !e.startsWith(".") && e !== "README.md" && existsSync(join(dir, e, marker))) : [];
 
-interface SyncRes { added: string[]; updated: string[]; unchanged: string[]; removed: string[]; overwritten: string[]; hashes: Record<string, string>; breaking: BreakingChange[]; }
+interface SyncRes { added: string[]; updated: string[]; unchanged: string[]; removed: string[]; overwritten: string[]; kept: string[]; backedUp: string[]; hashes: Record<string, string>; breaking: BreakingChange[]; }
+
+// The guard: detect drift BEFORE the mutation, not after. updateObservations
+// carries what the preflight saw for each managed target, and mutateManaged
+// routes every write through it, stopping when the risk is real.
 let updateObservations = new Map<string, ManagedTargetObservation>();
 const observationKey = (kind: string, slug: string): string => `${kind}/${slug}`;
 function mutateManaged(kind: string, slug: string, mutate: () => void): void {
@@ -208,39 +229,68 @@ function mutateManaged(kind: string, slug: string, mutate: () => void): void {
   if (!observation) { mutate(); return; }
   const guarded = guardManagedMutation(
     observation,
-    join(HOME, ".nirvana", "customization-snapshots", `pack-${SLUG}`),
+    join(nirvanaHome(), ".nirvana", "customization-snapshots", `pack-${SLUG}`),
     mutate,
   );
   if (guarded.ok) return;
   reportBlockedUpdate([guarded.risk!], guarded.snapshot_dir);
   process.exit(1);
 }
-function syncKind(kind: string, srcRoot: string, dstRoot: string, available: string[], old: Record<string, string>): SyncRes {
+
+// The backup, kept alongside the guard rather than replaced by it: the guard
+// stops a component it can prove is user-owned, and the backup still covers an
+// edit to a pack-owned component that the guard does not claim. Where a
+// component goes before the overlay writes over it. One directory per overlay
+// run, created on first use so a run that backs nothing up leaves nothing
+// behind. Restoring is a copy back.
+const BACKUP_STAMP = new Date().toISOString().replace(/[:.]/g, "-");
+function backupRoot(): string { return join(nirvanaHome(), ".nirvana", "backups", "packs", SLUG, BACKUP_STAMP); }
+function backupComponent(kind: string, slug: string, dst: string, ex: string[]): void {
+  if (DRY) return;
+  const dest = join(backupRoot(), kind, slug);
+  mkdirSync(dest, { recursive: true });
+  cpSync(dst, dest, { recursive: true, force: true, filter: (p) => { const rel = relative(dst, p).split(sep).join("/"); return rel === "" || !isExcluded(rel, ex); } });
+}
+
+function syncKind(kind: string, srcRoot: string, dstRoot: string, available: string[], old: Record<string, string>, precomputed?: Record<string, string>): SyncRes {
   const ex = RUNSTATE_EXCLUDES[kind] ?? [];
-  const res: SyncRes = { added: [], updated: [], unchanged: [], removed: [], overwritten: [], hashes: {}, breaking: [] };
+  const keep = KEEP.has(kind);
+  const res: SyncRes = { added: [], updated: [], unchanged: [], removed: [], overwritten: [], kept: [], backedUp: [], hashes: {}, breaking: [] };
   if (available.length) mkdirSync(dstRoot, { recursive: true });
   for (const slug of available) {
     const src = join(srcRoot, slug), dst = join(dstRoot, slug);
-    const h = hashDir(src, ex); res.hashes[slug] = h;
-    if (!existsSync(dst)) { res.added.push(slug); if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex)); }
-    // Identical content can be adopted without loss. A different user-owned
-    // component is blocked by the all-kinds preflight before write mode gets
-    // here; dry mode still reports what would conflict.
-    else if (!(slug in old)) {
-      if (hashDir(dst, ex) === h) res.unchanged.push(slug);
-      else { res.overwritten.push(slug); if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex)); }
-    }
-    else {
-      const prev = old[slug] ?? hashDir(dst, ex);
-      if (prev !== h) {
-        res.updated.push(slug);
-        // BEFORE the mirror: the only window when installed and incoming coexist.
-        res.breaking.push(...contractBreaks(dst, src, `${kind}/${slug}`));
-        if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex));
-      } else res.unchanged.push(slug);
-    }
+    const h = precomputed?.[slug] ?? hashDir(src, ex); res.hashes[slug] = h;
+    if (!existsSync(dst)) { res.added.push(slug); if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex)); continue; }
+    // --keep-<kind>: what is on disk stays, whatever the pack carries. The
+    // manifest keeps saying what the pack last INSTALLED here (the previous
+    // hash), so the next overlay without the flag treats it as an update again
+    // rather than as already current. A component the pack never owned stays
+    // outside the manifest.
+    if (keep) { res.kept.push(slug); if (slug in old) res.hashes[slug] = old[slug]; else delete res.hashes[slug]; continue; }
+    // Collision: it exists on disk but the pack never owned it (outside the
+    // manifest) — a user creation with the same slug. The user's version is
+    // snapshotted, and the mutation is routed through the guard first, so a
+    // provable user-owned component stops the run instead of being replaced.
+    if (!(slug in old)) { res.overwritten.push(slug); res.backedUp.push(slug); backupComponent(kind, slug, dst, ex); if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex)); continue; }
+    const prev = old[slug];
+    if (prev !== h) {
+      res.updated.push(slug);
+      // BEFORE the mirror: the only window when installed and incoming coexist.
+      res.breaking.push(...contractBreaks(dst, src, `${kind}/${slug}`));
+      // Changed on disk since the pack installed it — the buyer's edits. Backed
+      // up before the overlay replaces them; an untouched component is not,
+      // because the pack can always reproduce it.
+      if (hashDir(dst, ex) !== prev) { res.backedUp.push(slug); backupComponent(kind, slug, dst, ex); }
+      if (!DRY) mutateManaged(kind, slug, () => mirror(src, dst, ex));
+    } else res.unchanged.push(slug);
   }
-  for (const slug of Object.keys(old)) { if (available.includes(slug)) continue; const dst = join(dstRoot, slug); if (existsSync(dst)) { res.removed.push(slug); if (!DRY) mutateManaged(kind, slug, () => removeManagedTree(dst, ex)); } }
+  for (const slug of Object.keys(old)) {
+    if (available.includes(slug)) continue;
+    const dst = join(dstRoot, slug);
+    if (!existsSync(dst)) continue;
+    if (keep) { res.kept.push(slug); res.hashes[slug] = old[slug]; continue; }
+    res.removed.push(slug); if (!DRY) mutateManaged(kind, slug, () => removeManagedTree(dst, ex));
+  }
   return res;
 }
 
@@ -256,19 +306,19 @@ const availableClones = availableIn(cloneSrc, "MANIFEST.yaml");
 const updatePlans = [
   collectManagedUpdatePlan({
     ownership: "pack-managed", ownerId: SLUG, kind: "squads",
-    sourceRoot: squadsSrc, targetRoot: SQUADS_DIR, incomingSlugs: availableSquads,
+    sourceRoot: squadsSrc, targetRoot: squadsDir(), incomingSlugs: availableSquads,
     installedHashes: man.squads ?? {}, excludes: RUNSTATE_EXCLUDES.squads ?? [],
     baseVersion: man.version, incomingVersion: VERSION,
   }),
   collectManagedUpdatePlan({
     ownership: "pack-managed", ownerId: SLUG, kind: "mind-clones",
-    sourceRoot: cloneSrc, targetRoot: DNA_DIR, incomingSlugs: availableClones,
+    sourceRoot: cloneSrc, targetRoot: dnaDir(), incomingSlugs: availableClones,
     installedHashes: man["mind-clones"] ?? {}, excludes: RUNSTATE_EXCLUDES["mind-clones"] ?? [],
     baseVersion: man.version, incomingVersion: VERSION,
   }),
   collectManagedUpdatePlan({
     ownership: "pack-managed", ownerId: SLUG, kind: "businesses",
-    sourceRoot: bizSrc, targetRoot: BUSINESSES_DIR, incomingSlugs: availableBusinesses,
+    sourceRoot: bizSrc, targetRoot: businessesDir(), incomingSlugs: availableBusinesses,
     installedHashes: man.businesses ?? {}, excludes: RUNSTATE_EXCLUDES.businesses ?? [],
     baseVersion: man.version, incomingVersion: VERSION,
   }),
@@ -279,7 +329,7 @@ updateObservations = new Map(updatePlans.flatMap((plan) => plan.observations)
 if (updateRisks.length > 0) {
   const snapshotDir = DRY
     ? undefined
-    : createCustomizationSnapshot(updateRisks, join(HOME, ".nirvana", "customization-snapshots", `pack-${SLUG}`));
+    : createCustomizationSnapshot(updateRisks, join(nirvanaHome(), ".nirvana", "customization-snapshots", `pack-${SLUG}`));
   reportBlockedUpdate(updateRisks, snapshotDir);
   if (!DRY) process.exit(1);
 }
@@ -304,10 +354,61 @@ auditEmit("x_install_order_resolved", {
   edges: packGraph.edges.length,
 });
 
+const KIND_SOURCES: Record<string, { src: string; dst: string; marker: string; entity: "squad" | "business" | "mind-clone"; recorded: Record<string, string> }> = {
+  "squads": { src: squadsSrc, dst: squadsDir(), marker: "squad.yaml", entity: "squad", recorded: man.squads ?? {} },
+  "businesses": { src: bizSrc, dst: businessesDir(), marker: "business.yaml", entity: "business", recorded: man.businesses ?? {} },
+  "mind-clones": { src: cloneSrc, dst: dnaDir(), marker: "MANIFEST.yaml", entity: "mind-clone", recorded: man["mind-clones"] ?? {} },
+};
+
+// ── The admission gate, per entity, BEFORE anything is mirrored ─────────────
+//
+// Only what is actually ENTERING is checked: a slug whose source hash equals
+// the one this pack recorded last time is already installed and unchanged, and
+// re-judging it every update would make an install pay for the whole library.
+// The hashes computed here are handed to syncKind so nothing is hashed twice.
+//
+// A refusal aborts the WHOLE overlay before the first file moves — a pack that
+// half-installs is worse than one that does not install. And it only ever
+// refuses when the buyer turned `verify.enforce_on_install` on: with the
+// shipped defaults this block prints and proceeds.
+const srcHashes: Record<string, Record<string, string>> = {};
+const entering: Array<{ kind: string; entity: "squad" | "business" | "mind-clone"; slug: string; dir: string }> = [];
+for (const [kind, k] of Object.entries(KIND_SOURCES)) {
+  const ex = RUNSTATE_EXCLUDES[kind] ?? [];
+  srcHashes[kind] = {};
+  for (const slug of availableIn(k.src, k.marker)) {
+    const dir = join(k.src, slug);
+    const h = hashDir(dir, ex);
+    srcHashes[kind][slug] = h;
+    if (!existsSync(join(k.dst, slug)) || k.recorded[slug] !== h) entering.push({ kind, entity: k.entity, slug, dir });
+  }
+}
+if (entering.length) {
+  // Loaded lazily and defensively: a gate that cannot even be imported (a
+  // partially updated engine, a skills tree mid-copy) must not be the reason
+  // a paid pack fails to install.
+  const verifyHook = await import("../lib/verify/index.ts")
+    .then((m) => m.verifyHook)
+    .catch((e) => { console.warn(`  verify: the admission gate is unavailable (${(e as Error).message}) — installing without it`); return null; });
+  const refused: string[] = [];
+  for (const e of verifyHook ? entering : []) {
+    const gate = await verifyHook!({ kind: e.entity, target: e.dir, gate: "install", skip: SKIP_VALIDATE, stateDir: null });
+    for (const line of gate.lines) console.warn(`  ${line}`);
+    if (gate.blocked) refused.push(`${e.kind}/${e.slug}`);
+  }
+  if (refused.length) {
+    console.error(`\ninstall-content: ${refused.length} component(s) were refused by the admission gate (verify.enforce_on_install):`);
+    for (const r of refused) console.error(`    ✗ ${r}`);
+    console.error("  Nothing was installed. Fix them with `nrv validate <kind> <slug> --fix`, or re-run with --skip-validate.\n");
+    auditEmit("x_verify_install_refused", { pack: SLUG, refused });
+    process.exit(1);
+  }
+}
+
 const kindRuns: Record<string, () => SyncRes> = {
-  "squads": () => syncKind("squads", squadsSrc, SQUADS_DIR, availableSquads, man.squads ?? {}),
-  "businesses": () => syncKind("businesses", bizSrc, BUSINESSES_DIR, availableBusinesses, man.businesses ?? {}),
-  "mind-clones": () => syncKind("mind-clones", cloneSrc, DNA_DIR, availableClones, man["mind-clones"] ?? {}),
+  "squads": () => syncKind("squads", squadsSrc, squadsDir(), availableIn(squadsSrc, "squad.yaml"), man.squads ?? {}, srcHashes["squads"]),
+  "businesses": () => syncKind("businesses", bizSrc, businessesDir(), availableIn(bizSrc, "business.yaml"), man.businesses ?? {}, srcHashes["businesses"]),
+  "mind-clones": () => syncKind("mind-clones", cloneSrc, dnaDir(), availableIn(cloneSrc, "MANIFEST.yaml"), man["mind-clones"] ?? {}, srcHashes["mind-clones"]),
 };
 const runs: Record<string, SyncRes> = {};
 for (const kind of kindOrder.order) runs[kind] = kindRuns[kind]();
@@ -322,7 +423,7 @@ const sq = runs["squads"], bz = runs["businesses"], cl = runs["mind-clones"];
   for (const bind of scan.bindings) {
     if (bind.dangling) continue;
     if (scan.availableClones.has(bind.clone)) continue;
-    if (existsSync(join(DNA_DIR, bind.clone))) continue;
+    if (existsSync(join(dnaDir(), bind.clone))) continue;
     const key = `${bind.clone}|${bind.business}/${bind.employee}`;
     if (reported.has(key)) continue;
     reported.add(key);
@@ -331,7 +432,7 @@ const sq = runs["squads"], bz = runs["businesses"], cl = runs["mind-clones"];
   }
 }
 
-const line = (l: string, r: SyncRes) => console.log(`  ${l}: ${r.added.length} new · ${r.updated.length} updated · ${r.unchanged.length} unchanged · ${r.removed.length} removed${r.overwritten.length ? ` · ${r.overwritten.length} overwritten` : ""}`);
+const line = (l: string, r: SyncRes) => console.log(`  ${l}: ${r.added.length} new · ${r.updated.length} updated · ${r.unchanged.length} unchanged · ${r.removed.length} removed${r.kept.length ? ` · ${r.kept.length} kept (local)` : ""}${r.overwritten.length ? ` · ${r.overwritten.length} OVERWRITTEN` : ""}`);
 console.log(`${DRY ? "[DRY] " : ""}install-content '${SLUG}' ← ${CONTENT}`);
 line("squads", sq); line("businesses", bz); line("mind-clones", cl);
 
@@ -352,9 +453,21 @@ if (collisions.length > 0) {
   console.log("    Move the customization to an overlay, a different slug, or a fork, then rerun.");
   console.log("    Your run-state (projects/, outputs/, memory/projects) was preserved.");
 }
+// What the overlay wrote over that the buyer had changed: named, and where it
+// went. The one loss this script can cause is edits made after install; a line
+// that says "backed up" and a directory that holds them is the difference
+// between an update and an accident.
+const backedUp = ([["squads", sq], ["businesses", bz], ["mind-clones", cl]] as const)
+  .flatMap(([l, r]) => r.backedUp.map((s) => `${l}/${s}`));
+if (backedUp.length > 0) {
+  console.log();
+  console.log(`  ${DRY ? "WOULD BACK UP" : "BACKED UP"}: ${backedUp.length} component(s) changed on this machine since the pack installed them${DRY ? "" : ` → ${backupRoot()}`}`);
+  for (const c of backedUp) console.log(`    ~ ${c}`);
+  console.log(`    Restore one by copying it back over the installed directory; keep it out of future updates with --keep-<kind>.`);
+}
 
 if (!DRY) {
-  mkdirSync(PACKS_DIR, { recursive: true });
+  mkdirSync(packsDir(), { recursive: true });
   const out: Manifest = { slug: SLUG, ownership: "pack-managed", version: VERSION, updated_at: new Date().toISOString(), squads: sq.hashes, businesses: bz.hashes, "mind-clones": cl.hashes };
   writeFileSync(manifestPath, JSON.stringify(out, null, 2) + "\n");
   recordInstall(out);
@@ -365,8 +478,9 @@ if (!DRY) {
   // lived elsewhere. Now it falls back to the engine's own indexer, which is
   // where it always is: whoever gets here already has the engine, because this
   // script lives inside it.
+  if (NO_INDEX) { console.log("  (--no-index) registries not rebuilt — run 'nrv index' before routing to the new content."); process.exit(0); }
   console.log("  re-indexing registries...");
-  const nrvBin = join(HOME, ".local", "bin", "nrv");
+  const nrvBin = join(homedir(), ".local", "bin", "nrv");
   const indexer = join(import.meta.dir, "..", "..", "harness", "scripts", "index.ts");
   const reindex = existsSync(nrvBin)
     ? spawnSync(nrvBin, ["index"], { stdio: "inherit" })

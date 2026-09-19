@@ -34,6 +34,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { parseArgs, EXIT, log, paths } from "../lib/bun-helpers.ts";
+import { ProjectService } from "../../harness/lib/control-plane/project-service.ts";
+import { openclawAgentFor, openclawBindCommand } from "../lib/openclaw.ts";
+import { detectOrca, orcaHostActive, orcaRegisterProject, orcaSetWorkspace, resolveOrcaExecutable } from "../lib/orca.ts";
 
 const SKILLS_ROOT = process.env.NIRVANA_SKILLS_DIR
   || (fs.existsSync(path.join(os.homedir(), ".nirvana", "skills")) ? path.join(os.homedir(), ".nirvana", "skills") : path.join(os.homedir(), ".claude", "skills"));
@@ -117,6 +120,30 @@ function copyFile(src: string, dst: string, overwrite = false) {
  * If `dst` doesn't exist, it's created from scratch with just the snippet.
  * Preserves the user's pre-existing content untouched (we never overwrite).
  */
+/** The rules `nrv init` writes into `<target>/.claude/settings.json`
+ *  (`permissions.deny`), merged into whatever the project already has. */
+export const CLAUDE_DENY_RULES = ["Read(./.env)", "Read(./.env.*)", "Read(./**/.env)", "Read(./**/.env.*)"];
+
+function ensureClaudeDenyRules(target: string): boolean {
+  const dir = path.join(target, ".claude");
+  const file = path.join(dir, "settings.json");
+  let settings: any = {};
+  if (fs.existsSync(file)) {
+    try { settings = JSON.parse(fs.readFileSync(file, "utf8")); }
+    catch { log.warn(`not valid JSON, left alone: ${file}`); return false; }
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) { log.warn(`unexpected shape, left alone: ${file}`); return false; }
+  }
+  const perms = (settings.permissions && typeof settings.permissions === "object") ? settings.permissions : (settings.permissions = {});
+  const deny: string[] = Array.isArray(perms.deny) ? perms.deny : (perms.deny = []);
+  const missing = CLAUDE_DENY_RULES.filter((r) => !deny.includes(r));
+  if (!missing.length) { log.info(`dotenv deny rules already present: ${file}`); return false; }
+  deny.push(...missing);
+  ensureDir(dir);
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  log.ok(`wrote dotenv deny rules (${missing.length}) to ${file}`);
+  return true;
+}
+
 function appendWithMarker(src: string, dst: string, marker: string, label = "snippet"): boolean {
   if (!fs.existsSync(src)) {
     log.warn(`snippet missing: ${src}`);
@@ -336,8 +363,54 @@ async function main() {
     const agentsTemplate = path.join(SKILLS_ROOT, "_shared", "templates", "AGENTS.md");
     const writingContractSnippet = path.join(SKILLS_ROOT, "_shared", "templates", "writing-contract-snippet.md");
     const onDemandSnippet = path.join(SKILLS_ROOT, "_shared", "templates", "on-demand-contract-snippet.md");
-    const WRITING_CONTRACT_MARKER = "<!-- nirvana-os:writing-contract:v1 -->";
-    const INVOCATION_CONTRACT_MARKER = "<!-- nirvana-os:invocation-contract:v1 -->";
+    const WRITING_CONTRACT_MARKER = "<!-- nirvana-os:writing-contract:v2 -->";
+    const INVOCATION_CONTRACT_MARKER = "<!-- nirvana-os:invocation-contract:v2 -->";
+    // Markers of earlier contracts. A project initialised under one of them
+    // kept the old text forever: the marker check made init skip the file, so
+    // the fix that renamed the entry skill and added the discovery commands
+    // reached new projects only. The block under an older marker (up to the
+    // next nirvana-os marker, or the end of the file) is replaced by the
+    // current template; the user's own lines above it and the other contracts
+    // below it stay where they are.
+    const refreshManagedBlock = (dst: string, label: string, olderMarkers: string[], currentMarker: string, templatePath: string, endSentinel?: string): boolean => {
+      if (!fs.existsSync(dst) || !fs.existsSync(templatePath)) return false;
+      const existing = fs.readFileSync(dst, "utf8");
+      const old = olderMarkers.find((m) => existing.includes(m));
+      if (!old) return false;
+      const start = existing.indexOf(old);
+      const after = existing.slice(start + old.length);
+      // The block ends at the next nirvana-os marker, or at the old block's own
+      // last line when the caller names it (the writing contract has no marker
+      // after it, and lines the user added below it must survive), or at EOF.
+      const nextMarker = after.search(/<!-- nirvana-os:[a-z-]+:v\d+ -->/);
+      const sentinelAt = endSentinel ? after.indexOf(endSentinel) : -1;
+      const candidates = [nextMarker >= 0 ? nextMarker : Infinity, sentinelAt >= 0 ? sentinelAt + endSentinel!.length : Infinity];
+      const cut = Math.min(...candidates);
+      const end = Number.isFinite(cut) ? start + old.length + cut : existing.length;
+      // A snippet may open with a separator (`---`) before its marker; the
+      // block replaced here starts at the marker, so drop that lead-in.
+      const template = fs.readFileSync(templatePath, "utf8").replace(/^[\s\S]*?(?=<!-- nirvana-os:)/, "").replace(/\s*$/, "\n");
+      let tail = existing.slice(end).replace(/^\s*/, "");
+      // A second copy of the old block (an earlier init appended one it did not
+      // recognise) goes with it: same bounds, same rule.
+      for (let guard = 0; guard < 8; guard++) {
+        const dupAt = tail.indexOf(old);
+        if (dupAt < 0) break;
+        const rest = tail.slice(dupAt + old.length);
+        const m2 = rest.search(/<!-- nirvana-os:[a-z-]+:v\d+ -->/);
+        const s2 = endSentinel ? rest.indexOf(endSentinel) : -1;
+        const c2 = Math.min(m2 >= 0 ? m2 : Infinity, s2 >= 0 ? s2 + endSentinel!.length : Infinity);
+        const dupEnd = Number.isFinite(c2) ? dupAt + old.length + c2 : tail.length;
+        tail = (tail.slice(0, dupAt).replace(/\s*(---\s*)?$/, "\n") + tail.slice(dupEnd).replace(/^\s*/, "\n")).replace(/^\s*/, "");
+      }
+      fs.writeFileSync(dst, existing.slice(0, start) + template + (tail ? "\n" + tail : ""));
+      log.ok(`refreshed ${label} (${old.match(/v\d+/)![0]} → ${currentMarker.match(/v\d+/)![0]}): ${dst}`);
+      return true;
+    };
+    const refreshInvocationContract = (dst: string) =>
+      refreshManagedBlock(dst, "invocation contract", ["<!-- nirvana-os:invocation-contract:v1 -->"], INVOCATION_CONTRACT_MARKER, agentsTemplate);
+    const refreshWritingContract = (dst: string) =>
+      refreshManagedBlock(dst, "writing contract", ["<!-- nirvana-os:writing-contract:v1 -->"], WRITING_CONTRACT_MARKER, writingContractSnippet, "Gate flags = build fails. No auto-rewrite.");
     const ON_DEMAND_MARKER = "<!-- nirvana-os:on-demand-contract:v1 -->";
 
     // How Nirvana behaves in THIS project is the owner's call, and it matters
@@ -385,6 +458,10 @@ async function main() {
     } else if (fs.existsSync(agentsTemplate)) {
       for (const name of ["AGENTS.md", "CLAUDE.md", "GEMINI.md"]) {
         const dst = path.join(target, name);
+        // Phase 0: a contract written by an earlier engine is brought to the
+        // current text, in place.
+        refreshInvocationContract(dst);
+        refreshWritingContract(dst);
         // Phase 1: only copy the base if the file is absent (never overwrite
         // pre-existing rules the user wrote).
         if (!fs.existsSync(dst)) {
@@ -409,6 +486,11 @@ async function main() {
     } else {
       log.warn(`AGENTS.md template missing: ${agentsTemplate} — skipping agent contract`);
     }
+
+    // Claude Code deny rules for the project's dotenv files: `deny` applies
+    // before the folder is trusted, to Read and to the shell alike. A layer,
+    // not the guarantee: file ownership and the child-env allowlist are.
+    ensureClaudeDenyRules(target);
 
     if (scope && scope !== "global") {
       const envPath = path.join(target, ".env");
@@ -528,6 +610,15 @@ async function main() {
     ensureDir(path.join(target, ".nirvana", sub));
   }
   copyFile(path.join(TEMPLATE_DIR, ".nirvana", "README.md"), path.join(target, ".nirvana", "README.md"), force);
+  if (!linkOnly) {
+    const projectService = new ProjectService();
+    const project = projectService.create({
+      projectRoot: target,
+      scope: (scope as "global" | "project" | "merge" | null) || "global",
+      orchestrationMode: orchestrators as "always" | "on-demand",
+    });
+    log.ok(`project manifest: ${path.join(target, ".nirvana", "project.yaml")} (${project.project_id})`);
+  }
 
   // Per-agent symlinks (or copies) — only when withSkills is on.
   // Otherwise we'd create dozens of symlinks pointing to a non-existent
@@ -561,13 +652,57 @@ async function main() {
   try {
     const result = require("node:child_process").spawnSync("bun", [path.join(SKILLS_ROOT, "_shared", "scripts", "install.ts"), "--check"], { encoding: "utf8" });
     if (result.status !== 0) {
-      log.warn(`Audit hooks are NOT yet wired into your agents. Run: nrv install`);
+      log.warn(`Audit hooks are NOT yet wired into your agents. Run: nrv setup`);
       log.info(`(this configures Claude Code + Gemini-CLI to emit audit events automatically)`);
     } else {
       log.ok(`Audit hooks active across installed agents — runs auto-track in 'nrv glance'.`);
     }
   } catch { /* check is best-effort */ }
+  // The claws. Claude, Codex, Gemini and Hermes work where they are started, so
+  // "open it here" is the whole recipe. OpenClaw works in an agent's workspace,
+  // and the way this directory becomes that agent's home is one command — said
+  // here, once, because nothing in OpenClaw will ever say it.
+  try {
+    if (binOnPath("openclaw")) {
+      const bound = openclawAgentFor(target);
+      if (bound) {
+        log.ok(`OpenClaw: agent '${bound.id}' already has this project as its workspace.`);
+      } else {
+        log.info(`OpenClaw: to make this project an agent's workspace (AGENTS.md becomes its instructions; every nrv call logs here):`);
+        log.info(`  ${openclawBindCommand(target, path.basename(target))}`);
+        log.info(`  OpenClaw then scaffolds SOUL.md, IDENTITY.md, USER.md and memory/ in the project; memory/ is git-ignored.`);
+      }
+    }
+    if (binOnPath("hermes")) {
+      log.info(`Hermes: nrv-hermes from this directory (or hermes chat --in ${target}) — AGENTS.md is injected from cwd and the audit hooks already log here.`);
+    }
+    // Orca is a host: a project it knows is a workspace with a card that the
+    // ledger keeps current. Inside an Orca terminal the new project is
+    // registered here (that is what opening it in Orca means); outside, the
+    // one command is printed and nothing is called.
+    const orcaExe = resolveOrcaExecutable();
+    const orcaHere = detectOrca();
+    if (orcaHere && orcaHostActive()) {
+      const resolvedTarget = fs.realpathSync(target);
+      if (orcaHere.worktreeId && orcaHere.worktreeId.split("::").pop() === resolvedTarget) {
+        orcaSetWorkspace({ comment: "nirvana project · ready", status: "todo" });
+        log.ok("Orca: this directory is the current Orca workspace; its card now follows the ledger.");
+      } else {
+        const reg = orcaRegisterProject(resolvedTarget);
+        if (reg.ok) log.ok(`Orca: registered as workspace '${reg.displayName ?? path.basename(target)}' — every run shows on its card.`);
+        else log.info(`Orca: could not register this directory (${reg.reason}); register it with: ${orcaExe} repo add --path ${target}`);
+      }
+    } else if (binOnPath(orcaExe)) {
+      log.info(`Orca: ${orcaExe} repo add --path ${target} makes this project an Orca workspace; inside Orca every run shows on its card and headless dispatches run as worker terminals.`);
+    }
+  } catch { /* hints are best-effort */ }
   process.exit(EXIT.OK);
+}
+
+/** `where` on Windows, `which` elsewhere: is the CLI on PATH? */
+function binOnPath(bin: string): boolean {
+  const probe = process.platform === "win32" ? "where" : "which";
+  try { return require("node:child_process").spawnSync(probe, [bin], { stdio: "ignore" }).status === 0; } catch { return false; }
 }
 
 await main();

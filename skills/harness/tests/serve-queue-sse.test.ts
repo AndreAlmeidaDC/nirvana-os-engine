@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnBudgetMs } from "./helpers/test-budgets.ts";
 
 const root = mkdtempSync(join(tmpdir(), "serve-queue-"));
 const dispatchFixture = join(root, "slow-dispatch.ts");
@@ -64,6 +65,7 @@ beforeAll(async () => {
   process.env.NIRVANA_SERVE_DISPATCH_BIN = dispatchFixture;
   process.env.NIRVANA_RUN_LEDGER_DB = join(root, "ledger.sqlite");
   process.env.FIXTURE_MARKS = marksFile;
+  process.env.NIRVANA_CHILD_ENV_EXTRA = "FIXTURE_MARKS,FIXTURE_MS";
   mkdirSync(join(root, "serve"), { recursive: true });
   writeFileSync(marksFile, "");
 
@@ -113,7 +115,7 @@ describe("queue", () => {
     // second starts only after the first finished — serialization proved
     expect(bStart).toBeGreaterThanOrEqual(aEnd - 5);
     expect(aStart).toBeLessThan(bStart);
-  });
+  }, spawnBudgetMs(2));
 
   test("different sessions DO run in parallel under the cap", async () => {
     writeFileSync(marksFile, "");
@@ -130,7 +132,7 @@ describe("queue", () => {
     const ends = marks.filter((m) => m.phase === "end").map((m) => m.at).sort();
     // the second run started before the first one ended — real overlap
     expect(starts[1]).toBeLessThan(ends[1]);
-  });
+  }, spawnBudgetMs(2));
 });
 
 describe("SSE", () => {
@@ -163,5 +165,27 @@ describe("SSE", () => {
       if (ev.event === "run.finished") continue;
       expect(ev.trace_id ?? ev.project_id).toBe(r.trace_id);
     }
-  });
+  }, spawnBudgetMs(1));
+
+  test("a client that disconnects mid-run does not take the server down with it", async () => {
+    process.env.FIXTURE_MS = "600";
+    const { session_id } = await (await api("/v1/sessions", { method: "POST" })).json();
+    const r = await (await api(`/v1/sessions/${session_id}/briefs`, { method: "POST", body: JSON.stringify({ brief: "desconecta cedo" }) })).json();
+
+    const res = await api(`/v1/sessions/${session_id}/runs/${r.trace_id}/events`);
+    // Cancel while the run is still in flight — this is exactly what left
+    // the polling interval's next `enqueue()` throwing uncaught against a
+    // dead controller before `cancel()` was wired up.
+    await res.body!.cancel();
+
+    // Several 150ms poll ticks fire against the cancelled stream before the
+    // fixture even finishes (FIXTURE_MS=600 above).
+    await new Promise((res2) => setTimeout(res2, 500));
+
+    // If that throw had gone uncaught, the process would be gone and this
+    // would time out or the connection would reset instead of answering.
+    const health = await api("/v1/health");
+    expect(health.status).toBe(200);
+    delete process.env.FIXTURE_MS;
+  }, spawnBudgetMs(1));
 });

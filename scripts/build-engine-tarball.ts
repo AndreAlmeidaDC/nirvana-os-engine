@@ -8,14 +8,18 @@
  * Engine updates ship by cutting a new GitHub release — npm is never touched.
  *
  * Layout inside the tarball (extract root):
- *   skills/{harness,businesses,squads,_shared,nirvana-os} + VERSION + EDITION
+ *   skills/{harness,businesses,squads,_shared,nirvana} + VERSION + EDITION
  *   bin/{nrv,nrv-gemini,nrv-hermes}
  *   scripts/install.ts
  *   package.json (engine deps + version)  +  bun.lock
  *
- * Invariants (build fails otherwise): 5 skills, ZERO deliverable content
- * (squad.yaml / business.yaml / MANIFEST.yaml outside any templates/ dir),
- * ZERO watermark.
+ * Invariants (build fails otherwise): every skill in SKILLS, ZERO deliverable content
+ * (squad.yaml / business.yaml / MANIFEST.yaml outside any templates/ dir).
+ *
+ * A per-buyer attribution self-check also runs on this same staged tree, but
+ * lives in the private nirvana-packs repo (never in a public GitHub repo)
+ * and is run by hand before a release tag is ever pushed — see that repo's
+ * scripts/verify-engine-tarball-clean.ts.
  *
  * Usage: bun scripts/build-engine-tarball.ts [outDir]
  */
@@ -23,6 +27,10 @@ import { cpSync, existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, rea
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+// The ONE list of shipped skills — the same the installer and uninstaller use.
+// A private copy here drifted from it once already (a rename would have passed
+// the build here and failed the install there).
+import { SKILLS } from "../skills/_shared/lib/runtime-dirs.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(SCRIPT_DIR, "..");
@@ -30,7 +38,6 @@ const OUT = resolve(process.argv[2] ?? join(SRC, "dist"));
 const STAGE = join(OUT, "engine-stage");
 const TARBALL = join(OUT, "nirvana-os-engine.tar.gz");
 
-const SKILLS = ["harness", "businesses", "squads", "_shared", "nirvana-os"];
 const BINARIES = ["nrv", "nrv-gemini", "nrv-hermes"];
 const COPY_FILTER = (s: string): boolean =>
   !s.split(/[\\/]/).includes("node_modules") && !s.endsWith(".DS_Store") && !/\.bak\./.test(s);
@@ -47,19 +54,6 @@ function findContentLeaks(root: string): string[] {
     }
   })(root);
   return leaks;
-}
-
-const WM_RE = /^\/\/[A-Za-z0-9_-]{22}$|^\[\/\/\]: # \([A-Za-z0-9_-]{22}\)$|^#[A-Za-z0-9_-]{22}$/m;
-function findWatermarks(root: string): string[] {
-  const hits: string[] = [];
-  (function walk(dir: string) {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      const abs = join(dir, e.name);
-      if (e.isDirectory()) { if (e.name !== "node_modules") walk(abs); }
-      else { try { if (WM_RE.test(readFileSync(abs, "utf8"))) hits.push(abs.slice(root.length + 1)); } catch { /* binary */ } }
-    }
-  })(root);
-  return hits;
 }
 
 console.log("Building Nirvana-OS engine tarball");
@@ -100,7 +94,6 @@ if (existsSync(join(SRC, "bun.lock"))) cpSync(join(SRC, "bun.lock"), join(STAGE,
 // invariants
 const skillCount = readdirSync(join(STAGE, "skills")).filter((e) => SKILLS.includes(e)).length;
 const leaks = findContentLeaks(STAGE);
-const wms = findWatermarks(STAGE);
 // .env gate: NO .env may ship, EXCEPT the generic project-skeleton
 // template — and even that one may not contain anything that looks like a secret.
 // The owner's personal .env is never publishable (owner's rule, 2026-07-02).
@@ -119,13 +112,11 @@ const walkEnv = (dir: string): void => {
 };
 walkEnv(STAGE);
 console.log(`  version:      ${version}`);
-console.log(`  skills:       ${skillCount}/5`);
+console.log(`  skills:       ${skillCount}/${SKILLS.length}`);
 console.log(`  content leak: ${leaks.length === 0 ? "none (correct)" : `${leaks.length} — ERROR`}`);
-console.log(`  watermark:    ${wms.length === 0 ? "clean (correct)" : `${wms.length} — ERROR`}`);
 console.log(`  .env gate:    ${envLeaks.length === 0 ? "clean (only the skeleton template)" : `${envLeaks.length} — ERROR`}`);
-if (skillCount !== 5 || leaks.length > 0 || wms.length > 0 || envLeaks.length > 0) {
+if (skillCount !== SKILLS.length || leaks.length > 0 || envLeaks.length > 0) {
   for (const l of leaks) console.error(`  content: ${l}`);
-  for (const w of wms) console.error(`  watermark: ${w}`);
   for (const ev of envLeaks) console.error(`  .env: ${ev}`);
   console.error("\nBuild FAILED invariants.");
   process.exit(1);
@@ -148,4 +139,13 @@ if (spawnSync("tar", ["-czf", relTarball, "."], { stdio: "inherit", cwd: STAGE, 
   process.exit(1);
 }
 rmSync(STAGE, { recursive: true, force: true });
+// The checksum sidecar, in sha256sum format, so a downloader can prove the
+// bytes that arrived are the bytes the CI produced. The release workflow
+// attaches it beside the tarball; bootstrap.sh / .ps1 and cli.mjs verify it.
+{
+  const { createHash } = await import("node:crypto");
+  const digest = createHash("sha256").update(readFileSync(TARBALL)).digest("hex");
+  writeFileSync(`${TARBALL}.sha256`, `${digest}  nirvana-os-engine.tar.gz\n`);
+  console.log(`  sha256:       ${digest}`);
+}
 console.log(`\nOK → ${TARBALL}`);

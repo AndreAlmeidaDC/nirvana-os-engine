@@ -56,10 +56,18 @@ function fix_runtime_requirements_default(squadDir, patch) {
   const m = readYaml(file);
   if (!m) return { ok: false, reason: 'manifest unreadable' };
   m.runtime_requirements ??= {};
-  // Pydantic SquadManifest expects RuntimeRequirementMin objects: {runtime, version?}
-  if (!Array.isArray(m.runtime_requirements.minimum) || m.runtime_requirements.minimum.length === 0) {
-    m.runtime_requirements.minimum = [{ runtime: 'claude-code' }];
-  } else {
+  // A squad that declares nothing follows the session (policy: active). This
+  // fixer used to pin `minimum: claude-code` here, which under the old
+  // `declared` default refused every runtime the list did not name: 153
+  // squads of the library ended up pinned that way (owner doctrine, 2026-09-16:
+  // the run follows the runtime the user is working in).
+  if (m.runtime_requirements.policy === 'declared' && (!Array.isArray(m.runtime_requirements.minimum) || m.runtime_requirements.minimum.length === 0)) {
+    m.runtime_requirements.policy = 'active';
+    m.runtime_requirements.incompatible ??= [];
+  } else if (!m.runtime_requirements.policy && (!Array.isArray(m.runtime_requirements.minimum) || m.runtime_requirements.minimum.length === 0)) {
+    m.runtime_requirements.policy = 'active';
+    m.runtime_requirements.incompatible ??= [];
+  } else if (Array.isArray(m.runtime_requirements.minimum)) {
     // Coerce string entries to objects (legacy v4 squads sometimes used bare strings)
     m.runtime_requirements.minimum = m.runtime_requirements.minimum.map(e =>
       typeof e === 'string' ? { runtime: e } : e
@@ -118,38 +126,37 @@ function fix_dependencies_synth(squadDir) {
   return { ok: true, kind: 'manifest_pointer' };
 }
 
-function fix_humanize_default_true(squadDir) {
-  // The strict v5 capability schema uses `outputs[]` (array). Humanize is
-  // a per-output property. Migrate any legacy singular `output` field to
-  // `outputs` and ensure humanize=true on human-facing outputs.
+function fix_outputs_shape_repair(squadDir) {
+  // What survives of the retired `humanize` fixer: the half that was actually
+  // repairing something. The strict v5/v6 capability schema knows `outputs[]`
+  // with `{name, type, format?, schema?, description?}` and rejects a singular
+  // `output`, a bare string entry, and the `humanize` / `kind` keys the old
+  // fixer used to WRITE — which is how `fix-squad --apply` could turn a valid
+  // manifest into an invalid one.
   const file = path.join(squadDir, 'squad.yaml');
   const m = readYaml(file);
   if (!m || !Array.isArray(m.capabilities)) return { ok: false };
-  const HUMAN_KINDS = new Set(['markdown', 'html', 'string', 'text']);
   let changed = 0;
   for (const c of m.capabilities) {
+    if (typeof c !== 'object' || !c) continue;
     if ('output' in c && !Array.isArray(c.outputs)) {
       const o = c.output;
-      const kind = typeof o === 'string' ? o : (o?.type || o?.kind);
-      c.outputs = [typeof o === 'string'
-        ? { type: o, humanize: HUMAN_KINDS.has(String(o).toLowerCase()) }
-        : { ...o, humanize: o?.humanize ?? HUMAN_KINDS.has(String(kind).toLowerCase()) }];
+      c.outputs = [typeof o === 'string' ? { type: o } : { ...o }];
       delete c.output;
       changed++;
-      continue;
     }
-    if (Array.isArray(c.outputs)) {
-      for (const o of c.outputs) {
-        const kind = typeof o === 'string' ? o : (o?.type || o?.kind);
-        if (kind && HUMAN_KINDS.has(String(kind).toLowerCase()) && typeof o === 'object' && !('humanize' in o)) {
-          o.humanize = true;
-          changed++;
-        }
-      }
-    }
+    if (!Array.isArray(c.outputs)) continue;
+    c.outputs = c.outputs.map((o) => {
+      if (typeof o === 'string') { changed++; return { type: o }; }
+      if (typeof o !== 'object' || !o) return o;
+      const n = { ...o };
+      if ('kind' in n) { if (!n.type) n.type = n.kind; delete n.kind; changed++; }
+      if ('humanize' in n) { delete n.humanize; changed++; }
+      return n;
+    });
   }
   if (changed > 0) writeYaml(file, m);
-  return { ok: true, capabilities_humanized: changed };
+  return { ok: true, outputs_repaired: changed };
 }
 
 function fix_caps_examples_not_for(squadDir) {
@@ -292,42 +299,62 @@ function fix_domain_realign(squadDir, patch) {
 
 // ─── structural fixers (tasks, agents, readme, workflows) ───
 
+/**
+ * Headings the library writes acceptance criteria under when it does not write
+ * `## Acceptance Criteria`. Measured over the 206 installed squads on
+ * 27/08/2026: `Quality criteria` (37 task files), `Critérios de Qualidade` (22),
+ * `Acceptance` / `Acceptance (binário)` (14), `Postconditions` (9 — the
+ * brandcraft case). Nothing here is invented: a heading nobody writes only
+ * widens what a rename can damage.
+ *
+ * `Checklist` is deliberately absent. In the library it opens `### Pre` and
+ * `### Post` subsections, so renaming it would promote preconditions into the
+ * contract the judge scores against — the same lie by a different route.
+ */
+const AC_ALIAS_RE = /^(#{2,6})[ \t]+(?:Postconditions|P[óo]s[- ]?condi[çc][õo]es|Quality criteria|Crit[ée]rios? de Qualidade|Acceptance(?:[ \t]*\([^)\n]*\))?)[ \t]*$/im;
+
+/**
+ * Rename first, and never fabricate.
+ *
+ * The parser the judge reads (`acceptanceCriteriaOf`) matches
+ * `## Acceptance Criteria` and nothing else. A task whose real contract sits
+ * under another heading is therefore invisible to the judge — and appending a
+ * generic block, as this fixer used to, left the true criterion under one
+ * heading and a placebo under the one that is scored. That is worse than the
+ * finding it closed, because it closes silently.
+ *
+ * So: move the author's criteria under the heading the judge reads. When there
+ * is nothing to move, decline and name the tasks. v6 §28.3 — "os fixers nunca
+ * inventam" — and §35.2 both draw the line here: writing the criterion would
+ * be writing the squad's method.
+ */
 function fix_tasks_acceptance_criteria(squadDir) {
   const dir = path.join(squadDir, 'tasks');
   if (!fs.existsSync(dir)) return { ok: false, reason: 'tasks/ missing' };
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));
-  let patched = 0;
+  let renamed = 0;
+  const unwritten = [];
   for (const f of files) {
     const fp = path.join(dir, f);
-    let body = fs.readFileSync(fp, 'utf8');
+    const body = fs.readFileSync(fp, 'utf8');
     const hasACHeader = /^##+\s+(Acceptance Criteria|Critérios de Aceita[çc]ão|Success Criteria)/im.test(body);
     const hasOutputs = /^outputs\s*:/m.test(body);
     const hasACField = /^acceptance_criteria\s*:/m.test(body);
     if (hasACHeader || hasOutputs || hasACField) continue;
-    const slug = f.replace(/\.md$/, '');
-    const block = [
-      '',
-      '## Acceptance Criteria',
-      '',
-      `- [ ] Output produced for task \`${slug}\` is non-empty and matches the declared schema.`,
-      '- [ ] All inputs referenced in the task body are consumed; no orphan placeholders remain.',
-      '- [ ] Resulting handoff artifact is valid against \`_shared/schemas/handoff.schema.json\`.',
-      '',
-      '## Output Schema',
-      '',
-      '```yaml',
-      'outputs:',
-      `  - name: ${slug}_result`,
-      '    type: object',
-      `    description: Deliverable produced by the ${slug} task.`,
-      '```',
-      '',
-    ].join('\n');
-    if (!body.endsWith('\n')) body += '\n';
-    fs.writeFileSync(fp, body + block, 'utf8');
-    patched++;
+    const alias = AC_ALIAS_RE.exec(body);
+    if (!alias) { unwritten.push(f.replace(/\.md$/, '')); continue; }
+    const head = `${alias[1]} Acceptance Criteria`;
+    fs.writeFileSync(fp, body.slice(0, alias.index) + head + body.slice(alias.index + alias[0].length), 'utf8');
+    renamed++;
   }
-  return { ok: true, patched, total: files.length };
+  if (renamed === 0) {
+    if (unwritten.length === 0) return { ok: false, reason: 'every task already declares acceptance criteria or outputs' };
+    return {
+      ok: false,
+      reason: `${unwritten.length} task(s) declare no criteria under any heading (${unwritten.slice(0, 5).join(', ')}) — the author writes them; a fabricated one would be scored as a contract`,
+    };
+  }
+  return { ok: true, renamed, unwritten: unwritten.length, total: files.length };
 }
 
 function fix_agents_frontmatter_repair(squadDir) {
@@ -362,7 +389,9 @@ function fix_agents_frontmatter_repair(squadDir) {
     if (!hasMaxTurns) additions.push('maxTurns: 12');
     if (!hasTools) additions.push('tools: [Read, Write, Edit, Bash, Grep, Glob]');
     const newFm = fmText.trimEnd() + '\n' + additions.join('\n');
-    raw = raw.replace(fm[0], `---\n${newFm}\r?\n---\n`);
+    // `\r?\n` here used to be written LITERALLY into the file, leaving a `\r?`
+    // after the last frontmatter line and turning the block into invalid YAML.
+    raw = raw.replace(fm[0], `---\n${newFm}\n---\n`);
     fs.writeFileSync(fp, raw, 'utf8');
     patched++;
   }
@@ -596,8 +625,11 @@ function fix_components_files_stub(squadDir) {
     // Strip any extension already present in the ref so we don't end up
     // with foo.md.md or foo.yaml.yaml.
     const baseName = name.replace(/\.(md|ya?ml)$/i, '');
+    // A workflow already on disk in any encoding (.md for v6, .yaml/.yml for
+    // v5) is not missing; the stub itself is only ever a .yaml in this cut.
+    const present = sub === 'workflows' ? ['.md', '.yaml', '.yml'] : [ext];
+    if (present.some(e => fs.existsSync(path.join(dir, `${baseName}${e}`)))) return;
     const fp = path.join(dir, `${baseName}${ext}`);
-    if (fs.existsSync(fp)) return;
     fs.writeFileSync(fp, body, 'utf8');
     created.push(`${sub}/${baseName}${ext}`);
   };
@@ -684,7 +716,7 @@ function applyMechanicalFixes(squadDir, consensus_diff) {
         case 'runtime_requirements_default':         r = fix_runtime_requirements_default(squadDir, patch); break;
         case 'fidelity_status_default_experimental': r = fix_fidelity_status_default_experimental(squadDir); break;
         case 'dependencies_synth':                   r = fix_dependencies_synth(squadDir); break;
-        case 'humanize_default_true':                r = fix_humanize_default_true(squadDir); break;
+        case 'outputs_shape_repair':                 r = fix_outputs_shape_repair(squadDir); break;
         case 'caps_examples_not_for':                r = fix_caps_examples_not_for(squadDir); break;
         case 'caps_inference_required':              r = fix_caps_inference_required(squadDir); break;
         case 'domain_realign':                       r = fix_domain_realign(squadDir, patch); break;

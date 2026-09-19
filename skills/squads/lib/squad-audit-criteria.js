@@ -49,7 +49,7 @@ const SEMVER_RE = /^\d+\.\d+\.\d+([+\-].*)?$/;
 const CAP_ID_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/;
 
 // ─────────────────────────────────────────────────────────────────────
-// Criterion 1 — protocol "5.0" + valid semver version  (8 pts)
+// Criterion 1 — protocol "5.0" or "6.0" + valid semver version  (8 pts)
 // ─────────────────────────────────────────────────────────────────────
 function c1_protocol_version({ manifest }) {
   const max = 8;
@@ -58,14 +58,17 @@ function c1_protocol_version({ manifest }) {
   const ver = String(manifest.version || '').trim();
   let score = 0;
   const ev = [];
-  if (proto === '5.0') { score += 4; ev.push('protocol=5.0'); }
+  // 6.0 scores as 5.0: the capabilities contract is the same, and the fixer
+  // must never downgrade a v6 manifest to 5.0.
+  const protoOk = proto === '5.0' || proto === '6.0';
+  if (protoOk) { score += 4; ev.push(`protocol=${proto}`); }
   else { ev.push(`protocol=${proto || '(missing)'}`); }
   if (SEMVER_RE.test(ver)) { score += 4; ev.push(`version=${ver}`); }
   else { ev.push(`version=${ver || '(missing)'} (not semver)`); }
   let fix = null;
-  if (proto !== '5.0' || !SEMVER_RE.test(ver)) {
+  if (!protoOk || !SEMVER_RE.test(ver)) {
     fix = { kind: 'manifest_patch', patches: [] };
-    if (proto !== '5.0') fix.patches.push({ op: 'set', path: 'protocol', value: '5.0' });
+    if (!protoOk) fix.patches.push({ op: 'set', path: 'protocol', value: '5.0' });
     if (!SEMVER_RE.test(ver)) fix.patches.push({ op: 'set', path: 'version', value: '5.0.0' });
   }
   return { score, max, evidence: ev.join(' · '), fixable_diff: fix };
@@ -210,20 +213,30 @@ function c6_tasks({ squadDir }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Criterion 7 — workflows/*.yaml DAG-valid, refs resolve  (8 pts)
+// Criterion 7 — workflows/*.{yaml,md} DAG-valid, refs resolve  (8 pts)
 // ─────────────────────────────────────────────────────────────────────
+/** A workflow document: the whole file for YAML, the frontmatter for Markdown
+ *  (v6: frontmatter graph + prose body). CRLF tolerant. */
+function readWorkflowDoc(p) {
+  if (!/\.md$/i.test(p)) return readYaml(p);
+  if (!exists(p) || !YAML) return null;
+  try {
+    const m = /^\uFEFF?---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(fs.readFileSync(p, 'utf8'));
+    return m ? YAML.parse(m[1]) : null;
+  } catch { return null; }
+}
 function c7_workflows({ squadDir, manifest }) {
   const max = 8;
   const dir = path.join(squadDir, 'workflows');
   if (!exists(dir)) return { score: 0, max, evidence: 'workflows/ missing', fixable_diff: { kind: 'create_workflows_dir' } };
-  const files = listDir(dir).filter(f => /\.ya?ml$/.test(f));
+  const files = listDir(dir).filter(f => /\.(ya?ml|md)$/.test(f));
   if (files.length === 0) return { score: 0, max, evidence: 'no workflow files', fixable_diff: null };
   const knownAgents = new Set(listDir(path.join(squadDir, 'agents')).filter(f => f.endsWith('.md')).map(f => f.replace(/\.md$/, '')));
   const knownTasks = new Set(listDir(path.join(squadDir, 'tasks')).filter(f => f.endsWith('.md')).map(f => f.replace(/\.md$/, '')));
   let valid = 0;
   const issues = [];
   for (const f of files) {
-    const wf = readYaml(path.join(dir, f));
+    const wf = readWorkflowDoc(path.join(dir, f));
     if (!wf || typeof wf !== 'object') { issues.push(`${f}: parse-fail`); continue; }
     // v5 protocol allows multiple workflow shapes (real-world variance):
     //   top-level `steps:`            (Squad Protocol V5 canonical DAG)
@@ -274,45 +287,65 @@ function c8_runtime_requirements({ manifest }) {
   if (!manifest) return { score: 0, max, evidence: 'no manifest', fixable_diff: null };
   const rr = manifest.runtime_requirements || {};
   const min = Array.isArray(rr.minimum) ? rr.minimum : [];
+  const usesActiveRuntime = rr.policy !== 'declared';
   const feats = Array.isArray(manifest.features_required) ? manifest.features_required : [];
   let score = 0;
-  if (min.length >= 1) score += 4;
+  if (usesActiveRuntime || min.length >= 1) score += 4;
   if (feats.length >= 1) score += 2;
   return {
     score, max,
-    evidence: `runtimes=${min.length} · features_required=${feats.length}`,
-    fixable_diff: (min.length === 0 || feats.length === 0)
-      ? { kind: 'runtime_requirements_default', missing_min: min.length === 0, missing_feats: feats.length === 0 }
+    evidence: `policy=${rr.policy || 'active'} · runtimes=${min.length} · features_required=${feats.length}`,
+    fixable_diff: ((!usesActiveRuntime && min.length === 0) || feats.length === 0)
+      ? { kind: 'runtime_requirements_default', missing_min: !usesActiveRuntime && min.length === 0, missing_feats: feats.length === 0 }
       : null,
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Criterion 9 — humanize: true wired (P11)  (6 pts)
+// Criterion 9 — the acceptance contract (v6 §29)  (6 pts)
 // ─────────────────────────────────────────────────────────────────────
-function c9_humanize({ manifest }) {
+/**
+ * `humanize` used to live here, and it was a contradiction: the docs told an
+ * author to declare it, the strict schema rejected it, and the fixer WROTE it —
+ * so `fix-squad --apply` could turn a valid manifest into an invalid one. The
+ * writing contract lives in the runtime memory files and applies to every
+ * dispatched agent; there is nothing per-capability to declare.
+ *
+ * What the six points buy now is the contract the judge actually reads: the
+ * share of capabilities that say how their output is judged, either through
+ * `acceptance[]` (v6 §29) or through the `## Acceptance Criteria` of the task
+ * they invoke. The fallback order the Gauntlet will use is the same one scored
+ * here: `acceptance[]` → the invoked task's acceptance criteria.
+ */
+function c9_acceptance({ squadDir, manifest }) {
   const max = 6;
   const caps = manifest?.capabilities;
   if (!Array.isArray(caps) || caps.length === 0) return { score: 0, max, evidence: 'no caps', fixable_diff: null };
-  // Check capabilities producing human-facing output
-  const HUMAN_KINDS = new Set(['markdown', 'html', 'string', 'text']);
-  let needs = 0, satisfied = 0;
+  const AC_RE = /^##+\s+(Acceptance Criteria|Crit[ée]rios? de Aceita[çc][ãa]o|Success Criteria)/im;
+  let satisfied = 0;
+  let legacyOutput = false;
   for (const c of caps) {
-    const out = c.output || c.output_kind;
-    const kind = typeof out === 'string' ? out : (out?.type || out?.kind);
-    const looksHuman = kind && HUMAN_KINDS.has(String(kind).toLowerCase());
-    if (looksHuman) {
-      needs++;
-      const hum = (out && typeof out === 'object' && 'humanize' in out) ? !!out.humanize : true;
-      if (hum) satisfied++;
+    if (typeof c !== 'object' || !c) continue;
+    if ('output' in c && !Array.isArray(c.outputs)) legacyOutput = true;
+    if (Array.isArray(c.acceptance) && c.acceptance.length > 0) { satisfied++; continue; }
+    const invoke = c.invoke;
+    if (!invoke || invoke.type !== 'task' || typeof invoke.ref !== 'string') continue;
+    const bare = invoke.ref.replace(/\.md$/i, '');
+    const tries = [bare + '.md', path.join('tasks', path.basename(bare) + '.md')];
+    for (const t of tries) {
+      const p = path.join(squadDir, t);
+      if (!isFile(p)) continue;
+      try { if (AC_RE.test(fs.readFileSync(p, 'utf8'))) satisfied++; } catch {}
+      break;
     }
   }
-  if (needs === 0) return { score: max, max, evidence: 'no human-facing outputs', fixable_diff: null };
-  const score = Math.round((satisfied / needs) * max);
+  const score = Math.round((satisfied / caps.length) * max);
   return {
     score, max,
-    evidence: `${satisfied}/${needs} human outputs humanized`,
-    fixable_diff: satisfied < needs ? { kind: 'humanize_default_true' } : null,
+    evidence: `${satisfied}/${caps.length} capabilities declare acceptance[] or invoke a task with acceptance criteria`,
+    // The only mechanical repair reachable from here: a manifest still carrying
+    // the singular `output` the strict schema rejects.
+    fixable_diff: legacyOutput ? { kind: 'outputs_shape_repair' } : null,
   };
 }
 
@@ -434,7 +467,7 @@ const CRITERIA = [
   { id: 6, name: 'tasks', fn: c6_tasks, max: 6 },
   { id: 7, name: 'workflows', fn: c7_workflows, max: 8 },
   { id: 8, name: 'runtime_requirements', fn: c8_runtime_requirements, max: 6 },
-  { id: 9, name: 'humanize', fn: c9_humanize, max: 6 },
+  { id: 9, name: 'acceptance', fn: c9_acceptance, max: 6 },
   { id: 10, name: 'dependencies', fn: c10_dependencies, max: 6 },
   { id: 11, name: 'readme', fn: c11_readme, max: 8 },
   { id: 12, name: 'shebangs', fn: c12_shebangs, max: 4 },
